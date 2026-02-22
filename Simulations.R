@@ -25,3 +25,16 @@ print(stats$dynamic_evaluation)
 # table for Expert vs Layperson
 print(stats$power_by_type)
 
+
+# Visualisation
+
+# Network visualisation
+plot_social_and_delegation(res)
+
+# Summary table
+get_summary_table(res)
+
+# Summary Visualisation
+plot_summary_stats(res)
+
+
