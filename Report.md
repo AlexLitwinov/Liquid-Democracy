@@ -1,0 +1,103 @@
+Project Log: Liquid Democracy Simulation
+================
+2026-02-22
+
+# Project Overview
+
+This document serves as a continuous research log for the whole Project.
+It tracks any important change, parameter experiments, and key findings.
+
+------------------------------------------------------------------------
+
+# \[Baseline\] - Initial Model Implementation
+
+## Summary of the Current Base Code
+
+The baseline version implements a multi-community Liquid Democracy
+environment. The simulation explores how voting power concentrates as
+agents delegate their votes to peers or experts based on ideological
+proximity and perceived influence.
+
+### Core Technical Components:
+
+#### 1. Agent Architecture
+
+- **Types**: The population consists of **Laypersons** (regular voters)
+  and **Experts** (specialized nodes).
+- **Preferences**: Every agent is assigned a random preference value
+  between $0$ and $1$, representing their ideological position.
+- **Communities**: Agents are organized into distinct communities to
+  simulate local social structures.
+
+#### 2. Network Topologies
+
+- **Friendship Rings**: Each community starts with a ring-lattice
+  structure, representing a local social circle where everyone is
+  connected to their immediate neighbors.
+- **Expert Connectivity**: A defined percentage of laypersons in each
+  community is connected to local experts.
+- **Maslov-Sneppen Rewiring**: The model includes an optional rewiring
+  mechanism to transform the local rings into Small-World networks,
+  allowing for cross-community interactions.
+
+#### 3. Delegation Logic
+
+The decision to delegate is stochastic and based on an **Attractiveness
+Score**. An agent $i$ considers delegating to a friend $j$ based on: \*
+**Preference Similarity**: Agents prefer delegates with similar
+ideological positions. \* **Power Responsiveness**: Agents are attracted
+to delegates who already hold significant voting power.
+
+The probability of delegation is calculated using a logistic function:
+$$Attractiveness = \frac{1 - |pref_i - pref_j|}{1 + e^{-resp \cdot (power_j - power_i)}}$$
+
+#### 4. Vote Propagation & Metrics
+
+- **Power Counting**: The model recursively counts how many people have
+  delegated (directly or indirectly) to a specific node.
+- **Vote Attribution**: Preferences are propagated from the final
+  representatives back through the delegation chain.
+- **Lost Votes**: The system tracks “lost votes,” which occur when
+  delegation cycles form or when agents have no path to a final
+  representative.
+
+------------------------------------------------------------------------
+
+## Baseline Metrics (Summary Function)
+
+To evaluate the state of the simulation, a comprehensive
+`summary_metrics` function has been implemented. It tracks the following
+key indicators:
+
+### 1. Representation & Efficiency
+
+- **Lost Vote Rate**: Measures the percentage of agents whose votes do
+  not reach a final representative (due to cycles or isolation).
+- **Average Delegation Distance**: The average length of the delegation
+  chains, indicating how “liquid” or direct the democracy is.
+
+### 2. Power Distribution & Inequality
+
+- **Gini Coefficient (Power)**: Quantifies the inequality of voting
+  power across the network ($0$ = perfect equality, $1$ = total
+  concentration).
+- **Max/Mean Power**: Identifies the influence of the strongest
+  “super-voters” compared to the average agent.
+
+### 3. Network Macro-Structure
+
+- **Components**: Counts the number of isolated delegation clusters.
+- **Largest Component Size**: Monitors the size of the dominant voting
+  bloc.
+
+### 4. Expert vs. Layperson Dynamics
+
+- **Comparative Power**: Groups results by agent type to analyze if
+  experts actually accumulate the majority of the community’s influence
+  as intended by the model design.
+
+------------------------------------------------------------------------
+
+# Future Updates
+
+\`\`\`
