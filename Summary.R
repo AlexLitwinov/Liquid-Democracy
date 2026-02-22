@@ -19,7 +19,7 @@ summary_metrics <- function(res) {
     vote_attribution_rate    = 1 - mean(is.na(agents$my_vote)),
     lost_vote_rate           = mean(is.na(agents$my_vote)),
     gini_power_inequality    = gini(agents$countdelegations),
-    max_power                = max(agents$countdelegations), # Added here
+    max_power                = max(agents$countdelegations), 
     avg_chain_length         = suppressWarnings(mean_distance(gD, directed = TRUE, unconnected = TRUE)),
     total_components         = comps$no,
     largest_voting_bloc_size = max(comps$csize)
