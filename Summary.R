@@ -66,10 +66,6 @@ summary_metrics <- function(res) {
     mean(abs(represented_agents$preference - represented_agents$my_vote))
   } else { NA }
   
-  systemic_bias <- if(nrow(represented_agents) > 0) {
-    mean(represented_agents$my_vote) - mean(agents$preference)
-  } else { NA }
-  
   # Direct democracy votes
   direct_votes <- ifelse(agents$preference >= 0.5, 1, 0)
   direct_yes  <- sum(direct_votes == 1)
@@ -84,7 +80,6 @@ summary_metrics <- function(res) {
   
   dynamic_evaluation <- list(
     avg_ideological_drift = avg_ideological_drift,
-    systemic_bias         = systemic_bias,
     direct_yes            = direct_yes,
     direct_no             = direct_no,
     liquid_yes            = liquid_yes,
