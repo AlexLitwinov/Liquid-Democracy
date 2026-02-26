@@ -5,7 +5,7 @@ summary_metrics <- function(res) {
   agents <- res$agents
   gD <- res$delegation_graph
   
-  # 1. NETWORK DESCRIPTION (Professor 1)
+  # 1. NETWORK DESCRIPTION 
   # ---------------------------------------------------------
   comps <- components(gD)
   
@@ -25,7 +25,7 @@ summary_metrics <- function(res) {
     largest_voting_bloc_size = max(comps$csize)
   )
   
-  # 2. DYNAMIC EVALUATION (Professor 2)
+  # 2. DYNAMIC EVALUATION 
   # ---------------------------------------------------------
   represented_agents <- agents %>% filter(!is.na(my_vote))
   
