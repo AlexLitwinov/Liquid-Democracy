@@ -103,8 +103,6 @@ key indicators:
 - **avg_ideological_drift**: Measures the average absolute deviation
   between an agent’s original preference and the final vote cast on
   their behalf (individual-level).
-- **systemic_bias**: Measures difference between collective mean final
-  vote and collective mean original preference. (collective-level).
 - **direct_yes / direct_no**: Counts of yes (≥ 0.5) and no (\< 0.5)
   votes under direct democracy, where each agent votes according to
   their own preference.
