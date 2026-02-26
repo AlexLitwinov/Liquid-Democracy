@@ -10,12 +10,9 @@ Project Log: Liquid Democracy Simulation
     - [Core Technical Components:](#core-technical-components)
   - [Baseline Metrics (Summary
     Function)](#baseline-metrics-summary-function)
-    - [1. Representation & Efficiency](#1-representation--efficiency)
-    - [2. Power Distribution &
-      Inequality](#2-power-distribution--inequality)
-    - [3. Network Macro-Structure](#3-network-macro-structure)
-    - [4. Expert vs. Layperson
-      Dynamics](#4-expert-vs-layperson-dynamics)
+    - [1. network_description](#1-network_description)
+    - [2. dynamic_evaluation](#2-dynamic_evaluation)
+    - [3. power_by_type](#3-power_by_type)
   - [Simulation run for
     Visualisation](#simulation-run-for-visualisation)
   - [Simulation Execution](#simulation-execution)
@@ -74,16 +71,6 @@ to delegates who already hold significant voting power.
 The probability of delegation is calculated using a logistic function:
 $$Attractiveness = \frac{1 - |pref_i - pref_j|}{1 + e^{-resp \cdot (power_j - power_i)}}$$
 
-#### 4. Vote Propagation & Metrics
-
-- **Power Counting**: The model recursively counts how many people have
-  delegated (directly or indirectly) to a specific node.
-- **Vote Attribution**: Preferences are propagated from the final
-  representatives back through the delegation chain.
-- **Lost Votes**: The system tracks “lost votes,” which occur when
-  delegation cycles form or when agents have no path to a final
-  representative.
-
 ------------------------------------------------------------------------
 
 ## Baseline Metrics (Summary Function)
@@ -92,32 +79,45 @@ To evaluate the state of the simulation, a comprehensive
 `summary_metrics` function has been implemented. It tracks the following
 key indicators:
 
-### 1. Representation & Efficiency
+### 1. network_description
 
-- **Lost Vote Rate**: Measures the percentage of agents whose votes do
+- **lost_vote_rate**: Measures the percentage of agents whose votes do
   not reach a final representative (due to cycles or isolation).
-- **Average Delegation Distance**: The average length of the delegation
-  chains, indicating how “liquid” or direct the democracy is.
-
-### 2. Power Distribution & Inequality
-
+- **vote_attribution_rate**: Measures the percentages of agents whose
+  vote do reach a final representative (1 - lost_vote_rate).
+- **mean_power**: Measures the average power of all agents within the
+  network.
+- **max_power**: Identifies the agent with max power in the network.
 - **Gini Coefficient (Power)**: Quantifies the inequality of voting
   power across the network ($0$ = perfect equality, $1$ = total
   concentration).
-- **Max/Mean Power**: Identifies the influence of the strongest
-  “super-voters” compared to the average agent.
-
-### 3. Network Macro-Structure
-
-- **Components**: Counts the number of isolated delegation clusters.
-- **Largest Component Size**: Monitors the size of the dominant voting
+- **avg_chain_length**: The average length of the delegation chains,
+  indicating how “liquid” or direct the democracy is.
+- **total_components**: Counts the number of isolated delegation
+  clusters.
+- **largest_voting_bloc_size**: Measures the size of the largest voting
   bloc.
 
-### 4. Expert vs. Layperson Dynamics
+### 2. dynamic_evaluation
 
-- **Comparative Power**: Groups results by agent type to analyze if
-  experts actually accumulate the majority of the community’s influence
-  as intended by the model design.
+- **avg_ideological_drift**: Measures the average absolute deviation
+  between an agent’s original preference and the final vote cast on
+  their behalf (individual-level).
+- **systemic_bias**: Measures difference between collective mean final
+  vote and collective mean original preference. (collective-level).
+- **direct_yes / direct_no**: Counts of yes (≥ 0.5) and no (\< 0.5)
+  votes under direct democracy, where each agent votes according to
+  their own preference.
+- **liquid_yes / liquid_no**: Counts of yes and no votes under liquid
+  democracy, based on the final representative votes.
+  **direct_liquid_shift**: Measures the difference between direct and
+  liquid majority outcomes. It captures whether delegation changes the
+  collective decision compared to direct voting.
+
+### 3. power_by_type
+
+- **mean_power & max_power**: Type-specific analysis function
+  (lay/expert) in terms of power.
 
 ------------------------------------------------------------------------
 
