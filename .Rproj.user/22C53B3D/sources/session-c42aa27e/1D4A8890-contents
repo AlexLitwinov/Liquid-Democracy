@@ -1,9 +1,3 @@
-
-
-
-
-###############################
-###############################
 library(igraph)
 library(tibble)
 library(dplyr)
@@ -26,6 +20,51 @@ weighted_choice <- function(ids, weights) {
   sample(ids, size = 1, prob = w)
 }
 
+compute_choice <- function(i, agents, gF, responsiveness_to_power) {
+  
+  neigh <- neighbors(gF, i, mode = "out") |> as.integer()
+  
+  # ----------------------------
+  # Explicit weight construction
+  # ----------------------------
+  
+  choices <- numeric()
+  weights <- numeric()
+  
+  # ---- Option 1: self ----
+  
+  self_weight <- 1 / (1 + exp(-responsiveness_to_power *
+                                agents$countdelegations[i]))
+  
+  choices <- c(choices, i)
+  weights <- c(weights, self_weight)
+  
+  # ---- Options: neighbors ----
+  
+  if (length(neigh) > 0) {
+    for (j in neigh) {
+      
+      w <- compute_attractiveness(
+        pref_i = agents$preference[i],
+        pref_j = agents$preference[j],
+        count_i = agents$countdelegations[i],
+        count_j = agents$countdelegations[j],
+        resp = responsiveness_to_power
+      )
+      
+      choices <- c(choices, j)
+      weights <- c(weights, w)
+    }
+  }
+  
+  # ----------------------------
+  # Weighted random draw
+  # ----------------------------
+  
+  chosen <- weighted_choice(choices, weights)
+  
+  return(chosen)
+}
 # -----------------------------
 # NetLogo: setup-nodes + setup-experts
 # -----------------------------
@@ -317,29 +356,50 @@ simulate_liquid_democracy <- function(
   
   # go
   for (t in seq_len(T)) {
-    i <- sample(lay_ids, 1)
     
-    upd <- update_delegation(
-      i = i,
-      agents = agents,
-      gF = gF,
-      gD = gD,
-      responsiveness_to_power = responsiveness_to_power
-    )
-    agents <- upd$agents
-    gF <- upd$gF
-    gD <- upd$gD
+    # ----------------------------
+    # 1. All agents choose (based on old power)
+    # ----------------------------
+    
+    new_targets <- integer(length(lay_ids))
+    
+    for (k in seq_along(lay_ids)) {
+      i <- lay_ids[k]
+      new_targets[k] <- compute_choice(
+        i = i,
+        agents = agents,
+        gF = gF,
+        responsiveness_to_power = responsiveness_to_power
+      )
+    }
+    
+    # ----------------------------
+    # 2. Rebuild delegation graph synchronously
+    # ----------------------------
+    
+    gD <- make_empty_graph(n = number_of_nodes_ALL, directed = TRUE)
+    gD <- set_vertex_attr(gD, "name", value = agents$id)
+    
+    for (k in seq_along(lay_ids)) {
+      i <- lay_ids[k]
+      chosen <- new_targets[k]
+      
+      if (chosen != i) {
+        gD <- add_edges(gD, c(i, chosen))
+      }
+    }
+    
+    # ----------------------------
+    # 3. Recompute power (votes controlled)
+    # ----------------------------
     
     agents <- count_delegations(agents, gD)
+    
+    # ----------------------------
+    # 4. Propagate votes
+    # ----------------------------
+    
     agents <- get_my_vote(agents, gD)
     
     history_lost[t] <- lostvotes(agents)
   }
-  
-  list(
-    agents = agents,
-    friendship_graph = gF,
-    delegation_graph = gD,
-    lostvotes = history_lost
-  )
-}
