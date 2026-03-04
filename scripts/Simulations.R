@@ -1,16 +1,16 @@
 # -----------------------------
-# Example run 
+# Example run (like NetLogo: setup + go)
 # -----------------------------
 res <- simulate_liquid_democracy(
-  seed = 1,
-  n_per_community = 50,
-  n_communities = 5,
+  seed = 123,
+  number_of_nodes_per_community = 20,
+  number_of_communities = 5,
   node_degree = 6,
-  n_experts_per_community = 2,
+  number_of_experts_per_community = 2,
   expert_connectedness = 0.2,
-  p_rewire = 0.5,
-  responsiveness = 3,
-  T = 500 # number of delegation updates
+  MS_rewiring_iterations = 50,
+  responsiveness_to_power = 1,
+  T = 200 # number of delegation updates
 )
 
 ####################
