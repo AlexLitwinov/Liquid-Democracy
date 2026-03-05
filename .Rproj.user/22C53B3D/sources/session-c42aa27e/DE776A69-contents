@@ -261,3 +261,5 @@ simulate_liquid_democracy <- function(
     friendship_graph  = gF
   )
 }
+
+

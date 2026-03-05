@@ -1,0 +1,53 @@
+---
+title: "Summary Report"
+output: html_document
+date: "2026-03-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(igraph)
+library(tibble)
+library(dplyr)
+library(ggraph)
+library(tidygraph)
+library(ggplot2)
+```
+
+## Baseline Metrics (Summary Function)
+To evaluate the state of the simulation, a comprehensive `summary_metrics` function is implemented. It summarizes key structural and behavioral properties of the final delegation network produced by the simulation.
+
+### 1. network_description
+This section characterizes the structural properties of the delegation network.
+
+* **lost_vote_rate**: Measures the percentage of agents whose votes do not reach a final representative. Votes are lost when delegation chains form cycles.
+* **vote_attribution_rate**: The proportion of agents whose votes successfully reach a final representative. Defined as $1 - \text{lost\_vote\_rate}$.
+* **mean_power**: The average voting power across all agents in the network. Each agent starts with one vote; agents who receive delegations accumulate additional voting power.
+* **max_power**: The highest voting power held by any agent in the network, indicating the maximum degree of vote concentration.
+* **Gini Coefficient (Power)**: Measures inequality in the distribution of voting power across agents. A value of **0** represents perfect equality, while **1** indicates complete concentration of voting power in a single agent.
+* **avg_chain_length**: The average number of delegation hops from an agent to its chain root, computed over all agents (including direct voters, for whom this value is 0). Higher values indicate a more indirect democracy.
+* **total_components**: The number of weakly connected components in the delegation graph among agents who delegated or received a delegation. Isolated direct voters are excluded, as each would otherwise trivially inflate this count.
+* **largest_voting_bloc_size**: The size of the largest weakly connected component in the delegation network, representing the largest single power bloc.
+
+---
+
+### 2. dynamic_evaluation
+This section evaluates how delegation affects ideological representation and collective decisions.
+
+* **avg_ideological_drift**: The average absolute difference between an agent's own preference and the final vote cast on their behalf, computed over represented agents only. Values near 0 indicate high-quality representation.
+* **direct_yes / direct_no**: The number of yes (≥ 0.5) and no (< 0.5) votes under **direct democracy**, where every agent votes their own preference.
+* **liquid_yes / liquid_no**: The number of yes and no votes under **liquid democracy**, based on the votes of final representatives after delegation chains are resolved. Note that `liquid_yes + liquid_no` will be smaller than `direct_yes + direct_no` whenever votes are lost to cycles, so the two vote counts are not directly commensurable in absolute terms.
+* **liquid_margin**: The majority margin under liquid democracy, defined as `liquid_yes - liquid_no`. Positive values indicate a Yes majority; negative values indicate a No majority.
+* **direct_margin**: The majority margin under direct democracy, defined as `direct_yes - direct_no`. Positive values indicate a Yes majority; negative values indicate a No majority.
+
+Comparing `liquid_margin` to `direct_margin` shows whether delegation changes the direction or strength of the collective majority. Because cycle losses reduce the liquid vote count, a shift in margin does not necessarily reflect a genuine opinion change — it may partly reflect which side loses more votes to cycles.
+
+---
+
+### 3. power_by_type
+This section compares voting power between different agent types.
+
+* **mean_power**: The average voting power for each agent type (Laypersons vs. Experts).
+* **max_power**: The maximum voting power held by any agent within each type.
+
+This analysis helps identify whether experts systematically accumulate more voting power than regular voters within the delegation system.
