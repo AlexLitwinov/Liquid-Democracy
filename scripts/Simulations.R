@@ -10,7 +10,7 @@ res <- simulate_liquid_democracy(
   expert_connectedness = 0.2,
   p_rewire = 0.5,
   responsiveness = 3,
-  T = 500 # number of delegation updates
+  T = 500 
 )
 
 ####################
@@ -23,6 +23,9 @@ print(stats$network_description)
 
 # dynamic evaluation 
 print(stats$dynamic_evaluation)
+
+# convergence
+print(stats$convergence)
 
 # table for Expert vs Layperson
 print(stats$power_by_type)
@@ -39,5 +42,4 @@ get_summary_table(res)
 
 # Summary Visualisation
 plot_summary_stats(res)
-
 

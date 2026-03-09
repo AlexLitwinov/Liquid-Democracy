@@ -1,5 +1,5 @@
 ---
-title: "Weekly Report — Week 2 (26.03.2025 – 05.03.2025)"
+title: "Weekly Report — Week 2 (26.02.2025 – 05.03.2025)"
 output: 
   github_document:
 date: "2026-03-05"

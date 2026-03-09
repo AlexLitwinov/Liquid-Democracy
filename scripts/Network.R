@@ -126,8 +126,10 @@ setup_agents <- function(n_per_community, n_communities,
     id         = 1:n_all,
     type       = c(rep("lay", n_lay), rep("expert", n_exp)),
     preference = runif(n_all),          # fixed ideological position on [0,1]
-    community  = c((0:(n_lay - 1)) %% n_communities,
-                   (0:(n_exp - 1)) %% n_communities),
+    community = c(
+                (0:(n_lay - 1)) %% n_communities,
+                if (n_exp > 0) (0:(n_exp - 1)) %% n_communities else integer(0)
+                ),
     power      = 1L,                    # initialised to 1 (own vote)
     my_vote    = NA_real_,
     delegated  = FALSE
@@ -198,12 +200,16 @@ connect_experts <- function(gF, agents, n_per_community,
   set.seed(seed)
   lay_ids <- which(agents$type == "lay")
   exp_ids <- which(agents$type == "expert")
-  k       <- ceiling(expert_connectedness * n_per_community)
+  
+  # if no experts exist, return the friendship graph unchanged
+  if (length(exp_ids) == 0) return(gF)
+  
+  k <- ceiling(expert_connectedness * n_per_community)
   
   new_edges <- do.call(rbind, lapply(exp_ids, function(e) {
     lay_c  <- lay_ids[agents$community[lay_ids] == agents$community[e]]
     chosen <- sample(lay_c, min(k, length(lay_c)))
-    cbind(chosen, e)   # lay -> expert only
+    cbind(chosen, e)
   }))
   
   add_edges(gF, as.vector(t(new_edges)))
