@@ -5,8 +5,7 @@ Weekly Report — Week 3 (06.03.2026)
 ## Summary
 
 This week focused on fixing remaining bugs in the core simulation and
-running the first systematic parameter study. The simulation is now
-stable and completed 108 parameter combinations in 2.1 minutes.
+running the first systematic parameter study.
 
 ------------------------------------------------------------------------
 
@@ -31,59 +30,62 @@ stable and completed 108 parameter combinations in 2.1 minutes.
 
 ### Design
 
-Experts disabled to isolate lay agent dynamics. Full factorial grid —
-108 combinations total, runtime: **2.1 minutes**.
-
 | Parameter                | Values                             |
 |--------------------------|------------------------------------|
 | Responsiveness           | 0.1, 0.5, 1, 2, 5, 10, 25, 50, 100 |
 | Rewiring probability (p) | 0, 0.01, 0.05, 0.1                 |
-| Delegation rounds T      | 50, 100, 200                       |
+| Delegation rounds T      | 50, 100, 200, 500                  |
 
 ### Key Results
 
-**Plot 1 — Ideological Drift**
+**Ideological Drift**
 
-Drift decreases consistently as responsiveness increases across all T
-and rewiring conditions, falling from ~0.22–0.23 at responsiveness = 0.1
-down to ~0.12–0.17 at responsiveness = 100. The effect is monotone and
-stable once responsiveness exceeds ~5, where lines flatten out. Higher
-rewiring (p = 0.1) produces slightly more drift at low T but converges
-with other conditions at T = 200. The pure ring (p = 0) consistently
-achieves the lowest drift at high responsiveness.
+Ideological Drift decreases with higher responsiveness across all
+conditions, falling from roughly 0.20–0.25 at responsiveness = 0.1 to
+around 0.14–0.17 at responsiveness = 25. The effect flattens beyond
+responsiveness ≈ 2–5, suggesting diminishing returns. Notably, at longer
+time horizons (T = 500) the variance across rewiring conditions
+increases at low responsiveness, indicating that network structure
+matters more when agents have more rounds to delegate but little
+incentive to concentrate.
 
-**Plot 2 — Power Inequality (Gini)**
+**Share of Severely Misrepresented Agents (Drift \> 0.3)**
 
-The Gini coefficient shows a non-monotone pattern: it rises sharply from
-~0.25 at low responsiveness to a peak around responsiveness = 1–2, then
-stabilises at ~0.28–0.30 for higher values. Higher rewiring (p = 0.05, p
-= 0.1) produces notably higher peaks at T = 100 and T = 200
-(~0.33–0.35), suggesting that long-range ties amplify power
-concentration when agents are moderately responsive. At T = 200 the
-variance across rewiring conditions is largest, indicating that power
-inequality accumulates over time rather than stabilising quickly.
+High-drift share follows a similar downward trend but with considerably
+more noise, particularly at T = 500. This suggests that while average
+misrepresentation improves with responsiveness, the distribution becomes
+more uneven — some agents remain severely misrepresented even under high
+responsiveness conditions.
 
-**Plot 3 — Lost Vote Rate**
+**Lost Vote Rate**
 
 The lost vote rate drops steeply as responsiveness increases, from
 ~0.35–0.43 at responsiveness = 0.1 down to ~0.05–0.13 at responsiveness
 ≥ 5. The decline is sharp between responsiveness = 0.1 and 2, then
-levels off. At low responsiveness, higher rewiring (p = 0.01) produces
-the highest lost vote rates (~0.43), likely because random long-range
-ties create more cycle-prone delegation patterns. At T = 200, all
-conditions converge to low lost vote rates (~0.05–0.12) at high
-responsiveness, suggesting cycles self-resolve over longer runs.
+levels off.
+
+**Delegation Rate** Delegation Rate Contrary to initial intuition,
+delegation rate decreases monotonically with higher responsiveness,
+falling from roughly 0.79–0.81 at responsiveness = 0.1 to around
+0.57–0.61 at responsiveness = 25. This is explained by the dual role of
+the responsiveness parameter: while higher responsiveness increases the
+attractiveness of powerful neighbors, it simultaneously inflates the
+self-weight of agents with moderate or high power, making direct voting
+increasingly preferable. As a result, only agents facing a clear power
+disadvantage relative to a neighbor continue to delegate at high
+responsiveness, while the majority converges toward direct voting.
 
 ### Summary
 
 Higher responsiveness consistently improves representation quality
 (lower drift) and reduces vote loss (fewer cycles), at the cost of a
-moderate increase in power inequality. The network structure (rewiring)
-matters most at intermediate responsiveness and longer time horizons.
+moderate increase in power inequality.
 
 ------------------------------------------------------------------------
 
 ## Open Issues
 
-- Experiment 2 (with experts enabled) not yet run
-- Report `.Rmd` files to be consolidated into `README.md`
+- Checking updates / T
+- Checking lost vote rate (seems too high to me): Preference
+  distribution of cycle agents
+- Experiment 2 — Experts
