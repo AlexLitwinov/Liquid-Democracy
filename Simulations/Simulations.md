@@ -112,7 +112,7 @@ cat(sprintf("Grid completed: %d simulations in %.1f seconds (%.1f min)\n",
             nrow(param_grid), elapsed, elapsed / 60))
 ```
 
-    ## Grid completed: 140 simulations in 219.8 seconds (3.7 min)
+    ## Grid completed: 140 simulations in 219.7 seconds (3.7 min)
 
 ------------------------------------------------------------------------
 
