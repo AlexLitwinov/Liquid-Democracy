@@ -1,0 +1,89 @@
+Weekly Report — Week 3 (06.03.2026)
+================
+2026-03-06
+
+## Summary
+
+This week focused on fixing remaining bugs in the core simulation and
+running the first systematic parameter study. The simulation is now
+stable and completed 108 parameter combinations in 2.1 minutes.
+
+------------------------------------------------------------------------
+
+## Work Done
+
+**Bug Fixes**
+
+- Fixed `setup_agents()`: when `n_experts_per_community = 0`, the
+  expression `0:(n_exp - 1)` evaluated to `c(0, -1)` instead of an empty
+  vector, causing a tibble size mismatch. Fixed with an explicit guard:
+  `if (n_exp > 0) (0:(n_exp-1)) %% n_communities else integer(0)`
+- Fixed `connect_experts()`: when no experts exist, `lapply` over an
+  empty vector produced a malformed edge matrix causing `t()` to fail.
+  Fixed with an early return: `if (length(exp_ids) == 0) return(gF)`
+- Fixed `run_single_simulation()`: parameter columns were returned
+  twice, causing `unnest()` to fail with duplicate column names. Fixed
+  by removing them from the returned tibble.
+
+------------------------------------------------------------------------
+
+## Experiment 1 — Responsiveness to Power
+
+### Design
+
+Experts disabled to isolate lay agent dynamics. Full factorial grid —
+108 combinations total, runtime: **2.1 minutes**.
+
+| Parameter                | Values                             |
+|--------------------------|------------------------------------|
+| Responsiveness           | 0.1, 0.5, 1, 2, 5, 10, 25, 50, 100 |
+| Rewiring probability (p) | 0, 0.01, 0.05, 0.1                 |
+| Delegation rounds T      | 50, 100, 200                       |
+
+### Key Results
+
+**Plot 1 — Ideological Drift**
+
+Drift decreases consistently as responsiveness increases across all T
+and rewiring conditions, falling from ~0.22–0.23 at responsiveness = 0.1
+down to ~0.12–0.17 at responsiveness = 100. The effect is monotone and
+stable once responsiveness exceeds ~5, where lines flatten out. Higher
+rewiring (p = 0.1) produces slightly more drift at low T but converges
+with other conditions at T = 200. The pure ring (p = 0) consistently
+achieves the lowest drift at high responsiveness.
+
+**Plot 2 — Power Inequality (Gini)**
+
+The Gini coefficient shows a non-monotone pattern: it rises sharply from
+~0.25 at low responsiveness to a peak around responsiveness = 1–2, then
+stabilises at ~0.28–0.30 for higher values. Higher rewiring (p = 0.05, p
+= 0.1) produces notably higher peaks at T = 100 and T = 200
+(~0.33–0.35), suggesting that long-range ties amplify power
+concentration when agents are moderately responsive. At T = 200 the
+variance across rewiring conditions is largest, indicating that power
+inequality accumulates over time rather than stabilising quickly.
+
+**Plot 3 — Lost Vote Rate**
+
+The lost vote rate drops steeply as responsiveness increases, from
+~0.35–0.43 at responsiveness = 0.1 down to ~0.05–0.13 at responsiveness
+≥ 5. The decline is sharp between responsiveness = 0.1 and 2, then
+levels off. At low responsiveness, higher rewiring (p = 0.01) produces
+the highest lost vote rates (~0.43), likely because random long-range
+ties create more cycle-prone delegation patterns. At T = 200, all
+conditions converge to low lost vote rates (~0.05–0.12) at high
+responsiveness, suggesting cycles self-resolve over longer runs.
+
+### Summary
+
+Higher responsiveness consistently improves representation quality
+(lower drift) and reduces vote loss (fewer cycles), at the cost of a
+moderate increase in power inequality. The network structure (rewiring)
+matters most at intermediate responsiveness and longer time horizons.
+
+------------------------------------------------------------------------
+
+## Open Issues
+
+- Experiment 2 (with experts enabled) not yet run
+- Report `.Rmd` files to be consolidated into `README.md`
