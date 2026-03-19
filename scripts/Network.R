@@ -251,6 +251,7 @@ simulate_liquid_democracy <- function(
     expert_connectedness    = 0.2,
     p_rewire                = 0.05,
     responsiveness          = 1,
+    inertia                 = 0,
     T                       = 200
 ) {
   st     <- setup_agents(n_per_community, n_communities,
@@ -283,19 +284,36 @@ simulate_liquid_democracy <- function(
     targets <- vapply(lay_ids, function(i) {
       nb <- adj[[i]]
       
-      # Weight for voting directly
+      # Gewicht für direktes Abstimmen
       w_self <- 1 / (1 + exp(-responsiveness * pow[i]))
       
-      # Weight for delegating to each neighbour j
+      # Gewicht für Trägheit: aktuellen Delegaten beibehalten
+      current_target <- if (agents$delegated[i]) {
+        el <- as_edgelist(delegation_graphs[[max(1, t - 1)]], names = FALSE)
+        matches <- el[el[, 1] == i, 2]
+        if (length(matches)) matches[1] else NA_integer_
+      } else NA_integer_
+      
+      # Gewicht für Nachbarn
       w_nb <- if (length(nb))
-        compute_attractiveness(pref[i], pref[nb], pow[i], pow[nb],
-                               responsiveness)
+        compute_attractiveness(pref[i], pref[nb], pow[i], pow[nb], responsiveness)
       else numeric(0)
       
-      w <- pmax(c(w_self, w_nb), 0)
-      if (sum(w) == 0) w[] <- 1   # fallback: uniform if all weights are 0
+      # Trägheitsgewicht nur wenn aktueller Delegat ein Nachbar ist
+      w_inertia <- if (!is.na(current_target) && current_target %in% nb) {
+        inertia
+      } else 0
       
-      # Draw: index 1 = self, index 2+ = neighbours
+      # Gesamtgewichte: self, dann für jeden Nachbar (+ inertia falls aktueller Delegat)
+      w_nb_final <- w_nb
+      if (!is.na(current_target) && current_target %in% nb) {
+        idx <- which(nb == current_target)
+        w_nb_final[idx] <- w_nb_final[idx] + w_inertia
+      }
+      
+      w <- pmax(c(w_self, w_nb_final), 0)
+      if (sum(w) == 0) w[] <- 1
+      
       c(i, nb)[sample.int(length(w), 1L, prob = w)]
     }, integer(1L))
     
