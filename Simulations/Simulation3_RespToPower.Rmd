@@ -1,13 +1,34 @@
+---
+title: "Simulation 3 - Responsiveness to Power"
+output: github_document
+date: "2026-03-20"
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = here::here())
+knitr::opts_chunk$set(fig.path = "Simulations/Simulations_files/figure-gfm/")
+
+library(here)
+library(tibble)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+
+source(here::here("scripts/Network.R"))
+source(here::here("scripts/Summary.R"))
+```
+
 ## Experimental Design
 
-This experiment runs a (Watts-Strogatz) Network of 250 agents (directed) over 100 random seeds
-to obtain stable average estimates of key outcomes, removing seed-specific noise.
+This experiment runs a Watts-Strogatz network of 250 agents
+over 100 random seeds to obtain stable average estimates, removing
+seed-specific noise.
 
 - **Community**: 1 community, 250 lay agents
-- **Seeds**: 1–100
+- **Seeds**: 1-100
 - **Responsiveness**: 0.1, 0.5, 1, 2, 5, 10, 25
 - **Rewiring (p)**: 0, 0.05, 0.10, 0.25
-- **T**: 200
+- **T**: 200 (snapshots at 50, 100, 150, 200)
 ```{r param-grid}
 responsiveness_vals <- c(0.1, 0.5, 1, 2, 5, 10, 25)
 p_rewire_vals       <- c(0, 0.05, 0.10, 0.25)
@@ -28,28 +49,28 @@ cat("Total combinations:", nrow(param_grid), "\n")
 ```{r sim-function}
 run_single_simulation <- function(responsiveness, p_rewire, seed) {
   sim <- simulate_liquid_democracy(
-    seed           = seed,
-    n_per_community = 250,
-    n_communities  = 1,
-    node_degree    = 6,
+    seed                    = seed,
+    n_per_community         = 250,
+    n_communities           = 1,
+    node_degree             = 6,
     n_experts_per_community = 0,
     expert_connectedness    = 0,
-    p_rewire       = p_rewire,
-    responsiveness = responsiveness,
-    inertia        = 0,
-    T              = 200
+    p_rewire                = p_rewire,
+    responsiveness          = responsiveness,
+    inertia                 = 0,
+    T                       = 200
   )
 
   list(
     # Full time series for cheap metrics (200 rows)
     history = tibble(
-      round           = seq_len(200),
-      lost_vote_rate  = sim$history_lost,
-      avg_drift       = sim$history_drift,
-      delegation_rate = sim$history_delegation,
+      round                = seq_len(200),
+      lost_vote_rate       = sim$history_lost,
+      avg_drift            = sim$history_drift,
+      delegation_rate      = sim$history_delegation,
       delegation_stability = sim$history_stability
     ),
-    # Snapshots with all metrics (4 rows)
+    # Snapshots with all metrics at T = 50, 100, 150, 200
     snapshots = sim$snapshots
   )
 }
@@ -60,53 +81,70 @@ run_single_simulation <- function(responsiveness, p_rewire, seed) {
 ## Run Simulations
 ```{r run-simulations}
 library(furrr)
-library(tidyverse)
 
-plan(multisession, workers = parallel::detectCores() - 1)
+results_file <- here::here("Simulations/results_sim3.rds")
 
-t_start <- proc.time()
+if (file.exists(results_file)) {
+  # Load saved results - skip simulation entirely
+  saved             <- readRDS(results_file)
+  results_time      <- saved$results_time
+  results_snapshots <- saved$results_snapshots
+  results           <- saved$results
+  cat("Loaded saved results.\n")
+  cat(sprintf("Snapshots: %d rows\n", nrow(results_snapshots)))
+  cat(sprintf("Time series: %d rows\n", nrow(results_time)))
 
-# Run all simulations in parallel
-raw <- param_grid %>%
-  mutate(sim = furrr::future_pmap(
-    list(responsiveness, p_rewire, seed),
-    run_single_simulation,
-    .options = furrr_options(seed = TRUE)
-  ))
+} else {
+  # Run simulation only if no saved results exist
+  plan(multisession, workers = parallel::detectCores() - 1)
+  t_start <- proc.time()
 
-# Full time series averaged over seeds
-results_time <- raw %>%
-  mutate(h = map(sim, "history")) %>%
-  select(responsiveness, p_rewire, seed, h) %>%
-  unnest(h) %>%
-  group_by(responsiveness, p_rewire, round) %>%
-  summarise(across(where(is.numeric), mean, .names = "{.col}"),
-            .groups = "drop")
+  raw <- param_grid %>%
+    mutate(sim = furrr::future_pmap(
+      list(responsiveness, p_rewire, seed),
+      run_single_simulation,
+      .options = furrr_options(seed = TRUE)
+    ))
 
-# Snapshots averaged over seeds
-results_snapshots <- raw %>%
-  mutate(s = map(sim, "snapshots")) %>%
-  select(responsiveness, p_rewire, seed, s) %>%
-  unnest(s) %>%
-  group_by(responsiveness, p_rewire, round, pct_T) %>%
-  summarise(across(where(is.numeric), mean, .names = "{.col}"),
-            .groups = "drop")
+  # Full time series averaged over seeds
+  results_time <- raw %>%
+    mutate(h = map(sim, "history")) %>%
+    select(responsiveness, p_rewire, seed, h) %>%
+    unnest(h) %>%
+    group_by(responsiveness, p_rewire, round) %>%
+    summarise(across(where(is.numeric), mean, .names = "{.col}"),
+              .groups = "drop")
 
-# Final round only
-results <- results_snapshots %>%
-  filter(pct_T == 1.00) %>%
-  select(-round, -pct_T)
+  # Snapshots averaged over seeds
+  results_snapshots <- raw %>%
+    mutate(s = map(sim, "snapshots")) %>%
+    select(responsiveness, p_rewire, seed, s) %>%
+    unnest(s) %>%
+    group_by(responsiveness, p_rewire, round, pct_T) %>%
+    summarise(across(where(is.numeric), mean, .names = "{.col}"),
+              .groups = "drop")
 
-t_end   <- proc.time()
-elapsed <- (t_end - t_start)[["elapsed"]]
-cat(sprintf("Completed: %d simulations in %.1f seconds (%.1f min)\n",
-            nrow(param_grid), elapsed, elapsed / 60))
+  # Final round only
+  results <- results_snapshots %>%
+    filter(pct_T == 1.00) %>%
+    select(-round, -pct_T)
 
-# Reset to sequential after run
-plan(sequential)
+  plan(sequential)
+
+  t_end   <- proc.time()
+  elapsed <- (t_end - t_start)[["elapsed"]]
+  cat(sprintf("Completed: %d simulations in %.1f seconds (%.1f min)\n",
+              nrow(param_grid), elapsed, elapsed / 60))
+
+  saveRDS(list(
+    results_time      = results_time,
+    results_snapshots = results_snapshots,
+    results           = results
+  ), results_file)
+
+  cat(sprintf("Results saved to %s\n", results_file))
+}
 ```
-
-
 ```{r x-axis-setup, include=FALSE}
 x_scale <- scale_x_log10(
   breaks = c(0.1, 0.5, 1, 2, 5, 10, 25),
@@ -114,9 +152,11 @@ x_scale <- scale_x_log10(
 )
 ```
 
+---
+
 ## Results
 
-### Plot 1 — Average Ideological Drift (Snapshots)
+### Snapshot Plots (T = 50 / 100 / 150 / 200)
 ```{r plot-drift-snapshots, fig.width = 10, fig.height = 5}
 results_snapshots %>%
   ggplot(aes(x = responsiveness, y = avg_drift,
@@ -130,10 +170,6 @@ results_snapshots %>%
        color   = "Rewiring (p)") +
   theme_minimal()
 ```
-
----
-
-### Plot 2 — Lost Vote Rate (Snapshots)
 ```{r plot-lost-snapshots, fig.width = 10, fig.height = 5}
 results_snapshots %>%
   ggplot(aes(x = responsiveness, y = lost_vote_rate,
@@ -147,10 +183,6 @@ results_snapshots %>%
        color   = "Rewiring (p)") +
   theme_minimal()
 ```
-
----
-
-### Plot 3 — Delegation Rate (Snapshots)
 ```{r plot-delegation-snapshots, fig.width = 10, fig.height = 5}
 results_snapshots %>%
   ggplot(aes(x = responsiveness, y = delegation_rate,
@@ -164,12 +196,8 @@ results_snapshots %>%
        color   = "Rewiring (p)") +
   theme_minimal()
 ```
----
-
----
-### Plot 4
-### Table — Yes / No / Lost Votes by Snapshot
-```{r table-yes-no, fig.width = 10, fig.height = 5}
+```{r table-yes-no}
+# Vote counts: Direct Democracy vs Liquid Democracy per snapshot
 results_snapshots %>%
   mutate(
     lost_votes = direct_yes + direct_no - liquid_yes - liquid_no
@@ -179,7 +207,7 @@ results_snapshots %>%
          liquid_yes, liquid_no, lost_votes) %>%
   mutate(across(c(direct_yes, direct_no,
                   liquid_yes, liquid_no, lost_votes),
-                ~ round(.x, 1))) %>%  # <- explizit als lambda
+                ~ round(.x, 1))) %>%
   arrange(round, responsiveness, p_rewire) %>%
   knitr::kable(
     col.names = c("Responsiveness", "Rewiring (p)", "T",
@@ -188,8 +216,6 @@ results_snapshots %>%
     caption   = "Yes / No Vote Counts at T = 50 / 100 / 150 / 200 (averaged over seeds)"
   )
 ```
-
-### Plot — Majority Margins: Liquid vs. Direct Democracy (Snapshots)
 ```{r plot-margins-snapshots, fig.width = 10, fig.height = 5}
 results_snapshots %>%
   tidyr::pivot_longer(
@@ -207,14 +233,14 @@ results_snapshots %>%
   x_scale +
   labs(title   = "Majority Margins: Liquid vs. Direct Democracy",
        x       = "Responsiveness to Power",
-       y       = "Majority Margin (Yes − No)",
+       y       = "Majority Margin (Yes - No)",
        color   = "System") +
   theme_minimal()
 ```
 
 ---
 
-### Plot 5 — Average Ideological Drift over Time (Time Series)
+### Time Series Plots (all 200 rounds)
 ```{r plot-drift-time, fig.width = 10, fig.height = 5}
 results_time %>%
   ggplot(aes(x = round, y = avg_drift,
@@ -227,10 +253,6 @@ results_time %>%
        color   = "Rewiring (p)") +
   theme_minimal()
 ```
-
----
-
-### Plot 6 — Lost Vote Rate over Time (Time Series)
 ```{r plot-lost-time, fig.width = 10, fig.height = 5}
 results_time %>%
   ggplot(aes(x = round, y = lost_vote_rate,
@@ -243,10 +265,6 @@ results_time %>%
        color   = "Rewiring (p)") +
   theme_minimal()
 ```
-
----
-
-### Plot 7 — Delegation Rate over Time (Time Series)
 ```{r plot-delegation-time, fig.width = 10, fig.height = 5}
 results_time %>%
   ggplot(aes(x = round, y = delegation_rate,
@@ -259,10 +277,6 @@ results_time %>%
        color   = "Rewiring (p)") +
   theme_minimal()
 ```
-
----
-
-### Plot 8 — Delegation Stability over Time (Time Series)
 ```{r plot-stability-time, fig.width = 10, fig.height = 5}
 results_time %>%
   filter(!is.na(delegation_stability)) %>%
