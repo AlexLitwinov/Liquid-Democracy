@@ -26,9 +26,6 @@ compute_attractiveness <- function(pref_i, pref_j, pow_i, pow_j, resp) {
 # Cycles are identified by pointers that have not reached 0
 # after n iterations.
 #
-# Cost: O(L * n) vector operations instead of O(n * L) R loops.
-# In practice: L << n, and vector ops are ~100x faster than
-# R loops -> substantial speedup for large n.
 # =============================================================
 
 find_roots_vectorized <- function(n, delegate_of) {
@@ -241,14 +238,13 @@ connect_experts <- function(gF, agents, n_per_community,
 #     all votes of agents in that chain).
 #     Votes propagate along chains to the root.
 # =============================================================
-
 simulate_liquid_democracy <- function(
     seed                    = 123,
-    n_per_community         = 50,
-    n_communities           = 5,
+    n_per_community         = 250,
+    n_communities           = 1,
     node_degree             = 6,
-    n_experts_per_community = 2,
-    expert_connectedness    = 0.2,
+    n_experts_per_community = 0,
+    expert_connectedness    = 0,
     p_rewire                = 0.05,
     responsiveness          = 1,
     inertia                 = 0,
@@ -264,66 +260,87 @@ simulate_liquid_democracy <- function(
   gF <- connect_experts(gF, agents, n_per_community,
                         expert_connectedness, seed)
   
-  # adj[[i]]: neighbours of i in the friendship network (outgoing edges)
-  # For lay agents this includes other lay agents + reachable experts
   adj     <- lapply(seq_len(n_all),
                     \(v) as.integer(neighbors(gF, v, mode = "out")))
   lay_ids <- which(agents$type == "lay")
-  pref    <- agents$preference   # preferences are fixed throughout
+  pref    <- agents$preference
   
-  history           <- numeric(T)
+  # ---------------------------------------------------------
+  # Snapshot rounds: 25%, 50%, 75%, 100% of T
+  # All metrics including expensive ones computed at these points
+  # ---------------------------------------------------------
+  snapshot_rounds <- unique(round(c(0.25, 0.50, 0.75, 1.00) * T))
+  
+  # Per-round history for cheap metrics
+  history_lost       <- numeric(T)
+  history_drift      <- numeric(T)
+  history_delegation <- numeric(T)
+  history_stability  <- numeric(T)
+  
+  # Snapshot storage for all metrics
+  snapshot_list     <- vector("list", length(snapshot_rounds))
+  names(snapshot_list) <- as.character(snapshot_rounds)
+  
   delegation_graphs <- vector("list", T)
   
+  # Helper: Gini coefficient
+  gini <- function(x) {
+    if (sum(x) == 0) return(0)
+    x <- sort(x); n <- length(x)
+    sum((2 * seq_len(n) - n - 1) * x) / (n * sum(x))
+  }
+  
+  # Helper: Top-5% power share
+  top5 <- function(x) {
+    n_top <- max(1, floor(0.05 * length(x)))
+    sum(sort(x, decreasing = TRUE)[1:n_top]) / sum(x)
+  }
+  
   for (t in seq_len(T)) {
-    
-    pow <- agents$power   # power from t-1 (round 1: all power = 1)
-    
+
+    pow      <- agents$power
+
     # --------------------------------------------------
-    # Lay agents make their delegation decision
+    # Delegation decision
     # --------------------------------------------------
     targets <- vapply(lay_ids, function(i) {
       nb <- adj[[i]]
+
+      # Self-weight: agent identifies the most attractive available delegate
+      # (j* = argmax A_ij, combining ideological proximity and power), then
+      # compares own power against that single best alternative.
+      # Rationale: the relevant question is not "am I above average?" but
+      # "is there anyone who can represent me better than I represent myself?"
+      # Fallback 0.5 when agent has no neighbours (no comparison possible).
+      w_self <- if (length(nb)) {
+        a_nb   <- (1 - abs(pref[i] - pref[nb])) *
+                  (1 / (1 + exp(-responsiveness * (pow[nb] - pow[i]))))
+        j_star <- nb[which.max(a_nb)]
+        1 / (1 + exp(-responsiveness * (pow[i] - pow[j_star])))
+      } else 0.5
       
-      # Gewicht für direktes Abstimmen
-      w_self <- 1 / (1 + exp(-responsiveness * pow[i]))
-      
-      # Gewicht für Trägheit: aktuellen Delegaten beibehalten
-      current_target <- if (agents$delegated[i]) {
-        el <- as_edgelist(delegation_graphs[[max(1, t - 1)]], names = FALSE)
+      # Inertia: retain current delegate with probability `inertia`
+      if (inertia > 0 && agents$delegated[i]) {
+        el      <- as_edgelist(delegation_graphs[[max(1, t - 1)]], names = FALSE)
         matches <- el[el[, 1] == i, 2]
-        if (length(matches)) matches[1] else NA_integer_
-      } else NA_integer_
+        if (length(matches) && runif(1) < inertia) return(matches[1])
+      }
       
-      # Gewicht für Nachbarn
       w_nb <- if (length(nb))
         compute_attractiveness(pref[i], pref[nb], pow[i], pow[nb], responsiveness)
       else numeric(0)
       
-      # Trägheitsgewicht nur wenn aktueller Delegat ein Nachbar ist
-      w_inertia <- if (!is.na(current_target) && current_target %in% nb) {
-        inertia
-      } else 0
-      
-      # Gesamtgewichte: self, dann für jeden Nachbar (+ inertia falls aktueller Delegat)
-      w_nb_final <- w_nb
-      if (!is.na(current_target) && current_target %in% nb) {
-        idx <- which(nb == current_target)
-        w_nb_final[idx] <- w_nb_final[idx] + w_inertia
-      }
-      
-      w <- pmax(c(w_self, w_nb_final), 0)
+      w <- pmax(c(w_self, w_nb), 0)
       if (sum(w) == 0) w[] <- 1
-      
       c(i, nb)[sample.int(length(w), 1L, prob = w)]
     }, integer(1L))
     
     # --------------------------------------------------
-    # Build delegation graph for this round
-    # Edge i -> j means: i delegates to j
+    # Build delegation graph
     # --------------------------------------------------
-    mask      <- targets != lay_ids   # only genuine delegations
-    edge_from <- lay_ids[mask]        # lay agents who delegate
-    edge_to   <- targets[mask]        # target: another lay agent or expert
+    mask      <- targets != lay_ids
+    edge_from <- lay_ids[mask]
+    edge_to   <- targets[mask]
     
     if (length(edge_from)) {
       gD <- graph_from_edgelist(cbind(edge_from, edge_to), directed = TRUE)
@@ -333,26 +350,113 @@ simulate_liquid_democracy <- function(
     }
     delegation_graphs[[t]] <- gD
     
-    # --------------------------------------------------
-    # Compute transitive power (available to agents in round t+1)
-    # --------------------------------------------------
-    agents$power <- compute_power(n_all, edge_from, edge_to)
-    
-    # --------------------------------------------------
-    # Propagate votes along delegation chains
-    # --------------------------------------------------
+    agents$power     <- compute_power(n_all, edge_from, edge_to)
     agents$my_vote   <- propagate_votes(pref, n_all, edge_from, edge_to)
     agents$delegated <- seq_len(n_all) %in% edge_from
     
-    # Share of lost votes (cycles -> NA)
-    history[t] <- mean(is.na(agents$my_vote))
+    # --------------------------------------------------
+    # Cheap metrics — recorded every round
+    # --------------------------------------------------
+    represented            <- agents[!is.na(agents$my_vote), ]
+    history_lost[t]        <- mean(is.na(agents$my_vote))
+    history_drift[t]       <- if (nrow(represented) > 0)
+      mean(abs(represented$preference - represented$my_vote)) else NA_real_
+    history_delegation[t]  <- mean(agents$delegated[agents$type == "lay"])
+    
+    # Delegation stability — fraction of lay agents keeping same target
+    # compared to previous round (NA for round 1, no previous round exists)
+    history_stability[t]   <- if (t > 1) {
+      el_prev     <- as_edgelist(delegation_graphs[[t - 1]], names = FALSE)
+      el_curr     <- as_edgelist(gD, names = FALSE)
+      target_prev <- integer(n_all)
+      target_curr <- integer(n_all)
+      if (nrow(el_prev)) target_prev[el_prev[, 1]] <- el_prev[, 2]
+      if (nrow(el_curr)) target_curr[el_curr[, 1]] <- el_curr[, 2]
+      mean(target_prev[lay_ids] == target_curr[lay_ids])
+    } else NA_real_
+    
+    # --------------------------------------------------
+    # Full snapshot — recorded at 25%, 50%, 75%, 100% of T
+    # --------------------------------------------------
+    if (t %in% snapshot_rounds) {
+      
+      # Chain length (expensive)
+      roots_snap <- which(degree(gD, mode = "out") == 0)
+      if (length(roots_snap) > 0 && ecount(gD) > 0) {
+        dist_mat      <- distances(gD, mode = "out", to = roots_snap)
+        chain_lengths <- apply(dist_mat, 1, function(d) {
+          fd <- d[is.finite(d)]; if (length(fd)) min(fd) else NA_real_
+        })
+        delegating_lengths          <- chain_lengths[!is.na(chain_lengths) & chain_lengths > 0]
+        avg_chain_length_delegators <- if (length(delegating_lengths) > 0)
+          mean(delegating_lengths) else 0
+      } else {
+        avg_chain_length_delegators <- 0
+      }
+      
+      # Largest voting bloc (expensive)
+      active_nodes <- which(degree(gD, mode = "all") > 0)
+      if (length(active_nodes) > 0) {
+        gD_active           <- induced_subgraph(gD, active_nodes)
+        comps               <- components(gD_active)
+        largest_voting_bloc <- max(comps$csize) / n_all
+        total_components    <- comps$no
+      } else {
+        largest_voting_bloc <- 0
+        total_components    <- 0
+      }
+      
+      # Delegation stability — fraction of lay agents keeping same target
+      # compared to previous round (NA for first snapshot at t=1)
+      stab <- if (t > 1) {
+        g_prev      <- delegation_graphs[[t - 1]]
+        el_prev     <- as_edgelist(g_prev, names = FALSE)
+        el_curr     <- as_edgelist(gD,     names = FALSE)
+        
+        target_prev <- integer(n_all)
+        target_curr <- integer(n_all)
+        
+        if (nrow(el_prev)) target_prev[el_prev[, 1]] <- el_prev[, 2]
+        if (nrow(el_curr)) target_curr[el_curr[, 1]] <- el_curr[, 2]
+        
+        mean(target_prev[lay_ids] == target_curr[lay_ids])
+      } else NA_real_
+      
+      rep_power <- represented$power
+      
+      snapshot_list[[as.character(t)]] <- tibble(
+        round                       = t,
+        pct_T                       = t / T,
+        lost_vote_rate              = history_lost[t],
+        avg_drift                   = history_drift[t],
+        delegation_rate             = history_delegation[t],
+        gini_power                  = gini(rep_power),
+        top5_power_share            = top5(rep_power),
+        avg_chain_length_delegators = avg_chain_length_delegators,
+        largest_voting_bloc_share   = largest_voting_bloc,
+        total_components            = total_components,
+        delegation_stability        = stab,
+        direct_yes                  = sum(agents$preference >= 0.5),
+        direct_no                   = sum(agents$preference  < 0.5),
+        direct_margin               = sum(agents$preference >= 0.5) -
+          sum(agents$preference  < 0.5),
+        liquid_yes                  = sum(represented$my_vote >= 0.5, na.rm = TRUE),
+        liquid_no                   = sum(represented$my_vote  < 0.5, na.rm = TRUE),
+        liquid_margin               = sum(represented$my_vote >= 0.5, na.rm = TRUE) -
+          sum(represented$my_vote  < 0.5, na.rm = TRUE)
+      )
+    }
   }
   
   list(
-    agents            = agents,
-    history_lost      = history,
-    delegation_graphs = delegation_graphs,
-    final_graph       = delegation_graphs[[T]],
-    friendship_graph  = gF
+    agents             = agents,
+    history_lost       = history_lost,
+    history_drift      = history_drift,
+    history_delegation = history_delegation,
+    history_stability  = history_stability,   # neu
+    snapshots          = bind_rows(snapshot_list),
+    delegation_graphs  = delegation_graphs,
+    final_graph        = delegation_graphs[[T]],
+    friendship_graph   = gF
   )
 }

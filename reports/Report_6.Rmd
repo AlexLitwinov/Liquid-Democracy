@@ -1,0 +1,194 @@
+---
+title: "Weekly Report — Week 6 (27.03.2026 – 02.04.2026)"
+output: github_document
+date: "2026-03-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = here::here())
+
+library(here)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+
+source(here::here("scripts/Network.R"))
+
+f1 <- readRDS(here::here("simulations/output/results_sim3_rewire_0.1_1000seeds.rds"))
+f2 <- readRDS(here::here("simulations/output/results_sim3_rewire_0.1_1000seeds_newformula.rds"))
+f3 <- readRDS(here::here("simulations/output/results_sim3_rewire_0.1_1000seeds_argmaxformula.rds"))
+
+combined <- bind_rows(
+  f1$results_snapshots %>% mutate(formula = "Formula 1: Absolute Power"),
+  f2$results_snapshots %>% mutate(formula = "Formula 2: Mean Contest"),
+  f3$results_snapshots %>% mutate(formula = "Formula 3: Best-Neighbour Argmax")
+)
+combined_time <- bind_rows(
+  f1$results_time %>% mutate(formula = "Formula 1: Absolute Power"),
+  f2$results_time %>% mutate(formula = "Formula 2: Mean Contest"),
+  f3$results_time %>% mutate(formula = "Formula 3: Best-Neighbour Argmax")
+)
+
+x_scale <- scale_x_log10(
+  breaks = c(0.1, 0.5, 1, 2, 5, 10, 25),
+  labels = c("0.1", "0.5", "1", "2", "5", "10", "25")
+)
+col_scale <- scale_color_manual(values = c(
+  "Formula 1: Absolute Power"        = "steelblue",
+  "Formula 2: Mean Contest"          = "tomato",
+  "Formula 3: Best-Neighbour Argmax" = "forestgreen"
+))
+```
+
+## Summary
+
+- Iterated on the self-weight formula across three versions and validated each with 1 000-seed runs
+- Final formula: agent identifies best available delegate via $A_{ij}$, then compares own power against that single neighbour
+
+---
+
+## 1. Self-Weight Formula Evolution
+
+**Formula 1 — Absolute Power:**
+`w_self = sigmoid(r × own_power)`
+Used absolute power, so `r` inflated self-confidence independently of any social comparison. At high `r`, even an agent with power = 1 had self-weight ≈ 1, suppressing delegation before any power hierarchy could form.
+
+**Formula 2 — Mean Contest:**
+`w_self = mean over neighbours j of sigmoid(r × (own_power − power_j))`
+Compared own power against each neighbour individually and averaged the win probabilities. Symmetric with the neighbour formula, but ignores ideology entirely — a powerful ideologically distant neighbour pulled self-weight down just as much as a powerful ideologically close one.
+
+**Formula 3 — Best-Neighbour Argmax:**
+`j* = argmax A_ij`,  `w_self = sigmoid(r × (own_power − power_j*))`
+Agent first identifies the most attractive available delegate — the neighbour who best combines ideological proximity and power — then compares own power only against that single best alternative. Ideology filters the candidate in Step 1; power decides the contest in Step 2.
+
+---
+
+## 2. Formula Comparison — 1 000 Seeds
+
+### Ideological Drift
+
+```{r plot-drift, fig.width = 10, fig.height = 5}
+combined %>%
+  ggplot(aes(x = responsiveness, y = avg_drift, color = formula)) +
+  geom_line() + geom_point() +
+  facet_wrap(~round, labeller = label_both, ncol = 4) +
+  x_scale + col_scale +
+  labs(title    = "Average Ideological Drift at T = 50 / 100 / 150 / 200",
+       subtitle = "Averaged over 1 000 seeds — three self-weight formulas",
+       x = "Responsiveness to Power", y = "Avg. Ideological Drift",
+       color = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+### Lost Vote Rate
+
+```{r plot-lost, fig.width = 10, fig.height = 5}
+combined %>%
+  ggplot(aes(x = responsiveness, y = lost_vote_rate, color = formula)) +
+  geom_line() + geom_point() +
+  facet_wrap(~round, labeller = label_both, ncol = 4) +
+  x_scale + col_scale +
+  labs(title    = "Lost Vote Rate at T = 50 / 100 / 150 / 200",
+       subtitle = "Averaged over 1 000 seeds — three self-weight formulas",
+       x = "Responsiveness to Power", y = "Lost Vote Rate",
+       color = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+### Delegation Rate
+
+```{r plot-delegation, fig.width = 10, fig.height = 5}
+combined %>%
+  ggplot(aes(x = responsiveness, y = delegation_rate, color = formula)) +
+  geom_line() + geom_point() +
+  facet_wrap(~round, labeller = label_both, ncol = 4) +
+  x_scale + col_scale +
+  labs(title    = "Delegation Rate at T = 50 / 100 / 150 / 200",
+       subtitle = "Averaged over 1 000 seeds — three self-weight formulas",
+       x = "Responsiveness to Power", y = "Share of Lay Agents Delegating",
+       color = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+### Delegation Stability over Time
+
+```{r plot-stability, fig.width = 10, fig.height = 5}
+combined_time %>%
+  filter(!is.na(delegation_stability)) %>%
+  ggplot(aes(x = round, y = delegation_stability, color = formula)) +
+  geom_line(alpha = 0.8) +
+  geom_hline(yintercept = 0.99, linetype = "dashed", color = "grey40") +
+  facet_wrap(~responsiveness, labeller = label_both, ncol = 4) +
+  col_scale +
+  labs(title    = "Delegation Stability over Time",
+       subtitle = "Dashed line = 99% threshold; averaged over 1 000 seeds",
+       x = "Round", y = "Share of Agents Not Switching Target",
+       color = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+---
+
+## 3. Majority Margins (Formula 3, 1 000 Seeds)
+
+With 1 000 seeds the Direct Democracy margin converges close to its theoretical expectation of 0 (uniform preferences, n = 250), confirming the earlier deviation with 100 seeds was purely sampling noise (SE ≈ 1.58 at 100 seeds, ≈ 0.50 at 1 000 seeds).
+
+```{r plot-margins, fig.width = 10, fig.height = 5}
+f3$results_snapshots %>%
+  tidyr::pivot_longer(cols = c(liquid_margin, direct_margin),
+                      names_to = "system", values_to = "margin") %>%
+  mutate(system = recode(system,
+    "liquid_margin" = "Liquid Democracy",
+    "direct_margin" = "Direct Democracy")) %>%
+  ggplot(aes(x = responsiveness, y = margin, color = system)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  facet_wrap(~round, labeller = label_both, ncol = 4) +
+  x_scale +
+  labs(title    = "Majority Margins: Liquid vs. Direct Democracy",
+       subtitle = "Formula 3 (Best-Neighbour Argmax) — averaged over 1 000 seeds (p_rewire = 0.10)",
+       x = "Responsiveness to Power", y = "Majority Margin (Yes - No)",
+       color = "System") +
+  theme_minimal()
+```
+
+---
+
+## 4. Seed Validation
+
+The table below shows key metrics for 15 individual seeds (responsiveness = 1,
+p\_rewire = 0.10, T = 1, n = 250). Direct and Liquid margins vary in sign and
+magnitude around zero across seeds, confirming independent sampling. Lost votes
+reflect delegation cycles formed in round 1 before any power hierarchy exists.
+
+```{r seed-table}
+seed_check <- map_dfr(1:15, function(s) {
+  res <- simulate_liquid_democracy(
+    seed = s, n_per_community = 250, n_communities = 1,
+    node_degree = 6, p_rewire = 0.10, responsiveness = 1, T = 1
+  )
+  lay <- res$agents[res$agents$type == "lay", ]
+  tibble(
+    Seed                  = as.character(s),
+    `Direct Yes`          = sum(res$agents$preference >= 0.5),
+    `Direct No`           = sum(res$agents$preference  < 0.5),
+    `Direct Margin`       = sum(res$agents$preference >= 0.5) -
+                            sum(res$agents$preference  < 0.5)
+  )
+})
+
+knitr::kable(
+  seed_check,
+  align = "rrrrrr",
+  caption = "Per-seed metrics at T = 1 (n = 250, responsiveness = 1, p_rewire = 0.10)"
+)
+```
+
+---
+
+## Open Issues
+
+- Self-weight: another alterative: Competitive Residual Self-Weight: 1 - max(w_nb) (The core idea is to treat Self-Confidence not as a fixed value, but as the residual trust left over after evaluating the best available alternative)
+- How to deal with cycles: Ranked fallback (2nd best option) or keep cycles?

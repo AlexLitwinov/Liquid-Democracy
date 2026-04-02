@@ -1,0 +1,30 @@
+---
+title: "Weekly Report — Week 2 (26.02.2025 – 05.03.2025)"
+output: 
+  github_document:
+date: "2026-03-05"
+---
+
+## Summary
+Bug fixing week. Core simulation logic was corrected so that all agents update
+their delegation decision each round based on the power values from t-1.
+Summary metrics and visualisation toolkit were also revised.
+
+## Work Done
+
+**Bug Fixes**
+
+- Fixed power update logic: agents now correctly observe power from t-1 when
+  making delegation decisions in round t, producing proper dynamic behaviour
+  over the T rounds
+
+**Summary Metrics Revisions**
+
+- Replaced slow per-node chain length loop with vectorized `igraph::distances()`
+
+## Key Result
+After fixes: power concentration and delegation dynamics now behave as expected.
+
+## Open Issues
+
+- Running first Simulations

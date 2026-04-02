@@ -1,28 +1,21 @@
 Read Me
 ================
-2026-03-04
+2026-03-28
 
-- [Project Overview](#project-overview)
 - [Model](#model)
   - [Summary of the Current Base
     Code](#summary-of-the-current-base-code)
     - [Core Technical Components](#core-technical-components)
 - [Metrics (Summary Function)](#metrics-summary-function)
-  - [1. network_description](#1-network_description)
-  - [2. dynamic_evaluation](#2-dynamic_evaluation)
-  - [3. power_by_type](#3-power_by_type)
+  - [1. Network Description](#1-network-description)
+  - [2. Dynamic Evaluation](#2-dynamic-evaluation)
+  - [3. Convergence](#3-convergence)
+  - [4. Type-Specific Analysis](#4-type-specific-analysis)
 - [Visualisation](#visualisation)
   - [Example Simulation](#example-simulation)
   - [1. Multi-Layer Network Mapping](#1-multi-layer-network-mapping)
   - [2. Summary Table](#2-summary-table)
   - [3. Distributional Diagnostics](#3-distributional-diagnostics)
-
-# Project Overview
-
-This document serves as a continuous research log for the Project. It
-tracks any important change, updates or key findings.
-
-------------------------------------------------------------------------
 
 # Model
 
@@ -97,20 +90,9 @@ never in need of a delegate.
 
 At the start of every round $t$, each lay agent independently selects a
 delegation target from their candidate set: themselves (direct vote) or
-any out-neighbour in the friendship network.
-
-##### Self-retention weight
-
-The weight for voting directly is a logistic function of the agent’s own
-current power:
-
-$$
-w_{self} = \frac{1}{1 + e^{-resp \cdot power_i}}
-$$
-
-An agent who already attracts many delegations (high power) is therefore
-more likely to continue voting directly. In round 1, all agents have
-$power = 1$, so $w_{self} = 0.5$ for every agent.
+any out-neighbour in the friendship network. The previous round’s power
+values are used when computing weights, so agents react to the state of
+the system as it was, not as it is being updated.
 
 ##### Neighbour attractiveness weight
 
@@ -121,18 +103,60 @@ $$
 A_{ij} = \frac{1 - |pref_i - pref_j|}{1 + e^{-resp \cdot (power_j - power_i)}}
 $$
 
-- The first term equals 1 when $i$ and $j$ share the same preference and
+- The numerator equals 1 when $i$ and $j$ share the same preference and
   falls to 0 for maximally different agents.
-- The second term exceeds 0.5 whenever $j$ holds more power than $i$,
+- The sigmoid term exceeds 0.5 whenever $j$ holds more power than $i$,
   and drops below 0.5 otherwise.
-- The parameter $resp$ controls the steepness of the competence sigmoid
-  — higher values make agents more sensitive to power differences.
+- The parameter $resp$ controls the steepness of the sigmoid — higher
+  values make agents more sensitive to power differences.
 
 A target is drawn randomly from the candidate set with probabilities
 proportional to these weights. This produces **endogenous persistence**:
 agents who accumulate power become more attractive as delegates in
 subsequent rounds, creating self-reinforcing delegation chains without
 any explicit memory parameter.
+
+##### Self-weight
+
+The self-weight is computed in two steps. First, the agent uses $A_{ij}$
+to identify $j^*$, the single most attractive available delegate — the
+neighbour who best combines ideological proximity and accumulated power.
+Then the agent compares its own power against $j^*$:
+
+$$
+j^* = \arg\max_{j \in N_i} A_{ij}
+$$
+
+$$
+w_{self,i} = \frac{1}{1 + e^{-resp \cdot (power_i - power_{j^*})}}
+$$
+
+The behavioural assumption is: *“is there anyone who can represent me
+better than I represent myself?”* Only the best available representative
+is relevant to this comparison.
+
+- If $power_i > power_{j^*}$: self-weight $> 0.5$, agent tends to vote
+  directly.
+- If $power_i < power_{j^*}$: self-weight $< 0.5$, agent tends to
+  delegate.
+- If no ideologically close neighbour exists, $A_{ij} \approx 0$ for all
+  $j$, so all neighbour weights collapse to zero — the agent votes
+  directly with near-certainty regardless of $w_{self}$.
+
+When all agents have equal power (as in round 1), $sigmoid(0) = 0.5$ for
+every agent regardless of $resp$. For isolated agents with no neighbours
+the fallback is $w_{self} = 0.5$.
+
+Both $w_{self}$ and $A_{ij}$ use the same sigmoid structure and the same
+parameter $resp$, which therefore has a single consistent interpretation
+throughout: **sensitivity to power differences**.
+
+##### Inertia (optional)
+
+An optional `inertia` parameter (default 0) gives each lay agent a
+probability of retaining their current delegate without re-evaluating
+alternatives. At `inertia = 0` the system is fully memoryless — agents
+reconsider completely every round.
 
 ------------------------------------------------------------------------
 
@@ -150,14 +174,13 @@ $$A \rightarrow B \rightarrow C$$
 
 Here $A$ delegates to $B$, who further delegates to $C$. Agent $C$ is
 the **chain root** — the agent who actually casts the vote. Every agent
-starts with $power = 1$ (their own vote); the root of a chain of length
-$k$ accumulates $power = k + 1$.
+starts with $power = 1$ (their own vote); the root of a chain
+accumulates power equal to 1 plus the number of agents in their chain.
 
 Roots are identified using a vectorized pointer-jumping algorithm: in
 each iteration, every agent simultaneously advances one step along their
 chain using integer indexing, requiring at most $L$ iterations where $L$
-is the length of the longest chain. This avoids per-agent R loops and
-scales efficiently to large networks.
+is the length of the longest chain.
 
 ##### Cycles
 
@@ -184,103 +207,109 @@ After roots are identified, votes propagate as follows:
 When evaluating binary outcomes, preferences are interpreted using a
 threshold of $0.5$ (yes if $pref \geq 0.5$, no otherwise).
 
+------------------------------------------------------------------------
+
 # Metrics (Summary Function)
 
-To evaluate the state of the simulation, a comprehensive
-`summary_metrics` function is implemented. It summarizes key structural
-and behavioral properties of the final delegation network produced by
-the simulation.
-
-## 1. network_description
-
-This section characterizes the structural properties of the delegation
-network.
-
-- **lost_vote_rate**: Measures the percentage of agents whose votes do
-  not reach a final representative. Votes are lost when delegation
-  chains form cycles.
-- **vote_attribution_rate**: The proportion of agents whose votes
-  successfully reach a final representative. Defined as
-  $1 - \text{lost\_vote\_rate}$.
-- **mean_power**: The average voting power across all agents in the
-  network. Each agent starts with one vote; agents who receive
-  delegations accumulate additional voting power.
-- **max_power**: The highest voting power held by any agent in the
-  network, indicating the maximum degree of vote concentration.
-- **Gini Coefficient (Power)**: Measures inequality in the distribution
-  of voting power across agents. A value of **0** represents perfect
-  equality, while **1** indicates complete concentration of voting power
-  in a single agent.
-- **avg_chain_length**: The average number of delegation hops from an
-  agent to its chain root, computed over all agents (including direct
-  voters, for whom this value is 0). Higher values indicate a more
-  indirect democracy.
-- **total_components**: The number of weakly connected components in the
-  delegation graph among agents who delegated or received a delegation.
-  Isolated direct voters are excluded, as each would otherwise trivially
-  inflate this count.
-- **largest_voting_bloc_size**: The size of the largest weakly connected
-  component in the delegation network, representing the largest single
-  power bloc.
+`summary_metrics(res)` evaluates the state of the simulation at round T
+across four sections. Throughout, **represented agents** are agents with
+a valid $my\_vote$ (non-NA) — i.e., all agents except those in
+delegation cycles.
 
 ------------------------------------------------------------------------
 
-## 2. dynamic_evaluation
+## 1. Network Description
 
-This section evaluates how delegation affects ideological representation
-and collective decisions.
+Structural properties of the final delegation graph.
 
-- **avg_ideological_drift**: The average absolute difference between an
-  agent’s own preference and the final vote cast on their behalf,
-  computed over represented agents only. Values near 0 indicate
-  high-quality representation.
-- **direct_yes / direct_no**: The number of yes (≥ 0.5) and no (\< 0.5)
-  votes under **direct democracy**, where every agent votes their own
-  preference.
-- **liquid_yes / liquid_no**: The number of yes and no votes under
-  **liquid democracy**, based on the votes of final representatives
-  after delegation chains are resolved. Note that
-  `liquid_yes + liquid_no` will be smaller than `direct_yes + direct_no`
-  whenever votes are lost to cycles, so the two vote counts are not
-  directly commensurable in absolute terms.
-- **liquid_margin**: The majority margin under liquid democracy, defined
-  as `liquid_yes - liquid_no`. Positive values indicate a Yes majority;
-  negative values indicate a No majority.
-- **direct_margin**: The majority margin under direct democracy, defined
-  as `direct_yes - direct_no`. Positive values indicate a Yes majority;
-  negative values indicate a No majority.
+| Metric | Agents included | What it measures |
+|----|----|----|
+| `lost_vote_rate` | Lay agents only | Fraction of lay agents in a delegation cycle (vote lost) |
+| `delegation_rate` | Lay agents only | Fraction of lay agents who delegated in the final round |
+| `max_power` | All agents | Absolute vote count of the most powerful agent |
+| `max_power_share` | All agents | `max_power / total attributed votes` — normalised, comparable across simulation sizes |
+| `max_indegree` | All agents | Maximum number of agents delegating *directly* (non-transitively) to one agent |
+| `gini_power_nominal` | Represented agents only | Power inequality within the delegation hierarchy that operated; cycle agents excluded |
+| `top5_power_share_nominal` | Represented agents only | Fraction of attributed votes held by the top 5%; cycle agents excluded |
+| `gini_power_effective` | All lay agents | Power inequality across the full lay population; cycle agents enter as power = 0 |
+| `top5_power_share_effective` | All lay agents | Top-5% power share over all lay agents; cycle agents enter as power = 0 |
+| `avg_chain_length_all` | All agents (NA excluded) | Mean delegation depth; direct voters = 0, cycle agents excluded (NA) |
+| `avg_chain_length_delegators` | Delegating agents only | Mean delegation depth among agents who delegated; more comparable across conditions with varying delegation rates |
+| `max_chain_length` | Delegating agents only | Longest delegation chain in the final graph |
+| `largest_voting_bloc_share` | All agents | Fraction of all agents in the largest connected delegation tree |
+| `total_components` | All agents | Independent voting groups = delegation tree components + isolated direct voters |
 
-Comparing `liquid_margin` to `direct_margin` shows whether delegation
-changes the direction or strength of the collective majority. Because
-cycle losses reduce the liquid vote count, a shift in margin does not
-necessarily reflect a genuine opinion change — it may partly reflect
-which side loses more votes to cycles.
+**Nominal vs. effective power metrics:** Nominal metrics condition on
+successfully represented agents and describe inequality within the
+operating hierarchy. Effective metrics include cycle agents at power = 0
+and reflect system-wide inequality. Both should be reported together.
 
 ------------------------------------------------------------------------
 
-## 3. power_by_type
+## 2. Dynamic Evaluation
 
-This section compares voting power between different agent types.
+How delegation affects ideological representation and collective
+decisions.
 
-- **mean_power**: The average voting power for each agent type
-  (Laypersons vs. Experts).
-- **max_power**: The maximum voting power held by any agent within each
-  type.
+| Metric | Agents included | What it measures |
+|----|----|----|
+| `avg_ideological_drift` | Represented agents only | Mean \|preference − attributed vote\|; near 0 = high-quality representation |
+| `med_ideological_drift` | Represented agents only | Median drift (robust to outliers) |
+| `max_ideological_drift` | Represented agents only | Worst-case individual misrepresentation |
+| `pct_high_drift` | Represented agents only | Fraction with drift \> 0.3 |
+| `misclassification_rate` | Represented agents only | Fraction whose attributed vote is on the *wrong side* of 0.5 relative to their own preference — outcome-relevant measure |
+| `efficiency` | Lay agents | `(liquid_yes + liquid_no) / n_lay` — fraction of lay votes actually cast |
+| `direct_yes / direct_no` | All agents | Yes/No vote counts under direct democracy (all agents vote own preference) |
+| `liquid_yes / liquid_no` | Represented agents only | Yes/No vote counts under liquid democracy (cycle votes lost) |
+| `direct_margin` | All agents | Raw Yes − No majority margin under direct democracy |
+| `liquid_margin` | Represented agents only | Raw Yes − No margin under liquid democracy — **not directly comparable** to `direct_margin` due to different electorate sizes |
+| `direct_margin_pct` | All agents | Proportional margin = `direct_margin / n_agents` |
+| `liquid_margin_pct` | Represented agents only | Proportional margin = `liquid_margin / (liquid_yes + liquid_no)` — comparable to `direct_margin_pct` |
+| `outcome_reversal` | — | Whether liquid and direct democracy disagree on Yes/No outcome; based on proportional margins |
 
-This analysis helps identify whether experts systematically accumulate
-more voting power than regular voters within the delegation system.
+**Drift caveat:** Drift is computed only for represented agents. If
+cycle agents are non-randomly distributed across the preference space
+(which depends on network topology), the estimate is biased. Always
+interpret drift alongside `lost_vote_rate`.
+
+------------------------------------------------------------------------
+
+## 3. Convergence
+
+| Metric | What it measures |
+|----|----|
+| `convergence_sd` | SD of `lost_vote_rate` over the last 20 rounds — low = outcome has stabilised |
+| `delegation_stability` | Mean fraction of lay agents keeping the same delegation target between consecutive rounds, averaged over the last 20 round-pairs |
+| `edge_similarity_final` | Mean Jaccard similarity of the delegation graph between consecutive rounds, averaged over the last 20 round-pairs |
+| `convergence_round` | First round from which `delegation_stability ≥ 0.99` holds for 50 consecutive rounds; NA if never reached within T |
+| `cycle_indicator` | TRUE if stability \< 0.99 but edge similarity \> 0.95 — suggests oscillation of a subset of agents between fixed targets |
+| `converged_to_dd` | TRUE if convergence was detected but `delegation_rate < 0.05` — flags degenerate convergence to near-direct-democracy |
+
+------------------------------------------------------------------------
+
+## 4. Type-Specific Analysis
+
+| Metric       | What it measures                                     |
+|--------------|------------------------------------------------------|
+| `mean_power` | Average voting power per agent type (lay vs. expert) |
+| `max_power`  | Maximum voting power per agent type                  |
+
+Identifies whether experts systematically accumulate more voting power
+than lay agents.
+
+------------------------------------------------------------------------
 
 # Visualisation
 
 To complement the numerical metrics, a visualisation toolkit has been
 implemented to evaluate the structural and qualitative performance of
-the model across different complementary views.
+the model.
 
 ``` r
 library(here)
-source("../scripts/Network.R")
-source("../scripts/Summary.R")
-source("../scripts/Visualisations.R")
+source(here::here("scripts/Network.R"))
+source(here::here("scripts/Summary.R"))
+source(here::here("scripts/Visualisations.R"))
 ```
 
 ## Example Simulation
@@ -295,6 +324,7 @@ res <- simulate_liquid_democracy(
   expert_connectedness    = 0.2,
   p_rewire                = 0.05,
   responsiveness          = 1,
+  inertia                 = 0,
   T                       = 200
 )
 ```
@@ -324,9 +354,9 @@ plot_social_and_delegation(res)
 
 ## 2. Summary Table
 
-The summary table aggregates all key performance indicators across four
-dimensions: representation quality, power inequality, opinion dynamics,
-and network macro-structure.
+The summary table aggregates key performance indicators across
+representation quality, power inequality, opinion dynamics, and network
+macro-structure.
 
 ``` r
 summary_table <- get_summary_table(res)
@@ -340,13 +370,13 @@ knitr::kable(
 
 | Dimension        | Metric                   |  Value |
 |:-----------------|:-------------------------|-------:|
-| Representation   | Lost Vote Rate (%)       | 20.910 |
-| Representation   | Avg. Delegation Distance |  2.360 |
-| Inequality       | Gini (Power)             |  0.293 |
-| Inequality       | Max Power (Single Agent) | 12.000 |
-| Opinion Dynamics | Avg. Ideological Drift   |  0.144 |
-| Opinion Dynamics | Max. Ideological Drift   |  0.748 |
-| Network Macro    | Active Components        | 40.000 |
+| Representation   | Lost Vote Rate (%)       | 44.550 |
+| Representation   | Avg. Delegation Distance |  2.330 |
+| Inequality       | Gini (Power)             |  0.225 |
+| Inequality       | Max Power (Single Agent) | 10.000 |
+| Opinion Dynamics | Avg. Ideological Drift   |  0.155 |
+| Opinion Dynamics | Max. Ideological Drift   |  0.689 |
+| Network Macro    | Active Components        | 35.000 |
 
 Liquid Democracy: System Performance Overview
 
@@ -355,16 +385,15 @@ Liquid Democracy: System Performance Overview
 Two charts provide a structural health check of the simulation in its
 final state.
 
-- **Ideological Drift (Representation Loss)**: Restricted to laypersons
-  only, since experts always cast their own preference and have drift =
-  0 by definition. Measures the absolute distance between each
-  layperson’s true preference and the vote eventually cast on their
-  behalf via delegation. A distribution concentrated near 0 indicates
+- **Ideological Drift (Representation Loss)**: Restricted to represented
+  agents only (cycle agents excluded). Measures the absolute distance
+  between each agent’s true preference and the vote eventually cast on
+  their behalf. A distribution concentrated near 0 indicates
   high-quality representation.
 - **Power Concentration**: Ranks all agents by their accumulated voting
   power. Visually identifies the emergence of super-voters and shows
   whether experts are systematically accumulating more influence than
-  laypersons as the model intends.
+  laypersons.
 
 ``` r
 plot_summary_stats(res)
