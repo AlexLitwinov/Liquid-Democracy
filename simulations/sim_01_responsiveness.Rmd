@@ -57,7 +57,9 @@ run_single_simulation <- function(responsiveness, p_rewire, seed) {
     p_rewire                = p_rewire,
     responsiveness          = responsiveness,
     inertia                 = 0,
-    T                       = 200
+    T                       = 200,
+    selfweight_fn           = selfweight_argmax_log,
+    attractiveness_fn       = attractiveness_log
   )
 
   list(
@@ -81,15 +83,16 @@ run_single_simulation <- function(responsiveness, p_rewire, seed) {
 ```{r run-simulations}
 library(furrr)
 
-setting <- "rewire_0.1_1000seeds_argmaxformula"
+setting <- "rewire_0.1_1000seeds_log_argmax"
 results_file <- here::here(paste0("simulations/output/results_sim3_", setting, ".rds"))
 
 if (file.exists(results_file)) {
   # Load saved results - skip simulation entirely
-  saved             <- readRDS(results_file)
-  results_time      <- saved$results_time
-  results_snapshots <- saved$results_snapshots
-  results           <- saved$results
+  saved                    <- readRDS(results_file)
+  results_time             <- saved$results_time
+  results_snapshots        <- saved$results_snapshots
+  results_snapshots_seed   <- saved$results_snapshots_seed
+  results                  <- saved$results
   cat("Loaded saved results.\n")
   cat(sprintf("Snapshots: %d rows\n", nrow(results_snapshots)))
   cat(sprintf("Time series: %d rows\n", nrow(results_time)))
@@ -115,11 +118,14 @@ if (file.exists(results_file)) {
     summarise(across(where(is.numeric), mean, .names = "{.col}"),
               .groups = "drop")
 
-  # Snapshots averaged over seeds
-  results_snapshots <- raw %>%
+  # Per-seed snapshots (kept for distributional plots)
+  results_snapshots_seed <- raw %>%
     mutate(s = map(sim, "snapshots")) %>%
-    select(responsiveness, p_rewire, s) %>%
-    unnest(s) %>%
+    select(responsiveness, p_rewire, seed, s) %>%
+    unnest(s)
+
+  # Snapshots averaged over seeds
+  results_snapshots <- results_snapshots_seed %>%
     group_by(responsiveness, p_rewire, round, pct_T) %>%
     summarise(across(where(is.numeric), mean, .names = "{.col}"),
               .groups = "drop")
@@ -137,9 +143,10 @@ if (file.exists(results_file)) {
               nrow(param_grid), elapsed, elapsed / 60))
 
   saveRDS(list(
-    results_time      = results_time,
-    results_snapshots = results_snapshots,
-    results           = results
+    results_time           = results_time,
+    results_snapshots      = results_snapshots,
+    results_snapshots_seed = results_snapshots_seed,
+    results                = results
   ), results_file)
 
   cat(sprintf("Results saved to %s\n", results_file))
@@ -217,24 +224,62 @@ results_snapshots %>%
   )
 ```
 ```{r plot-margins-snapshots, fig.width = 10, fig.height = 5}
+# Direct democracy margin is seed-determined and independent of responsiveness.
+# Each seed's direct_margin is identical across all responsiveness levels (same
+# preferences), so we take one responsiveness level to avoid inflating n.
+dd_ref <- results_snapshots_seed %>%
+  filter(responsiveness == min(responsiveness)) %>%
+  group_by(round) %>%
+  summarise(
+    dd_mean = mean(direct_margin),
+    dd_lo   = dd_mean - 1.96 * sd(direct_margin) / sqrt(n()),
+    dd_hi   = dd_mean + 1.96 * sd(direct_margin) / sqrt(n()),
+    .groups = "drop"
+  )
+
 results_snapshots %>%
-  tidyr::pivot_longer(
-    cols      = c(liquid_margin, direct_margin),
-    names_to  = "system",
-    values_to = "margin"
-  ) %>%
-  mutate(system = recode(system,
-    "liquid_margin" = "Liquid Democracy",
-    "direct_margin" = "Direct Democracy")) %>%
-  ggplot(aes(x = responsiveness, y = margin, color = system)) +
-  geom_point() +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  left_join(dd_ref, by = "round") %>%
+  ggplot(aes(x = responsiveness)) +
+  geom_ribbon(aes(ymin = dd_lo, ymax = dd_hi), fill = "steelblue", alpha = 0.2) +
+  geom_hline(aes(yintercept = dd_mean), color = "steelblue", linetype = "dashed") +
+  geom_line(aes(y = liquid_margin), color = "tomato") +
+  geom_point(aes(y = liquid_margin), color = "tomato") +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "grey50") +
   facet_wrap(~round, labeller = label_both, ncol = 4) +
   x_scale +
-  labs(title   = "Majority Margins: Liquid vs. Direct Democracy",
-       x       = "Responsiveness to Power",
-       y       = "Majority Margin (Yes - No)",
-       color   = "System") +
+  labs(title    = "Majority Margins: Liquid vs. Direct Democracy",
+       subtitle = "Red = Liquid Democracy mean; blue dashed = Direct Democracy mean (±95% CI band); both averaged over 1 000 seeds",
+       x        = "Responsiveness to Power",
+       y        = "Majority Margin (Yes - No)") +
+  theme_minimal()
+```
+```{r plot-margins-boxplot, fig.width = 10, fig.height = 5}
+# Per-seed boxplots: liquid margin only (direct margin is constant across
+# responsiveness levels and is shown as a reference band instead)
+dd_ref_T200 <- results_snapshots_seed %>%
+  filter(pct_T == 1.00, responsiveness == min(responsiveness)) %>%
+  summarise(
+    dd_mean = mean(direct_margin),
+    dd_lo   = dd_mean - 1.96 * sd(direct_margin) / sqrt(n()),
+    dd_hi   = dd_mean + 1.96 * sd(direct_margin) / sqrt(n())
+  )
+
+results_snapshots_seed %>%
+  filter(pct_T == 1.00) %>%
+  ggplot(aes(x = factor(responsiveness), y = liquid_margin)) +
+  annotate("rect",
+           xmin = -Inf, xmax = Inf,
+           ymin = dd_ref_T200$dd_lo, ymax = dd_ref_T200$dd_hi,
+           fill = "steelblue", alpha = 0.15) +
+  geom_hline(yintercept = dd_ref_T200$dd_mean,
+             color = "steelblue", linetype = "dashed") +
+  geom_boxplot(fill = "tomato", alpha = 0.6, outlier.size = 0.3) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 3, color = "darkred") +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "grey50") +
+  labs(title    = "Distribution of Liquid Democracy Margins across 1 000 Seeds (T = 200)",
+       subtitle = "Red boxes = Liquid Democracy (line = median, diamond = mean); blue dashed = Direct Democracy mean (±95% CI band)",
+       x        = "Responsiveness to Power",
+       y        = "Majority Margin (Yes - No)") +
   theme_minimal()
 ```
 
@@ -276,6 +321,4 @@ results_time %>%
        y       = "Share of Lay Agents Delegating",
        color   = "Rewiring (p)") +
   theme_minimal()
-```
-
 ```

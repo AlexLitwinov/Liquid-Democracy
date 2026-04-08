@@ -1,0 +1,194 @@
+---
+title: "Weekly Report — Week 7 (03.04.2026 – 09.04.2026)"
+output: github_document
+date: "2026-04-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = here::here())
+
+library(here)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+
+source(here::here("scripts/Network.R"))
+
+f_abs <- readRDS(here::here("simulations/output/results_sim3_rewire_0.1_1000seeds_argmaxformula.rds"))
+f_log <- readRDS(here::here("simulations/output/results_sim3_rewire_0.1_1000seeds_log_argmax.rds"))
+
+combined <- bind_rows(
+  f_abs$results_snapshots %>% mutate(formula = "Absolute (Formula 3)"),
+  f_log$results_snapshots %>% mutate(formula = "Log-Ratio (Formula 4)")
+)
+combined_time <- bind_rows(
+  f_abs$results_time %>% mutate(formula = "Absolute (Formula 3)"),
+  f_log$results_time %>% mutate(formula = "Log-Ratio (Formula 4)")
+)
+
+x_scale <- scale_x_log10(
+  breaks = c(0.1, 0.5, 1, 2, 5, 10, 25),
+  labels = c("0.1", "0.5", "1", "2", "5", "10", "25")
+)
+col_scale <- scale_color_manual(values = c(
+  "Absolute (Formula 3)" = "steelblue",
+  "Log-Ratio (Formula 4)" = "tomato"
+))
+fill_scale <- scale_fill_manual(values = c(
+  "Absolute (Formula 3)" = "steelblue",
+  "Log-Ratio (Formula 4)" = "tomato"
+))
+```
+
+## Summary
+
+- Switched the power term in both the neighbour attractiveness and self-weight
+  formulas from absolute differences to log-ratios
+- Old formula: `sigmoid(r × (power_j − power_i))`
+- New formula: `sigmoid(r × log(power_j / power_i))`
+- Motivation: absolute differences cause sigmoid saturation once a power
+  hierarchy forms, making `r` lose interpretive meaning after early rounds;
+  log-ratios keep `r` consistent across all rounds
+- Both formulas run on 1 000 seeds, p_rewire = 0.10, T = 200
+
+---
+
+## 1. Formula Comparison
+
+**Formula 3 — Absolute Power Difference** (archived):
+`A_ij = (1 - |pref_i - pref_j|) × sigmoid(r × (power_j - power_i))`
+
+Once a hierarchy forms (e.g. round 20+), power differences easily reach 10–50.
+For r = 1, sigmoid(10) ≈ 1 and sigmoid(50) ≈ 1 — indistinguishable.
+The formula is effectively binary (always delegate / never delegate) long before T = 200.
+
+**Formula 4 — Log-Ratio Power** (current default):
+`A_ij = (1 - |pref_i - pref_j|) × sigmoid(r × log(power_j / power_i))`
+
+A 5:1 power ratio produces log(5) ≈ 1.61 regardless of whether the absolute
+values are 1 vs 5 or 100 vs 500. The sigmoid input stays on a bounded,
+interpretable scale throughout the simulation.
+
+---
+
+## 2. Snapshot Comparisons (T = 50 / 100 / 150 / 200)
+
+### Ideological Drift
+
+```{r plot-drift, fig.width = 10, fig.height = 5}
+combined %>%
+  ggplot(aes(x = responsiveness, y = avg_drift, color = formula)) +
+  geom_line() + geom_point() +
+  facet_wrap(~round, labeller = label_both, ncol = 4) +
+  x_scale + col_scale +
+  labs(title    = "Average Ideological Drift at T = 50 / 100 / 150 / 200",
+       subtitle = "Averaged over 1 000 seeds — absolute vs. log-ratio power",
+       x = "Responsiveness to Power", y = "Avg. Ideological Drift",
+       color = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+### Lost Vote Rate
+
+```{r plot-lost, fig.width = 10, fig.height = 5}
+combined %>%
+  ggplot(aes(x = responsiveness, y = lost_vote_rate, color = formula)) +
+  geom_line() + geom_point() +
+  facet_wrap(~round, labeller = label_both, ncol = 4) +
+  x_scale + col_scale +
+  labs(title    = "Lost Vote Rate at T = 50 / 100 / 150 / 200",
+       subtitle = "Averaged over 1 000 seeds — absolute vs. log-ratio power",
+       x = "Responsiveness to Power", y = "Lost Vote Rate",
+       color = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+### Delegation Rate
+
+```{r plot-delegation, fig.width = 10, fig.height = 5}
+combined %>%
+  ggplot(aes(x = responsiveness, y = delegation_rate, color = formula)) +
+  geom_line() + geom_point() +
+  facet_wrap(~round, labeller = label_both, ncol = 4) +
+  x_scale + col_scale +
+  labs(title    = "Delegation Rate at T = 50 / 100 / 150 / 200",
+       subtitle = "Averaged over 1 000 seeds — absolute vs. log-ratio power",
+       x = "Responsiveness to Power", y = "Share of Lay Agents Delegating",
+       color = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+### Power Concentration — Gini
+
+```{r plot-gini, fig.width = 10, fig.height = 5}
+combined %>%
+  ggplot(aes(x = responsiveness, y = gini_power, color = formula)) +
+  geom_line() + geom_point() +
+  facet_wrap(~round, labeller = label_both, ncol = 4) +
+  x_scale + col_scale +
+  labs(title    = "Gini Coefficient of Power at T = 50 / 100 / 150 / 200",
+       subtitle = "Averaged over 1 000 seeds — absolute vs. log-ratio power",
+       x = "Responsiveness to Power", y = "Gini (Power)",
+       color = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+### Power Concentration — Top-5% Share
+
+```{r plot-top5, fig.width = 10, fig.height = 5}
+combined %>%
+  ggplot(aes(x = responsiveness, y = top5_power_share, color = formula)) +
+  geom_line() + geom_point() +
+  facet_wrap(~round, labeller = label_both, ncol = 4) +
+  x_scale + col_scale +
+  labs(title    = "Top-5% Power Share at T = 50 / 100 / 150 / 200",
+       subtitle = "Averaged over 1 000 seeds — absolute vs. log-ratio power",
+       x = "Responsiveness to Power", y = "Top-5% Power Share",
+       color = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+
+## 3. Time Series Comparisons (all 200 rounds)
+
+### Ideological Drift over Time
+
+```{r plot-drift-time, fig.width = 10, fig.height = 5}
+combined_time %>%
+  ggplot(aes(x = round, y = avg_drift, color = formula)) +
+  geom_line(alpha = 0.8) +
+  facet_wrap(~responsiveness, labeller = label_both, ncol = 4) +
+  col_scale +
+  labs(title  = "Average Ideological Drift over Time",
+       x = "Round", y = "Avg. Ideological Drift", color = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+### Delegation Rate over Time
+
+```{r plot-delegation-time, fig.width = 10, fig.height = 5}
+combined_time %>%
+  ggplot(aes(x = round, y = delegation_rate, color = formula)) +
+  geom_line(alpha = 0.8) +
+  facet_wrap(~responsiveness, labeller = label_both, ncol = 4) +
+  col_scale +
+  labs(title  = "Delegation Rate over Time",
+       x = "Round", y = "Share of Lay Agents Delegating", color = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+### Lost Vote Rate over Time
+
+```{r plot-lost-time, fig.width = 10, fig.height = 5}
+combined_time %>%
+  ggplot(aes(x = round, y = lost_vote_rate, color = formula)) +
+  geom_line(alpha = 0.8) +
+  facet_wrap(~responsiveness, labeller = label_both, ncol = 4) +
+  col_scale +
+  labs(title  = "Lost Vote Rate over Time",
+       x = "Round", y = "Lost Vote Rate", color = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+

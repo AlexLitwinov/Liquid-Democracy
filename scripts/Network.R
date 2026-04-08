@@ -1,6 +1,8 @@
 library(igraph)
 library(tibble)
 
+source(here::here("scripts/FunctionVersions.R"))
+
 # =============================================================
 # ATTRACTIVENESS FUNCTION
 # Ideological proximity x competence sigmoid
@@ -221,8 +223,9 @@ connect_experts <- function(gF, agents, n_per_community,
 #     Observe the power and preference of all neighbours from t-1.
 #     Choose probabilistically:
 #       (a) Vote directly (target = self)
-#           Weight: sigmoid(own power) — the more trust I already
-#           enjoy, the more likely I vote directly
+#           Weight: selfweight_fn(i, nb, pref, pow, responsiveness)
+#           Default (Formula 3): sigmoid(r * (own_power - power_j*))
+#           where j* = argmax A_ij is the most attractive available delegate.
 #       (b) Delegate to neighbour j
 #           Weight: attractiveness(i,j) = proximity x competence
 #     This creates endogenous persistence: powerful delegates remain
@@ -248,7 +251,9 @@ simulate_liquid_democracy <- function(
     p_rewire                = 0.05,
     responsiveness          = 1,
     inertia                 = 0,
-    T                       = 200
+    T                       = 200,
+    selfweight_fn           = selfweight_argmax_log,
+    attractiveness_fn       = attractiveness_log
 ) {
   st     <- setup_agents(n_per_community, n_communities,
                          n_experts_per_community, seed)
@@ -306,18 +311,9 @@ simulate_liquid_democracy <- function(
     targets <- vapply(lay_ids, function(i) {
       nb <- adj[[i]]
 
-      # Self-weight: agent identifies the most attractive available delegate
-      # (j* = argmax A_ij, combining ideological proximity and power), then
-      # compares own power against that single best alternative.
-      # Rationale: the relevant question is not "am I above average?" but
-      # "is there anyone who can represent me better than I represent myself?"
-      # Fallback 0.5 when agent has no neighbours (no comparison possible).
-      w_self <- if (length(nb)) {
-        a_nb   <- (1 - abs(pref[i] - pref[nb])) *
-                  (1 / (1 + exp(-responsiveness * (pow[nb] - pow[i]))))
-        j_star <- nb[which.max(a_nb)]
-        1 / (1 + exp(-responsiveness * (pow[i] - pow[j_star])))
-      } else 0.5
+      # Self-weight: computed by the active formula (selfweight_fn).
+      # See scripts/SelfWeights.R for all available formulas.
+      w_self <- selfweight_fn(i, nb, pref, pow, responsiveness)
       
       # Inertia: retain current delegate with probability `inertia`
       if (inertia > 0 && agents$delegated[i]) {
@@ -327,7 +323,7 @@ simulate_liquid_democracy <- function(
       }
       
       w_nb <- if (length(nb))
-        compute_attractiveness(pref[i], pref[nb], pow[i], pow[nb], responsiveness)
+        attractiveness_fn(pref[i], pref[nb], pow[i], pow[nb], responsiveness)
       else numeric(0)
       
       w <- pmax(c(w_self, w_nb), 0)
