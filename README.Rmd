@@ -90,15 +90,19 @@ The weight for delegating to neighbour $j$ combines ideological proximity
 with a competence signal:
 
 $$
-A_{ij} = \frac{1 - |pref_i - pref_j|}{1 + e^{-resp \cdot (power_j - power_i)}}
+A_{ij} = \frac{1 - |pref_i - pref_j|}{1 + e^{-resp \cdot \log(power_j / power_i)}}
 $$
 
 * The numerator equals 1 when $i$ and $j$ share the same preference and
   falls to 0 for maximally different agents.
 * The sigmoid term exceeds 0.5 whenever $j$ holds more power than $i$,
   and drops below 0.5 otherwise.
+* The log-ratio input ensures that $resp$ retains a consistent interpretation
+  across all rounds: a fixed power ratio (e.g., 5:1) produces the same sigmoid
+  input regardless of the absolute scale of power, so $resp$ does not lose
+  meaning after an early hierarchy forms.
 * The parameter $resp$ controls the steepness of the sigmoid — higher
-  values make agents more sensitive to power differences.
+  values make agents more sensitive to relative power differences.
 
 A target is drawn randomly from the candidate set with probabilities
 proportional to these weights. This produces **endogenous persistence**:
@@ -118,7 +122,7 @@ j^* = \arg\max_{j \in N_i} A_{ij}
 $$
 
 $$
-w_{self,i} = \frac{1}{1 + e^{-resp \cdot (power_i - power_{j^*})}}
+w_{self,i} = \frac{1}{1 + e^{-resp \cdot \log(power_i / power_{j^*})}}
 $$
 
 The behavioural assumption is: *"is there anyone who can represent me
@@ -131,13 +135,48 @@ is relevant to this comparison.
   so all neighbour weights collapse to zero — the agent votes directly with
   near-certainty regardless of $w_{self}$.
 
-When all agents have equal power (as in round 1), $sigmoid(0) = 0.5$ for
-every agent regardless of $resp$. For isolated agents with no neighbours
-the fallback is $w_{self} = 0.5$.
+When all agents have equal power (as in round 1), $\log(power_i / power_j) = 0$
+and $sigmoid(0) = 0.5$ for every agent regardless of $resp$. For isolated agents
+with no neighbours the fallback is $w_{self} = 0.5$.
 
-Both $w_{self}$ and $A_{ij}$ use the same sigmoid structure and the same
-parameter $resp$, which therefore has a single consistent interpretation
-throughout: **sensitivity to power differences**.
+Both $w_{self}$ and $A_{ij}$ use the same log-ratio sigmoid structure and the
+same parameter $resp$, which therefore has a single consistent interpretation
+throughout: **sensitivity to relative power differences**. Power must be $\geq 1$
+at all times (every agent always holds at least their own vote), which guarantees
+the log-ratio is well-defined.
+
+##### Perception Noise (optional)
+
+By default agents observe the true opinions and power of their neighbours.
+Two optional parameters introduce noise into these perceptions:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `sigma_opinion` | 0 | SD of Gaussian noise added in logit space to perceived opinions; output is projected back to $[0,1]$ via $\text{plogis}$ |
+| `sigma_pow` | 0 | SD of log-space multiplicative noise on perceived power; equivalent to scaling true power by $e^{\mathcal{N}(0, \sigma^2)}$ |
+
+Setting both to 0 (the default) reproduces the original model where
+perceived values equal true values. Each agent always perceives its own
+opinion and power correctly; noise applies only to neighbours.
+
+##### Formula Versioning
+
+The attractiveness and self-weight formulas are passed as first-class
+function arguments (`attractiveness_fn`, `selfweight_fn`) to
+`simulate_liquid_democracy`. All formula versions — including archived
+variants — are stored in `scripts/FunctionVersions.R`:
+
+| Function | Type | Status |
+|---|---|---|
+| `attractiveness_absolute` | Neighbour attractiveness | Archived — uses raw power difference; saturates at high absolute power |
+| `attractiveness_log` | Neighbour attractiveness | **Current default** — uses log-ratio; $resp$ stays interpretable across rounds |
+| `selfweight_absolute_power` | Self-weight | Archived — proportional to own absolute power, no social comparison |
+| `selfweight_mean_contest` | Self-weight | Archived — averages win-probabilities against all neighbours, ideology-blind |
+| `selfweight_argmax` | Self-weight | Archived — argmax with absolute power differences |
+| `selfweight_argmax_log` | Self-weight | **Current default** — argmax with log-ratio power; same scale invariance as `attractiveness_log` |
+
+To switch formulas, pass a different function to the corresponding argument.
+Old versions are preserved and must never be deleted.
 
 ##### Inertia (optional)
 An optional `inertia` parameter (default 0) gives each lay agent a
@@ -188,6 +227,46 @@ After roots are identified, votes propagate as follows:
 
 When evaluating binary outcomes, preferences are interpreted using a threshold
 of $0.5$ (yes if $pref \geq 0.5$, no otherwise).
+
+---
+
+# Simulation Output
+
+`simulate_liquid_democracy()` returns a named list with the following elements:
+
+| Element | Type | Description |
+|---|---|---|
+| `agents` | tibble | Final agent state (round T): `id`, `type`, `opinion`, `community`, `power`, `my_vote`, `delegated` |
+| `history_lost` | numeric(T) | Fraction of agents with a lost vote (NA) at each round |
+| `history_drift` | numeric(T) | Mean ideological drift among represented agents at each round |
+| `history_delegation` | numeric(T) | Fraction of lay agents who delegated at each round |
+| `history_stability` | numeric(T) | Fraction of lay agents keeping the same delegation target vs. the previous round |
+| `snapshots` | tibble | Structured metrics recorded at 25%, 50%, 75%, and 100% of T (see below) |
+| `delegation_graphs` | list(T) | Full igraph delegation graph for every round |
+| `final_graph` | igraph | Delegation graph at round T (shorthand for `delegation_graphs[[T]]`) |
+| `friendship_graph` | igraph | Static social network (Watts-Strogatz + expert edges) |
+
+## Snapshots
+
+The `snapshots` tibble provides a compact longitudinal view with one row per
+snapshot round (25%, 50%, 75%, 100% of T):
+
+| Column | What it records |
+|---|---|
+| `round`, `pct_T` | Round number and fraction of total T |
+| `lost_vote_rate` | Fraction of agents with a lost vote |
+| `avg_drift` | Mean ideological drift (represented agents) |
+| `delegation_rate` | Fraction of lay agents who delegated |
+| `gini_power` | Gini coefficient of power (represented agents) |
+| `top5_power_share` | Top-5% power share (represented agents) |
+| `avg_chain_length_delegators` | Mean chain length among delegating agents |
+| `largest_voting_bloc_share` | Fraction of all agents in the largest delegation tree |
+| `total_components` | Total independent voting groups |
+| `delegation_stability` | Fraction of lay agents retaining the same target vs. prior round |
+| `direct_yes / direct_no` | Yes/No counts under direct democracy |
+| `direct_margin` | Raw majority margin under direct democracy |
+| `liquid_yes / liquid_no` | Yes/No counts under liquid democracy |
+| `liquid_margin` | Raw majority margin under liquid democracy |
 
 ---
 
@@ -287,6 +366,7 @@ model.
 
 ```{r Functions}
 library(here)
+source(here::here("scripts/FunctionVersions.R"))   # formula version library
 source(here::here("scripts/Network.R"))
 source(here::here("scripts/Summary.R"))
 source(here::here("scripts/Visualisations.R"))
@@ -304,7 +384,11 @@ res <- simulate_liquid_democracy(
   p_rewire                = 0.05,
   responsiveness          = 1,
   inertia                 = 0,
-  T                       = 200
+  T                       = 200,
+  selfweight_fn           = selfweight_argmax_log,  # default: log-ratio argmax
+  attractiveness_fn       = attractiveness_log,     # default: log-ratio attractiveness
+  sigma_opinion           = 0,   # perception noise on opinions (0 = no noise)
+  sigma_pow               = 0    # perception noise on power    (0 = no noise)
 )
 ```
 ---

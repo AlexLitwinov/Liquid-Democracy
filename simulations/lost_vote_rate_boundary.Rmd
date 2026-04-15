@@ -1,0 +1,145 @@
+---
+title: "Lost Vote Rate — Boundary Validation"
+output: github_document
+date: "2026-04-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = here::here())
+
+library(here)
+library(tibble)
+library(dplyr)
+library(ggplot2)
+
+source(here::here("scripts/Network.R"))
+```
+
+```{r params}
+N        <- 250   # agents
+K        <- 6     # WS node degree
+P_REWIRE <- 0.10  # WS rewiring probability
+N_SEEDS  <- 10    # seeds to average over
+T_ROUNDS <- 50    # rounds per run
+```
+
+## Boundary Simulation (WS, constant w = 0.5)
+
+```{r sim-fn}
+simulate_boundary <- function(seed, n, adj_list, T) {
+  set.seed(seed)
+  op      <- runif(n)
+  all_ids <- seq_len(n)
+  out     <- vector("list", T)
+
+  for (t in seq_len(T)) {
+    targets <- vapply(all_ids, function(i) {
+      sample(c(i, adj_list[[i]]), 1L)
+    }, integer(1L))
+
+    mask      <- targets != all_ids
+    edge_from <- all_ids[mask]
+    edge_to   <- targets[mask]
+    votes     <- propagate_votes(op, n, edge_from, edge_to)
+
+    out[[t]] <- tibble(round = t,
+                       delegation_rate = mean(mask),
+                       lost_vote_rate  = mean(is.na(votes)))
+  }
+  bind_rows(out) %>% mutate(seed = seed)
+}
+```
+
+```{r run-boundary}
+ws_raw <- lapply(seq_len(N_SEEDS), function(s) {
+  st  <- setup_agents(N, 1, 0, s)
+  gF  <- setup_friendship_network(st$agents, 1, K, P_REWIRE, s)
+  adj <- lapply(seq_len(N), \(v) as.integer(igraph::neighbors(gF, v, mode = "out")))
+  simulate_boundary(s, N, adj, T_ROUNDS)
+}) %>% bind_rows()
+
+ws_boundary_avg <- ws_raw %>%
+  group_by(round) %>%
+  summarise(delegation_rate = mean(delegation_rate),
+            lost_vote_rate  = mean(lost_vote_rate),
+            .groups = "drop")
+```
+
+---
+
+## Load Actual Results
+
+```{r load-actual}
+actual <- readRDS(here::here(
+  "simulations/output/results_sim3_rewire_0.1_1000seeds_log_argmax.rds"
+))
+
+actual_time <- actual$results_time %>% filter(round <= T_ROUNDS)
+```
+
+---
+
+## Plots
+
+```{r plot-lost, fig.width = 10, fig.height = 5}
+actual_time %>%
+  ggplot(aes(x = round, y = lost_vote_rate,
+             color = factor(responsiveness), group = factor(responsiveness))) +
+  geom_line(alpha = 0.8) +
+  geom_line(data = ws_boundary_avg,
+            aes(x = round, y = lost_vote_rate),
+            inherit.aes = FALSE,
+            color = "black", linetype = "dashed", linewidth = 1) +
+  annotate("text", x = 2, y = max(ws_boundary_avg$lost_vote_rate) + 0.01,
+           label = "WS boundary (w = 0.5)", hjust = 0, size = 3.5) +
+  scale_color_viridis_d(name = "Responsiveness") +
+  labs(title    = "Lost Vote Rate: Actual vs. Boundary",
+       subtitle = "Coloured = actual WS model (1 000 seeds avg) | Dashed = boundary with w = 0.5 (10 seeds)",
+       x = "Round", y = "Lost Vote Rate") +
+  theme_minimal()
+```
+
+```{r plot-delegation, fig.width = 10, fig.height = 5}
+actual_time %>%
+  ggplot(aes(x = round, y = delegation_rate,
+             color = factor(responsiveness), group = factor(responsiveness))) +
+  geom_line(alpha = 0.8) +
+  geom_line(data = ws_boundary_avg,
+            aes(x = round, y = delegation_rate),
+            inherit.aes = FALSE,
+            color = "black", linetype = "dashed", linewidth = 1) +
+  annotate("text", x = 2, y = max(ws_boundary_avg$delegation_rate) + 0.01,
+           label = "WS boundary (w = 0.5)", hjust = 0, size = 3.5) +
+  scale_color_viridis_d(name = "Responsiveness") +
+  labs(title    = "Delegation Rate: Actual vs. Boundary",
+       subtitle = "Coloured = actual WS model (1 000 seeds avg) | Dashed = boundary with w = 0.5 (10 seeds)",
+       x = "Round", y = "Delegation Rate") +
+  theme_minimal()
+```
+
+---
+
+## Comparison Table (at T = 50)
+
+```{r table}
+actual_agg <- actual_time %>%
+  filter(round == T_ROUNDS) %>%
+  summarise(delegation_rate     = mean(delegation_rate),
+            lost_vote_rate_mean = mean(lost_vote_rate),
+            lost_vote_rate_max  = max(lost_vote_rate))
+
+boundary_agg <- ws_raw %>%
+  filter(round == T_ROUNDS) %>%
+  summarise(delegation_rate     = mean(delegation_rate),
+            lost_vote_rate_mean = mean(lost_vote_rate),
+            lost_vote_rate_max  = max(lost_vote_rate))
+
+tibble(
+  Model               = c("Actual WS (1 000 seeds, avg over r)",
+                          "WS boundary (w = 0.5, 10 seeds)"),
+  Delegation_Rate     = round(c(actual_agg$delegation_rate,     boundary_agg$delegation_rate),     4),
+  Lost_Vote_Rate_Mean = round(c(actual_agg$lost_vote_rate_mean, boundary_agg$lost_vote_rate_mean), 4),
+  Lost_Vote_Rate_Max  = round(c(actual_agg$lost_vote_rate_max,  boundary_agg$lost_vote_rate_max),  4)
+) %>% print()
+```

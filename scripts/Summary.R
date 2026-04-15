@@ -131,7 +131,7 @@ summary_metrics <- function(res) {
   # Caveat: if cycle agents are non-randomly distributed across the preference
   # space this estimate is biased. Report alongside lost_vote_rate.
   if (nrow(represented_agents) > 0) {
-    drift_vals            <- abs(represented_agents$preference -
+    drift_vals            <- abs(represented_agents$opinion -
                                    represented_agents$my_vote)
     avg_ideological_drift <- mean(drift_vals)
     med_ideological_drift <- median(drift_vals)
@@ -143,7 +143,7 @@ summary_metrics <- function(res) {
     # More outcome-relevant than raw drift because it captures directional error.
     misclassification_rate <- mean(
       (represented_agents$my_vote  >= 0.5) !=
-      (represented_agents$preference >= 0.5)
+      (represented_agents$opinion >= 0.5)
     )
   } else {
     avg_ideological_drift  <- NA
@@ -154,8 +154,8 @@ summary_metrics <- function(res) {
   }
 
   # Vote counts
-  direct_yes <- sum(agents$preference >= 0.5)
-  direct_no  <- sum(agents$preference  < 0.5)
+  direct_yes <- sum(agents$opinion >= 0.5)
+  direct_no  <- sum(agents$opinion  < 0.5)
   liquid_yes <- sum(represented_agents$my_vote >= 0.5, na.rm = TRUE)
   liquid_no  <- sum(represented_agents$my_vote  < 0.5, na.rm = TRUE)
 

@@ -1,0 +1,253 @@
+---
+title: "Weekly Report — Week 8 (10.04.2026 – 16.04.2026)"
+output: github_document
+date: "2026-04-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = here::here())
+
+library(here)
+library(tibble)
+library(dplyr)
+library(ggplot2)
+
+source(here::here("scripts/Network.R"))
+```
+
+## Summary
+
+- Validated whether the lost vote rate and delegation rate of the actual simulation
+  are within a structurally plausible range
+- Approach: run the same Watts-Strogatz network (n = 250, k = 6, p = 0.10) for
+  50 rounds with all weights fixed at **w = 0.5** — the maximum the log-ratio
+  formula can produce when preferences align and powers are equal
+- This gives a **structural upper bound**: the highest delegation and lost vote rate
+  the network topology can generate, independent of any power or preference dynamics
+- If the actual model stays below this boundary, the numbers are valid
+
+---
+
+## Boundary Simulation Setup
+
+```{r run-boundary, include=FALSE}
+N        <- 250
+K        <- 6
+P_REWIRE <- 0.10
+N_SEEDS  <- 10
+T_ROUNDS <- 50
+
+simulate_boundary <- function(seed, n, adj_list, T) {
+  set.seed(seed)
+  op      <- runif(n)
+  all_ids <- seq_len(n)
+  out     <- vector("list", T)
+  for (t in seq_len(T)) {
+    targets   <- vapply(all_ids, function(i) sample(c(i, adj_list[[i]]), 1L), integer(1L))
+    mask      <- targets != all_ids
+    edge_from <- all_ids[mask]
+    edge_to   <- targets[mask]
+    votes     <- propagate_votes(op, n, edge_from, edge_to)
+    out[[t]]  <- tibble(round = t,
+                        delegation_rate = mean(mask),
+                        lost_vote_rate  = mean(is.na(votes)))
+  }
+  bind_rows(out) %>% mutate(seed = seed)
+}
+
+ws_raw <- lapply(seq_len(N_SEEDS), function(s) {
+  st  <- setup_agents(N, 1, 0, s)
+  gF  <- setup_friendship_network(st$agents, 1, K, P_REWIRE, s)
+  adj <- lapply(seq_len(N), \(v) as.integer(igraph::neighbors(gF, v, mode = "out")))
+  simulate_boundary(s, N, adj, T_ROUNDS)
+}) %>% bind_rows()
+
+ws_boundary_avg <- ws_raw %>%
+  group_by(round) %>%
+  summarise(delegation_rate = mean(delegation_rate),
+            lost_vote_rate  = mean(lost_vote_rate),
+            .groups = "drop")
+
+actual <- readRDS(here::here(
+  "simulations/output/results_sim3_rewire_0.1_1000seeds_log_argmax.rds"
+))
+actual_time <- actual$results_time %>% filter(round <= T_ROUNDS)
+```
+
+---
+
+## 1. Lost Vote Rate: Actual vs. Boundary
+
+```{r plot-lost, fig.width = 10, fig.height = 5}
+actual_time %>%
+  ggplot(aes(x = round, y = lost_vote_rate,
+             color = factor(responsiveness), group = factor(responsiveness))) +
+  geom_line(alpha = 0.8) +
+  geom_line(data = ws_boundary_avg,
+            aes(x = round, y = lost_vote_rate),
+            inherit.aes = FALSE,
+            color = "black", linetype = "dashed", linewidth = 1) +
+  annotate("text", x = 2, y = max(ws_boundary_avg$lost_vote_rate) + 0.01,
+           label = "WS boundary (w = 0.5)", hjust = 0, size = 3.5) +
+  scale_color_viridis_d(name = "Responsiveness") +
+  labs(title    = "Lost Vote Rate: Actual vs. Boundary",
+       subtitle = "Coloured = actual WS model (1 000 seeds avg) | Dashed = boundary with w = 0.5 (10 seeds)",
+       x = "Round", y = "Lost Vote Rate") +
+  theme_minimal()
+```
+
+## 2. Delegation Rate: Actual vs. Boundary
+
+```{r plot-delegation, fig.width = 10, fig.height = 5}
+actual_time %>%
+  ggplot(aes(x = round, y = delegation_rate,
+             color = factor(responsiveness), group = factor(responsiveness))) +
+  geom_line(alpha = 0.8) +
+  geom_line(data = ws_boundary_avg,
+            aes(x = round, y = delegation_rate),
+            inherit.aes = FALSE,
+            color = "black", linetype = "dashed", linewidth = 1) +
+  annotate("text", x = 2, y = max(ws_boundary_avg$delegation_rate) + 0.01,
+           label = "WS boundary (w = 0.5)", hjust = 0, size = 3.5) +
+  scale_color_viridis_d(name = "Responsiveness") +
+  labs(title    = "Delegation Rate: Actual vs. Boundary",
+       subtitle = "Coloured = actual WS model (1 000 seeds avg) | Dashed = boundary with w = 0.5 (10 seeds)",
+       x = "Round", y = "Delegation Rate") +
+  theme_minimal()
+```
+
+---
+
+## 3. Comparison Table (T = 50)
+
+```{r table}
+actual_agg <- actual_time %>%
+  filter(round == T_ROUNDS) %>%
+  summarise(delegation_rate     = mean(delegation_rate),
+            lost_vote_rate_mean = mean(lost_vote_rate),
+            lost_vote_rate_max  = max(lost_vote_rate))
+
+boundary_agg <- ws_raw %>%
+  filter(round == T_ROUNDS) %>%
+  summarise(delegation_rate     = mean(delegation_rate),
+            lost_vote_rate_mean = mean(lost_vote_rate),
+            lost_vote_rate_max  = max(lost_vote_rate))
+
+tibble(
+  Model               = c("Actual WS (1 000 seeds, avg over r)",
+                          "WS boundary (w = 0.5, 10 seeds)"),
+  Delegation_Rate_mean    = round(c(actual_agg$delegation_rate,     boundary_agg$delegation_rate),     4),
+  Lost_Vote_Rate_Mean = round(c(actual_agg$lost_vote_rate_mean, boundary_agg$lost_vote_rate_mean), 4),
+  Lost_Vote_Rate_Max  = round(c(actual_agg$lost_vote_rate_max,  boundary_agg$lost_vote_rate_max),  4)
+) %>% knitr::kable()
+```
+
+**Interpretation:** If the actual model's lost vote rate stays below the boundary
+values, the observed rates are structurally valid — they are lower than what the
+network topology would produce under the most delegation-friendly conditions possible.
+
+---
+
+## 4. Perceived Opinion and Power
+
+So far agents observe the **true** opinion and power of their neighbours. This is
+unrealistic. The next modelling step introduces perception noise so that delegation
+decisions are based on **perceived** values.
+
+### Implementation
+
+Two noise parameters are added to `simulate_liquid_democracy()`:
+
+- `sigma_opinion` — SD of Gaussian noise in **logit space** (opinion ∈ [0, 1])
+- `sigma_pow` — SD of Gaussian noise in **log space** (power > 0)
+
+Setting both to 0 (default) reproduces the current model exactly.
+
+**Perceived opinion** of agent i about neighbour j:
+$$\hat{p}_{ij} = \text{logistic}\!\left(\text{logit}(p_j) + \varepsilon\right), \quad \varepsilon \sim \mathcal{N}(0,\, \sigma_{\text{opinion}}^2)$$
+
+Logit space is used so the output stays in [0, 1]. The noise
+is symmetric on the logit scale and compresses near the boundaries — extreme
+opinions are perceived with slightly less distortion than moderate ones.
+
+**Perceived power** of agent i about neighbour j:
+$$\widehat{\text{pow}}_{ij} = \text{pow}_j \cdot \exp(\eta), \quad \eta \sim \mathcal{N}(0,\, \sigma_{\text{pow}}^2)$$
+
+Log space ensures the output stays positive and makes the noise multiplicative —
+a factor-of-2 error is equally likely whether the true power is 2 or 200. This
+is more realistic than additive noise for a quantity that spans several orders of
+magnitude as hierarchies form.
+
+In both cases agents know their **own** opinion and power exactly.
+
+### What different sigma values mean
+
+| sigma | Opinion: 68% CI around p = 0.5 | Power: 68% CI around true pow |
+|-------|-------------------------------|-------------------------------|
+| 0.0   | [0.50, 0.50] — no noise       | [1.00, 1.00] × pow            |
+| 0.5   | [0.38, 0.62]                  | [0.61, 1.65] × pow            |
+| 1.0   | [0.27, 0.73]                  | [0.37, 2.72] × pow            |
+
+---
+
+## 5. Open Questions for Discussion
+
+**1. What should agents observe?**
+
+- **Option A:** Noisy signal of true opinion and true power *(current implementation)*
+- **Option B:** Observable proxies
+  - Opinion → last observed vote (possibly already delegated, i.e. reflects the
+    opinion of the neighbour's own delegate rather than the neighbour's true position)
+  - Power → local prominence (e.g. number of direct neighbours delegating to j,
+    which is a lower bound on true transitive power and grows increasingly inaccurate
+    as delegation chains lengthen)
+
+→ *Which interpretation is more appropriate for the model?*
+
+---
+
+**2. How should uncertainty be modelled?**
+
+- **Option A:** Global noise parameters — same σ for all agents *(current implementation)*
+- **Option B:** Heterogeneous noise
+  - By agent (some agents are better informed than others)
+  - By relationship (closer neighbours → less noise, e.g. σ_ij decreases with
+    network distance or interaction history)
+
+→ *Is a simple global σ sufficient, or should heterogeneity be included?*
+
+---
+
+**3. Should perception change over time (learning)?**
+
+- **Option A:** Fixed noise — no learning *(current implementation)*
+- **Option B:** Decreasing uncertainty with repeated interaction, e.g.:
+$$\sigma_{ij}(t) = \frac{\sigma_0}{\sqrt{1 + n_{ij}(t)}}$$
+  where $n_{ij}(t)$ counts past rounds in which i observed j. Early rounds become
+  noisier and more exploratory; later rounds more stable as beliefs converge.
+
+→ *Do we want agents to "learn" about others over time?*
+
+---
+
+**4. Should perception include systematic bias (not just noise)?**
+
+- **Option A:** Purely random error *(current approach)*
+- **Option B:** Biased perception, e.g. egocentric bias — others are perceived as
+  closer to one's own opinion than they actually are:
+$$\hat{p}_{ij} = \text{logistic}\!\left(\text{logit}(p_j) + \beta\,(p_i - p_j) + \varepsilon\right)$$
+  where β > 0 pulls perceived opinions toward the observer's own view. This could
+  produce echo-chamber effects even with a diverse true opinion distribution.
+
+→ *Is it worth including simple bias mechanisms at this stage?*
+
+---
+
+**5. How realistic vs. how simple should the first version be?**
+
+- **Option A:** Keep noisy true values — simple, controlled baseline *(current implementation)*
+- **Option B:** Move to proxy-based perception — more realistic, but adds complexity
+  in both implementation and interpretation
+
+→ *Which level of complexity is appropriate for this project?*

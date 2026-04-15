@@ -106,8 +106,8 @@ plot_summary_stats <- function(res) {
   lay_drift_df <- res$agents %>%
     filter(type == "lay") %>%
     filter(!is.na(my_vote)) %>%
-    mutate(drift = abs(preference - my_vote))
-  
+    mutate(drift = abs(opinion - my_vote))
+
   p1 <- ggplot(lay_drift_df, aes(x = drift)) +
     geom_histogram(
       binwidth = 0.05, fill = "#4DBBD5FF", color = "white", alpha = 0.8
@@ -172,8 +172,8 @@ get_summary_table <- function(res) {
   # Drift for agents whose votes reached a representative
   drift_data <- agents %>%
     filter(!is.na(my_vote)) %>%
-    mutate(drift = abs(preference - my_vote))
-  
+    mutate(drift = abs(opinion - my_vote))
+
   # Average delegation distance: mean finite positive distance in gD
   dist_vals <- distances(gD)
   avg_deleg_dist <- mean(dist_vals[is.finite(dist_vals) & dist_vals > 0])
