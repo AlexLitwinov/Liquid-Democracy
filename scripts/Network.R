@@ -239,6 +239,112 @@ connect_experts <- function(gF, agents, n_per_community,
 }
 
 # =============================================================
+# HOMOPHILY OPINION SHUFFLE (Metropolis)
+#
+# Runs AFTER the friendship network is built and BEFORE the
+# simulation loop. The network topology is never touched —
+# only opinions are redistributed among lay agents so that
+# connected nodes become more similar.
+#
+# Algorithm (per step):
+#   1. Pick two random lay agents i and j
+#   2. Compute current total opinion disagreement on edges
+#      touching i or j (the i-j edge itself cancels and is excluded)
+#   3. Propose swapping op[i] <-> op[j]
+#   4. Accept if disagreement decreases; otherwise accept with
+#      probability exp(-delta_E * homophily_t)
+#   5. Every 100 steps: check assortativity; stop if target reached
+#
+# Parameters:
+#   target_homophily : target opinion assortativity to reach;
+#                      NULL disables the step entirely
+#   homophily_t      : Metropolis temperature — higher = more greedy,
+#                      faster convergence (default 5)
+#   homophily_steps  : safety cap on proposed swaps (default 100 000)
+#
+# Returns: agents tibble with (possibly) reshuffled opinions
+# =============================================================
+
+shuffle_opinions_homophily <- function(agents, gF,
+                                       target_homophily,
+                                       homophily_t     = 5,
+                                       homophily_steps = 100000,
+                                       seed            = 1) {
+  if (is.null(target_homophily)) return(agents)
+  set.seed(seed)
+
+  lay_ids <- which(agents$type == "lay")
+  n_lay   <- length(lay_ids)
+  op      <- agents$opinion
+  gF_lay  <- induced_subgraph(gF, lay_ids)   # lay-only subgraph for assortativity
+
+  for (step in seq_len(homophily_steps)) {
+
+    # Check assortativity every 100 steps; stop when target is reached
+    if (step %% 100L == 0L) {
+      if (assortativity(gF_lay, op[lay_ids], directed = FALSE) >= target_homophily)
+        break
+    }
+
+    idx <- sample(n_lay, 2)
+    i   <- lay_ids[idx[1]]
+    j   <- lay_ids[idx[2]]
+
+    # Lay neighbours of i and j, excluding the i-j edge (cancels in delta_E)
+    nb_i <- setdiff(intersect(as.integer(neighbors(gF, i, mode = "out")), lay_ids), j)
+    nb_j <- setdiff(intersect(as.integer(neighbors(gF, j, mode = "out")), lay_ids), i)
+
+    E_before <- sum(abs(op[i] - op[nb_i])) + sum(abs(op[j] - op[nb_j]))
+    E_after  <- sum(abs(op[j] - op[nb_i])) + sum(abs(op[i] - op[nb_j]))
+    delta_E  <- E_after - E_before
+
+    if (delta_E < 0 || runif(1) < exp(-delta_E * homophily_t)) {
+      op[c(i, j)] <- op[c(j, i)]
+    }
+  }
+
+  agents$opinion <- op
+  agents
+}
+
+# =============================================================
+# NETWORK HOMOPHILY MEASUREMENT
+#
+# Computes two complementary measures of opinion homophily on
+# the lay-to-lay subgraph of the friendship network:
+#
+#   assortativity         — Pearson correlation of opinions across
+#                           connected lay pairs; range [-1, 1];
+#                           0 = random baseline, 1 = perfect homophily
+#
+#   mean_edge_disagreement — mean |op_i - op_j| over all lay-to-lay
+#                            edges; range [0, 1]; random baseline ≈ 0.33;
+#                            directly proportional to the energy E that
+#                            the Metropolis shuffle minimises
+#
+# Usage: compute_network_homophily(res$friendship_graph, res$agents)
+# =============================================================
+
+compute_network_homophily <- function(gF, agents) {
+  lay_ids <- which(agents$type == "lay")
+  op      <- agents$opinion
+  gF_lay  <- induced_subgraph(gF, lay_ids)
+  lay_op  <- op[lay_ids]
+
+  assort <- assortativity(gF_lay, lay_op, directed = FALSE)
+
+  el     <- as_edgelist(gF_lay, names = FALSE)
+  mean_d <- if (nrow(el) > 0)
+    mean(abs(lay_op[el[, 1]] - lay_op[el[, 2]]))
+  else NA_real_
+
+  list(
+    assortativity          = round(assort,  4),
+    mean_edge_disagreement = round(mean_d,  4)
+  )
+}
+
+# =============================================================
 # MAIN SIMULATION
 #
 # Each of the T rounds:
@@ -276,8 +382,11 @@ simulate_liquid_democracy <- function(
     T                       = 200,
     selfweight_fn           = selfweight_argmax_log,
     attractiveness_fn       = attractiveness_log,
-    sigma_opinion           = 0,    # SD of logit-space noise on perceived opinion
-    sigma_pow               = 0     # SD of log-space noise on perceived power
+    sigma_opinion           = 0,       # SD of logit-space noise on perceived opinion
+    sigma_pow               = 0,       # SD of log-space noise on perceived power
+    target_homophily        = NULL,    # target assortativity; NULL disables shuffle
+    homophily_t             = 5,       # Metropolis temperature (higher = more greedy)
+    homophily_steps         = 100000   # safety cap on proposed swaps
 ) {
   st     <- setup_agents(n_per_community, n_communities,
                          n_experts_per_community, seed)
@@ -288,6 +397,11 @@ simulate_liquid_democracy <- function(
                                  p_rewire, seed)
   gF <- connect_experts(gF, agents, n_per_community,
                         expert_connectedness, seed)
+
+  # Redistribute lay opinions on the fixed network so that connected
+  # agents become more similar. No-op when target_homophily is NULL.
+  agents <- shuffle_opinions_homophily(agents, gF, target_homophily,
+                                       homophily_t, homophily_steps, seed)
 
   adj     <- lapply(seq_len(n_all),
                     \(v) as.integer(neighbors(gF, v, mode = "out")))

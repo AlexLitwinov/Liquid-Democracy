@@ -184,6 +184,94 @@ probability of retaining their current delegate without re-evaluating
 alternatives. At `inertia = 0` the system is fully memoryless — agents
 reconsider completely every round.
 
+##### Homophily (optional)
+
+**Homophily** is the tendency of connected agents to hold similar opinions —
+the network science equivalent of "birds of a feather flock together". By
+default the model assigns opinions randomly and independently of network
+position, so neighbours are no more ideologically similar than any two
+strangers. The homophily step introduces opinion structure onto the existing
+network: after the Watts-Strogatz graph is built, lay opinions are
+redistributed so that connected agents become more ideologically similar.
+Crucially, **only the assignment of opinions to nodes changes** — the network
+topology, degree distribution, clustering, and path lengths are all preserved
+exactly. Experts are excluded throughout.
+
+This design keeps homophily orthogonal to network structure: you can
+independently vary how connected agents are (via `p_rewire`, `node_degree`)
+and how similar connected agents' opinions are (via `target_homophily`), and
+study each effect cleanly.
+
+Three parameters control the shuffle:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `target_homophily` | `NULL` | Target opinion assortativity $\in [-1,1]$ to reach; `NULL` disables the step |
+| `homophily_t` | 5 | Metropolis temperature — higher = more greedy, faster convergence |
+| `homophily_steps` | 100 000 | Safety cap on proposed swaps; stops the loop if the target is never reached |
+
+**Algorithm** (`shuffle_opinions_homophily` in `scripts/Network.R`).
+Repeat up to `homophily_steps` times:
+
+1. Pick two random lay agents $i$ and $j$
+2. Compute the current total opinion disagreement on all lay-to-lay edges
+   touching $i$ or $j$ (the $i$–$j$ edge itself cancels and is excluded):
+   $$E = \sum_{v \in N_i \setminus \{j\}} |op_i - op_v| + \sum_{v \in N_j \setminus \{i\}} |op_j - op_v|$$
+3. Propose swapping $op_i \leftrightarrow op_j$ and compute $E'$
+4. Accept if $E' < E$; otherwise accept with probability $e^{-(E'-E)\cdot \text{homophily\_t}}$
+5. Every 100 steps: compute the opinion assortativity of the lay subgraph;
+   stop as soon as $r_{op} \geq \text{target\_homophily}$
+
+Higher `homophily_t` makes the algorithm greedier — only clearly improving
+swaps are accepted, converging faster to the target. Lower values allow more
+exploratory moves. Setting `target_homophily = NULL` skips the step entirely.
+
+```r
+# Excerpt from scripts/Network.R
+shuffle_opinions_homophily <- function(agents, gF,
+                                       target_homophily,
+                                       homophily_t     = 5,
+                                       homophily_steps = 100000,
+                                       seed            = 1) {
+  if (is.null(target_homophily)) return(agents)
+  set.seed(seed)
+
+  lay_ids <- which(agents$type == "lay")
+  op      <- agents$opinion
+  gF_lay  <- induced_subgraph(gF, lay_ids)
+
+  for (step in seq_len(homophily_steps)) {
+    if (step %% 100L == 0L) {
+      if (assortativity(gF_lay, op[lay_ids], directed = FALSE) >= target_homophily)
+        break
+    }
+    idx <- sample(n_lay, 2); i <- lay_ids[idx[1]]; j <- lay_ids[idx[2]]
+    nb_i <- setdiff(intersect(neighbors(gF, i, mode = "out"), lay_ids), j)
+    nb_j <- setdiff(intersect(neighbors(gF, j, mode = "out"), lay_ids), i)
+    E_before <- sum(abs(op[i] - op[nb_i])) + sum(abs(op[j] - op[nb_j]))
+    E_after  <- sum(abs(op[j] - op[nb_i])) + sum(abs(op[i] - op[nb_j]))
+    delta_E  <- E_after - E_before
+    if (delta_E < 0 || runif(1) < exp(-delta_E * homophily_t))
+      op[c(i, j)] <- op[c(j, i)]
+  }
+  agents$opinion <- op
+  agents
+}
+```
+
+**Measuring homophily.** Two complementary metrics are available via
+`compute_network_homophily(gF, agents)`:
+
+| Metric | Range | Random baseline | Perfect homophily |
+|---|---|---|---|
+| `assortativity` | $[-1, 1]$ | $\approx 0$ | $1$ |
+| `mean_edge_disagreement` | $[0, 1]$ | $\approx 0.33$ | $0$ |
+
+The assortativity is the Pearson correlation of opinion values across
+connected lay pairs. The mean edge disagreement is the per-edge average of
+$|op_i - op_j|$ and is directly proportional to the energy $E$ the shuffle
+minimises — so it is the most natural companion metric.
+
 ---
 
 #### 4. Delegation Chains and Power Accumulation
@@ -387,8 +475,11 @@ res <- simulate_liquid_democracy(
   T                       = 200,
   selfweight_fn           = selfweight_argmax_log,  # default: log-ratio argmax
   attractiveness_fn       = attractiveness_log,     # default: log-ratio attractiveness
-  sigma_opinion           = 0,   # perception noise on opinions (0 = no noise)
-  sigma_pow               = 0    # perception noise on power    (0 = no noise)
+  sigma_opinion           = 0,      # perception noise on opinions (0 = no noise)
+  sigma_pow               = 0,      # perception noise on power    (0 = no noise)
+  target_homophily        = NULL,   # target assortativity; NULL disables shuffle
+  homophily_t             = 5,      # Metropolis temperature (higher = more greedy)
+  homophily_steps         = 100000  # safety cap on proposed swaps
 )
 ```
 ---

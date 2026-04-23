@@ -1,0 +1,153 @@
+---
+title: "Weekly Report — Week 9 (17.04.2026 – 23.04.2026)"
+output: github_document
+date: "2026-04-17"
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = here::here())
+
+library(here)
+library(tibble)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+
+source(here::here("scripts/Network.R"))
+source(here::here("scripts/Summary.R"))
+```
+
+## Summary
+
+- Implemented structural homophily via a Metropolis opinion-shuffle step
+- The shuffle runs once on the fixed network before the simulation loop;
+  it stops as soon as a specified target assortativity is reached
+- Added `compute_network_homophily()` to measure the degree of homophily
+  of any friendship graph
+- Ran the responsiveness experiment across three target assortativity
+  levels (0.2, 0.4, 0.6) plus the random baseline
+
+------------------------------------------------------------------------
+
+## 1. Homophily Algorithm
+
+The standard model assigns opinions randomly, so connected agents are
+no more similar than any two strangers. The Metropolis opinion-shuffle
+redistributes lay opinions on the **fixed** network until a target level
+of structural homophily is reached.
+
+**What stays fixed:** the entire network topology — edges, degree
+sequence, clustering, path lengths. Experts are excluded throughout.
+
+**What changes:** the assignment of opinion values to lay nodes. The
+same set of values drawn from $\text{Uniform}[0,1]$ is preserved; only
+their allocation is reshuffled.
+
+**Algorithm.** Repeat up to `homophily_steps` times:
+
+1. Draw two random lay agents $i$ and $j$
+2. Compute total opinion disagreement on all lay-to-lay edges touching
+   $i$ or $j$, excluding the $i$–$j$ edge (cancels):
+   $$E = \sum_{v \in N_i \setminus \{j\}} |op_i - op_v| + \sum_{v \in N_j \setminus \{i\}} |op_j - op_v|$$
+3. Propose swapping $op_i \leftrightarrow op_j$; compute $E'$
+4. Accept if $E' < E$; otherwise accept with probability
+   $e^{-(E'-E)\cdot \text{homophily\_t}}$
+5. Every 100 steps: compute opinion assortativity on the lay subgraph;
+   **stop** as soon as $r_{op} \geq \text{target\_homophily}$
+
+The parameter `homophily_t` (Metropolis temperature) controls how
+strictly improvements are enforced — higher values make the algorithm
+more greedy and converge faster. The algorithm is disabled entirely when
+`target_homophily = NULL`.
+
+**Measuring homophily.** `compute_network_homophily(gF, agents)` returns
+two metrics on the lay subgraph:
+
+| Metric | Range | Random baseline | Perfect homophily |
+|----|----|----|-----|
+| `assortativity` | $[-1, 1]$ | $\approx 0$ | $1$ |
+| `mean_edge_disagreement` | $[0, 1]$ | $\approx 0.33$ | $0$ |
+
+The assortativity is the stopping criterion. The mean edge disagreement
+is directly proportional to the energy $E$ the shuffle minimises,
+making it the most natural companion metric.
+
+------------------------------------------------------------------------
+
+## 2. Results — Responsiveness × Target Homophily
+
+Simulation parameters: n = 250 lay agents, 1 community, k = 6,
+p_rewire = 0.10, T = 200, 100 seeds, `homophily_t` = 5.
+
+```{r load-results}
+rds_path <- here::here("simulations/output/results_sim_homophily.rds")
+if (!file.exists(rds_path))
+  stop("RDS not found — knit simulations/sim_03_homophily.Rmd first.")
+
+saved <- readRDS(rds_path)
+
+if (!"target_homophily" %in% names(saved$results_snapshots))
+  stop("RDS uses old column name 'homophily_degree' — delete the file and re-knit sim_03_homophily.Rmd.")
+
+results_snapshots <- saved$results_snapshots %>%
+  mutate(homophily_label = ifelse(is.na(target_homophily), "baseline",
+                                  as.character(target_homophily)))
+
+x_scale    <- scale_x_log10(breaks = c(0.1, 0.5, 1, 2, 5, 10, 25),
+                             labels = c("0.1","0.5","1","2","5","10","25"))
+hom_colors <- c("baseline" = "grey60",
+                "0.2"      = "#4DBBD5",
+                "0.4"      = "#E64B35",
+                "0.6"      = "#3C5488")
+```
+
+### Ideological Drift
+
+```{r plot-drift}
+results_snapshots %>%
+  ggplot(aes(x = responsiveness, y = avg_drift,
+             color = homophily_label)) +
+  geom_line() + geom_point() +
+  facet_wrap(~round, labeller = label_both, ncol = 4) +
+  x_scale +
+  scale_color_manual(values = hom_colors) +
+  labs(title  = "Average Ideological Drift at T = 50 / 100 / 150 / 200",
+       x      = "Responsiveness to Power",
+       y      = "Avg. Ideological Drift",
+       color  = "Target Homophily") +
+  theme_minimal()
+```
+
+### Lost Vote Rate
+
+```{r plot-lost}
+results_snapshots %>%
+  ggplot(aes(x = responsiveness, y = lost_vote_rate,
+             color = homophily_label)) +
+  geom_line() + geom_point() +
+  facet_wrap(~round, labeller = label_both, ncol = 4) +
+  x_scale +
+  scale_color_manual(values = hom_colors) +
+  labs(title  = "Lost Vote Rate at T = 50 / 100 / 150 / 200",
+       x      = "Responsiveness to Power",
+       y      = "Lost Vote Rate",
+       color  = "Target Homophily") +
+  theme_minimal()
+```
+
+### Delegation Rate
+
+```{r plot-delegation}
+results_snapshots %>%
+  ggplot(aes(x = responsiveness, y = delegation_rate,
+             color = homophily_label)) +
+  geom_line() + geom_point() +
+  facet_wrap(~round, labeller = label_both, ncol = 4) +
+  x_scale +
+  scale_color_manual(values = hom_colors) +
+  labs(title  = "Delegation Rate at T = 50 / 100 / 150 / 200",
+       x      = "Responsiveness to Power",
+       y      = "Share of Lay Agents Delegating",
+       color  = "Target Homophily") +
+  theme_minimal()
+```

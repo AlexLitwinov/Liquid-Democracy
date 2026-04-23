@@ -1,0 +1,225 @@
+---
+title: "Simulation — Homophily: Effect on Liquid Democracy Dynamics"
+output: github_document
+date: "2026-04-16"
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = here::here())
+knitr::opts_chunk$set(fig.path = "output/figures/")
+
+library(here)
+library(tibble)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(furrr)
+
+source(here::here("scripts/Network.R"))
+source(here::here("scripts/Summary.R"))
+```
+
+## Experimental Design
+
+This experiment adds the Metropolis opinion-shuffle step to the standard
+Watts-Strogatz baseline. Rather than varying a process parameter,
+`target_homophily` directly sets the **target opinion assortativity**
+the shuffle must reach before the simulation loop starts. Three levels
+plus a no-homophily baseline are compared. Responsiveness remains the
+primary x-axis variable, as in Simulation 1.
+
+- **Community**: 1 community, 250 lay agents, no experts
+- **Seeds**: 1–100
+- **Responsiveness**: 0.1, 0.5, 1, 2, 5, 10, 25
+- **target_homophily**: NA (baseline), 0.2 (weak), 0.4 (moderate), 0.6 (strong)
+- **homophily_t**: 5 (fixed — greedy convergence)
+- **homophily_steps**: 100 000 (safety cap)
+- **T**: 200 (snapshots at 50, 100, 150, 200)
+
+```{r param-grid}
+responsiveness_vals    <- c(0.1, 0.5, 1, 2, 5, 10, 25)
+target_homophily_vals  <- c(NA, 0.2, 0.4, 0.6)
+seed_vals              <- 1:100
+
+param_grid <- expand.grid(
+  responsiveness   = responsiveness_vals,
+  target_homophily = target_homophily_vals,
+  seed             = seed_vals
+)
+
+cat("Total combinations:", nrow(param_grid), "\n")
+```
+
+---
+
+## Simulation Function
+
+```{r sim-function}
+run_single_simulation <- function(responsiveness, target_homophily, seed) {
+  sim <- simulate_liquid_democracy(
+    seed                    = seed,
+    n_per_community         = 250,
+    n_communities           = 1,
+    node_degree             = 6,
+    n_experts_per_community = 0,
+    expert_connectedness    = 0,
+    p_rewire                = 0.10,
+    responsiveness          = responsiveness,
+    inertia                 = 0,
+    T                       = 200,
+    selfweight_fn           = selfweight_argmax_log,
+    attractiveness_fn       = attractiveness_log,
+    sigma_opinion           = 0,
+    sigma_pow               = 0,
+    target_homophily        = if (is.na(target_homophily)) NULL else target_homophily,
+    homophily_t             = 5,
+    homophily_steps         = 100000
+  )
+
+  list(
+    history = tibble(
+      round                = seq_len(200),
+      lost_vote_rate       = sim$history_lost,
+      avg_drift            = sim$history_drift,
+      delegation_rate      = sim$history_delegation,
+      delegation_stability = sim$history_stability
+    ),
+    snapshots = sim$snapshots
+  )
+}
+```
+
+---
+
+## Run Simulations
+
+```{r run-sims}
+results_file <- here::here("simulations/output/results_sim_homophily.rds")
+
+if (file.exists(results_file)) {
+  saved                  <- readRDS(results_file)
+  results_time           <- saved$results_time
+  results_snapshots      <- saved$results_snapshots
+  results_snapshots_seed <- saved$results_snapshots_seed
+  results                <- saved$results
+  cat("Loaded saved results.\n")
+  cat(sprintf("Snapshots: %d rows\n",   nrow(results_snapshots)))
+  cat(sprintf("Time series: %d rows\n", nrow(results_time)))
+
+} else {
+  plan(multisession, workers = parallel::detectCores() - 1)
+  t_start <- proc.time()
+
+  raw <- param_grid %>%
+    mutate(sim = furrr::future_pmap(
+      list(responsiveness, target_homophily, seed),
+      run_single_simulation,
+      .options = furrr_options(seed = TRUE)
+    ))
+
+  results_time <- raw %>%
+    mutate(h = map(sim, "history")) %>%
+    select(responsiveness, target_homophily, h) %>%
+    unnest(h) %>%
+    group_by(responsiveness, target_homophily, round) %>%
+    summarise(across(where(is.numeric), mean, .names = "{.col}"), .groups = "drop")
+
+  results_snapshots_seed <- raw %>%
+    mutate(s = map(sim, "snapshots")) %>%
+    select(responsiveness, target_homophily, seed, s) %>%
+    unnest(s)
+
+  results_snapshots <- results_snapshots_seed %>%
+    group_by(responsiveness, target_homophily, round, pct_T) %>%
+    summarise(across(where(is.numeric), mean, .names = "{.col}"), .groups = "drop")
+
+  results <- results_snapshots %>%
+    filter(pct_T == 1.00) %>%
+    select(-round, -pct_T)
+
+  plan(sequential)
+  t_end   <- proc.time()
+  elapsed <- (t_end - t_start)[["elapsed"]]
+  cat(sprintf("Completed: %d simulations in %.1f seconds (%.1f min)\n",
+              nrow(param_grid), elapsed, elapsed / 60))
+
+  saveRDS(list(
+    results_time           = results_time,
+    results_snapshots      = results_snapshots,
+    results_snapshots_seed = results_snapshots_seed,
+    results                = results
+  ), results_file)
+
+  cat(sprintf("Results saved to %s\n", results_file))
+}
+```
+
+---
+
+## Results
+
+```{r plot-setup, include=FALSE}
+x_scale <- scale_x_log10(breaks = c(0.1, 0.5, 1, 2, 5, 10, 25),
+                          labels = c("0.1","0.5","1","2","5","10","25"))
+
+hom_colors <- c("baseline" = "grey60",
+                "0.2"      = "#4DBBD5",
+                "0.4"      = "#E64B35",
+                "0.6"      = "#3C5488")
+
+# Replace NA with a readable label for plots
+results_snapshots <- results_snapshots %>%
+  mutate(homophily_label = ifelse(is.na(target_homophily), "baseline",
+                                  as.character(target_homophily)))
+```
+
+### Ideological Drift
+
+```{r plot-drift-snapshots}
+results_snapshots %>%
+  ggplot(aes(x = responsiveness, y = avg_drift,
+             color = homophily_label)) +
+  geom_line() + geom_point() +
+  facet_wrap(~round, labeller = label_both, ncol = 4) +
+  x_scale +
+  scale_color_manual(values = hom_colors) +
+  labs(title  = "Average Ideological Drift at T = 50 / 100 / 150 / 200",
+       x      = "Responsiveness to Power",
+       y      = "Avg. Ideological Drift",
+       color  = "Target Homophily") +
+  theme_minimal()
+```
+
+### Lost Vote Rate
+
+```{r plot-lost-snapshots}
+results_snapshots %>%
+  ggplot(aes(x = responsiveness, y = lost_vote_rate,
+             color = homophily_label)) +
+  geom_line() + geom_point() +
+  facet_wrap(~round, labeller = label_both, ncol = 4) +
+  x_scale +
+  scale_color_manual(values = hom_colors) +
+  labs(title  = "Lost Vote Rate at T = 50 / 100 / 150 / 200",
+       x      = "Responsiveness to Power",
+       y      = "Lost Vote Rate",
+       color  = "Target Homophily") +
+  theme_minimal()
+```
+
+### Delegation Rate
+
+```{r plot-delegation-snapshots}
+results_snapshots %>%
+  ggplot(aes(x = responsiveness, y = delegation_rate,
+             color = homophily_label)) +
+  geom_line() + geom_point() +
+  facet_wrap(~round, labeller = label_both, ncol = 4) +
+  x_scale +
+  scale_color_manual(values = hom_colors) +
+  labs(title  = "Delegation Rate at T = 50 / 100 / 150 / 200",
+       x      = "Responsiveness to Power",
+       y      = "Share of Lay Agents Delegating",
+       color  = "Target Homophily") +
+  theme_minimal()
+```
