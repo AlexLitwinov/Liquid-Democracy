@@ -2,471 +2,443 @@ Weekly Report — Week 10 (24.04.2026 – 30.04.2026)
 ================
 2026-04-24
 
-## Summary
-
-- Replaced the two-step (argmax + sigmoid self-weight) architecture with
-  a unified **Multinomial Logit (MNL)** model in which all options
-  compete simultaneously
-- This report develops the **base model** step by step: first the
-  neighbour utility, then the self utility, with analytical plots at
-  each step showing limit behaviour
-- Models 1–5 (Weeks 1–9) are archived at the end for reference
-
-------------------------------------------------------------------------
-
-## Motivation
-
-The previous models had a structural flaw: Step 1 picked the single best
-neighbour $j^*$ via $\arg\max$, and Step 2 compared the agent against
-$j^*$ via a sigmoid. This threw away all information about the other
-neighbours and created discontinuities — a tiny change in scores could
-flip $j^*$ and abruptly change the self-weight.
-
-The MNL model replaces both steps with a single equation. Agent $i$
-assigns a **utility** $V_k$ to every option
-$k \in \mathcal{C}_i = \{i\} \cup N(i)$ and draws from the resulting
-softmax:
-
-$$
-P_i(k) = \frac{\exp(V_k / \tau)}{\exp(V_{i,\text{self}} / \tau)
-          + \sum_{j \in N(i)} \exp(V_{ij} / \tau)}
-$$
-
-The temperature $\tau$ is the `responsiveness` parameter in the
-simulation.
+<!--
+  WORKFLOW NOTE
+  ─────────────────────────────────────────────────────────────────
+  Phase I  (Sections 1–5): Utility functions studied in isolation.
+           No softmax, no self-weight, no simulation noise.
+           Goal: understand the structural behaviour of the formulas
+           before any decision mechanism is introduced.
+&#10;  Phase II (Sections 6–9): The same functions are embedded in the
+           full stochastic decision model from scripts/Network.R.
+           Softmax and self-weight are reintroduced; outcomes are
+           compared across a parameter grid.
+  ─────────────────────────────────────────────────────────────────
+-->
 
 ------------------------------------------------------------------------
 
-## Base Model
-
-Two decisions are made independently:
-
-1.  **Neighbour utility** — how attractive is neighbour $j$ to agent
-    $i$?
-2.  **Self utility** — how strongly does $i$ prefer to keep their own
-    vote?
-
-The simplest version of each:
-
-$$
-V_{ij} = \alpha \cdot s_{ij} + \beta \cdot r_{ij}
-\qquad
-s_{ij} = 1 - |o_i - o_j|,\quad r_{ij} = \log\!\frac{p_j}{p_i}
-$$
-
-$$
-V_{i,\text{self}} = \mu \quad \text{(constant for all agents)}
-$$
-
-The unnormalised softmax weights are $w_{ij} = e^{V_{ij}/\tau}$ and
-$w_\text{self} = e^{\mu/\tau}$.
+# Phase I — Utility Analysis (No Decision Rule)
 
 ------------------------------------------------------------------------
 
-## Part 1 — Neighbour Utility
+## 1. Utility Functions: Model A and Model B
 
-### 1a. Effect of Opinion Similarity ($\alpha$, fixing $\beta = 0$, $r = 0$)
+We compare two specifications for the utility agent $i$ assigns to
+delegating to neighbour $j$. Both depend on the same two quantities:
 
-$$
-V_{ij} = \alpha \cdot s_{ij}
-\qquad \Longrightarrow \qquad
-w_{ij} = e^{\alpha \cdot s}
-$$
+$$\text{opinion similarity:} \quad (1 - |o_i - o_j|) \in [0, 1]$$
 
-![](Report_10_files/figure-gfm/plot-alpha-1.png)<!-- -->
+$$\text{log power ratio:} \quad \log\!\left(\frac{p_j}{p_i}\right) \in \mathbb{R}$$
 
-**Limit behaviour:**
+**Model A — additive:**
+$$V_{ij}^{(A)} \;=\; \alpha\,(1 - |o_i - o_j|) \;+\; \beta\,\log\!\left(\frac{p_j}{p_i}\right)$$
 
-| $\alpha$ | Effect |
-|----|----|
-| $\alpha = 0$ | $w_{ij} = 1$ for every neighbour — opinion is completely irrelevant |
-| $\alpha \to \infty$ | $w_{ij} \approx 0$ for $s < 1$; only the most similar neighbour counts |
-| $\alpha = 1$ | The weight doubles as $s$ goes from 0 to 1 ($e^0 = 1$ to $e^1 \approx 2.7$) |
+Opinion similarity and relative power contribute **independently**. A
+powerful but ideologically distant neighbour can still accumulate a
+large $\beta\log(p_j/p_i)$ term even when $(1-|o_i-o_j|)$ is small.
 
-------------------------------------------------------------------------
+**Model B — interaction:**
+$$V_{ij}^{(B)} \;=\; (1 - |o_i - o_j|)\,\left[\alpha \;+\; \beta\,\log\!\left(\frac{p_j}{p_i}\right)\right]$$
 
-### 1b. Effect of Relative Power ($\beta$, fixing $\alpha = 0$, $s = 0.5$)
+Opinion similarity acts as a **multiplicative gate** on the power term.
+When agents are maximally dissimilar ($|o_i - o_j| = 1$),
+$V_{ij}^{(B)} = 0$ regardless of power. This encodes a strong
+behavioural assumption: *power only matters if agents are similar*.
+Ideological distance is not a penalty — it is a hard exclusion.
 
-$$
-V_{ij} = \beta \cdot r_{ij}
-\qquad \Longrightarrow \qquad
-w_{ij} = e^{\beta \cdot r}
-$$
-
-Note that $r = \log(p_j / p_i)$: positive when $j$ is more powerful,
-negative when less powerful.
-
-![](Report_10_files/figure-gfm/plot-beta-1.png)<!-- -->
-
-**Limit behaviour:**
-
-| Condition | $r$ value | Effect |
+|  | Model A | Model B |
 |----|----|----|
-| $p_j = p_i$ | $r = 0$ | $w_{ij} = 1$ regardless of $\beta$ — power parity |
-| $p_j \gg p_i$ | $r \to +\infty$ | $w_{ij} \to \infty$ — very powerful neighbours are overwhelmingly attractive |
-| $p_j \ll p_i$ | $r \to -\infty$ | $w_{ij} \to 0$ — less powerful neighbours are ignored |
-| $\beta = 0$ | any | $w_{ij} = 1$ — power is irrelevant |
+| Structure | Additive, separable | $(1-\|o_i-o_j\|)$ gates the power term |
+| Dissimilar, powerful neighbour | $V_{ij} = \beta\log(p_j/p_i) \neq 0$ | $V_{ij} = 0$ always |
+| Models agree when | — | $\beta = 0$, $\log(p_j/p_i) = 0$, $o_i = o_j$ |
 
 ------------------------------------------------------------------------
 
-### 1c. Combined Effect: Heatmap of $V_{ij} = 2s + r$
-
-With $\alpha = 2$, $\beta = 1$, $\tau = 1$ (the default parameters used
-below).
-
-![](Report_10_files/figure-gfm/heatmap-Vij-1.png)<!-- -->
-
-The $w = 1$ contour (white line at the bottom-left) is where the
-neighbour is exactly as attractive as the reference self-option (when
-$\mu = 0$). Below that line, delegating to $j$ is less likely than
-keeping your own vote.
-
-------------------------------------------------------------------------
-
-## Part 2 — Self Utility (Constant Baseline)
-
-$$
-V_{i,\text{self}} = \mu
-\qquad \Longrightarrow \qquad
-w_\text{self} = e^{\mu / \tau}
-$$
-
-### 2a. How $\mu$ shifts the probability of voting directly
-
-For a typical agent with $K$ neighbours each contributing weight
-$\bar{w}_{nb} = e^{V_{ij}}$:
-
-$$
-P(\text{self}) = \frac{e^{\mu/\tau}}{e^{\mu/\tau} + K \cdot \bar{w}_{nb}}
-$$
-
-Below we fix $\tau = 1$, $\alpha = 2$, $\beta = 1$, $s = 0.7$, $r = 0$
-(typical agent with equally-powered neighbours and 70 % average opinion
-agreement).
-
-![](Report_10_files/figure-gfm/plot-mu-1.png)<!-- -->
-
-**Limit behaviour:**
-
-| $\mu$ | Effect |
-|----|----|
-| $\mu \to -\infty$ | $w_\text{self} \to 0$: agent always delegates — no self-confidence |
-| $\mu = 0$ | $w_\text{self} = 1$: self has same base weight as a neighbour with $V_{ij} = 0$ |
-| $\mu = V_{nb}$ | Self and each neighbour have equal weight; $P(\text{self}) = 1/(1+K)$ |
-| $\mu \to +\infty$ | $w_\text{self} \to \infty$: agent never delegates |
-
-With 6 neighbours and $V_{nb} \approx 1.4$, you need roughly
-$\mu \approx 3$ (i.e. $e^3 \approx 20$) to get
-$P(\text{self}) \approx 45\%$.
-
-------------------------------------------------------------------------
-
-### 2b. Effect of Temperature $\tau$ on the same model
-
-Temperature $\tau$ scales all utilities — it does not change *which*
-option is best, but how sharply the agent commits to it.
-
-![](Report_10_files/figure-gfm/plot-tau-1.png)<!-- -->
-
-At $\tau = 0.5$ the curve is much steeper: agents are nearly
-deterministic. At $\tau = 2$ the curve is flat: differences in $\mu$
-barely affect behaviour.
-
-------------------------------------------------------------------------
-
-## Part 3 — Extension: Power-Scaled Self
-
-The constant $\mu$ is the same for every agent in every round. A natural
-extension: let self-confidence grow with **accumulated power** $p_i$.
-
-$$
-V_{i,\text{self}} = \mu + \gamma \cdot \log(p_i)
-\qquad \Longrightarrow \qquad
-w_\text{self} = p_i^{\,\gamma/\tau} \cdot e^{\mu/\tau}
-$$
-
-### 3a. Self-weight as a function of $p_i$ (varying $\gamma$)
-
-![](Report_10_files/figure-gfm/plot-gamma-weight-1.png)<!-- -->
-
-### 3b. P(self) as a function of $p_i$ (6 typical neighbours)
-
-![](Report_10_files/figure-gfm/plot-gamma-pself-1.png)<!-- -->
-
-**Limit behaviour:**
-
-| $\gamma$ | Effect |
-|----|----|
-| $\gamma = 0$ | Collapses to constant-$\mu$ model; power doesn’t affect self-confidence |
-| $\gamma = 1$ | $w_\text{self} = p_i$: self-weight equals own power — linear feedback |
-| $\gamma \to \infty$ | Even slightly powerful agents ($p_i > 1$) become near-certain direct voters |
-| $p_i = 1$ (initial state) | $w_\text{self} = e^{\mu/\tau}$ for all $\gamma$ — power self = constant self in round 1 |
-
-The key dynamic: in **round 1** every agent has $p_i = 1$, so the
-power-scaled model behaves identically to the constant model with
-$\mu = 0$. After delegations occur, some agents accumulate power and
-their self-confidence grows — they gradually stop delegating. This is an
-**endogenous feedback loop** rather than an externally fixed parameter.
-
-------------------------------------------------------------------------
-
-## Part 4 — Extension: Bilinear Utility
-
-The additive model treats $s$ and $r$ as independent. A bilinear
-interaction term lets power **amplify** the effect of opinion
-similarity:
-
-$$
-V_{ij}^{\text{bil}} = \alpha \cdot s + \beta \cdot r + \delta \cdot s \cdot r
-$$
-
-Setting $\delta = 0$ recovers the additive case.
-
-![](Report_10_files/figure-gfm/heatmap-bilinear-1.png)<!-- -->
-
-In the **bilinear** panel, the contours become tilted: for high-power
-neighbours ($r > 0$), even moderate similarity produces a high utility.
-For low-power neighbours ($r < 0$), even high similarity doesn’t
-compensate.
-
-**Limit behaviour of $\delta$:**
-
-| $\delta$ | Effect |
-|----|----|
-| $\delta = 0$ | Additive; $s$ and $r$ are independent |
-| $\delta > 0$ | Power scales the opinion weight: effective $\alpha_\text{eff} = \alpha + \delta \cdot r$ |
-| $s = 0$ | Interaction vanishes; only $\beta \cdot r$ matters regardless of $\delta$ |
-| $r = 0$ | Interaction vanishes; only $\alpha \cdot s$ matters regardless of $\delta$ |
-
-------------------------------------------------------------------------
-
-## Unified Model: Self as a Softmax Option
-
-### Assumption
-
-Each agent $i$ assigns a **utility** to every possible choice — voting
-directly or delegating to any of their neighbours — and draws from a
-softmax over those utilities. This is the **Multinomial Logit** model
-(McFadden 1974): if we assume each agent’s perceived utility has an
-independent random component drawn from a Gumbel distribution, the
-resulting choice probabilities are exactly the softmax.
-
-------------------------------------------------------------------------
-
-### Utility of delegating to neighbour $j$
-
-$$
-V_{ij}
-= \alpha \cdot \bigl(1 - |o_i - o_j|\bigr)
-+ \beta \cdot \log\!\left(\frac{p_j}{p_i}\right)
-$$
-
-- $1 - |o_i - o_j| \in [0,1]$: **opinion similarity**. Is 1 when $i$ and
-  $j$ have identical opinions, 0 when maximally different. $\alpha > 0$
-  means: the more you agree, the more attractive the delegate.
-
-- $\log(p_j / p_i) \in \mathbb{R}$: **log power ratio**. Is 0 when both
-  have equal power, positive when $j$ is more powerful, negative when
-  $j$ is less powerful. Using the logarithm ensures scale-invariance: a
-  10:1 ratio always contributes the same utility regardless of whether
-  we are comparing 1 vs 10 votes or 100 vs 1 000 votes. $\beta > 0$
-  means: more powerful neighbours are more attractive.
-
-------------------------------------------------------------------------
-
-### Utility of voting directly (self-option)
-
-$$
-V_{i,\text{self}} = \mu
-$$
-
-$\mu$ is a **constant baseline** — the same for every agent in every
-round. It captures the general tendency to keep one’s own vote
-independent of power or neighbourhood structure. $\mu > 0$: agents lean
-towards voting directly. $\mu < 0$: agents lean towards delegating.
-$\mu = 0$: the self-option has the same base weight as a neighbour with
-$V_{ij} = 0$ (i.e. equal power and maximum opinion distance).
-
-------------------------------------------------------------------------
-
-### Choice probabilities via Softmax
-
-The **softmax** converts the utilities into a proper probability
-distribution over all $K+1$ options (self plus $K = |N(i)|$ neighbours):
-
-$$
-P_i(\text{vote directly}) =
-\frac{
-  \exp\!\left(\dfrac{\mu}{\tau}\right)
-}{
-  \exp\!\left(\dfrac{\mu}{\tau}\right)
-  +
-  \displaystyle\sum_{j \in N(i)}
-  \exp\!\left(\dfrac{\alpha(1-|o_i-o_j|) + \beta\log(p_j/p_i)}{\tau}\right)
-}
-$$
-
-$$
-P_i(\text{delegate to } j) =
-\frac{
-  \exp\!\left(\dfrac{\alpha(1-|o_i-o_j|) + \beta\log(p_j/p_i)}{\tau}\right)
-}{
-  \exp\!\left(\dfrac{\mu}{\tau}\right)
-  +
-  \displaystyle\sum_{j' \in N(i)}
-  \exp\!\left(\dfrac{\alpha(1-|o_i-o_{j'}|) + \beta\log(p_{j'}/p_i)}{\tau}\right)
-}
-$$
-
-The **temperature** $\tau > 0$ is the `responsiveness` parameter in the
-simulation. Dividing all utilities by $\tau$ uniformly scales how
-sharply agents discriminate between options:
-
-- $\tau \to 0$: near-deterministic — the option with the highest utility
-  is chosen with probability approaching 1 (equivalent to $\arg\max$)
-- $\tau = 1$: standard softmax — utilities enter without rescaling
-- $\tau \to \infty$: uniform random — all options equally likely
-  regardless of utilities
-
-------------------------------------------------------------------------
-
-### Why This Replaces the Two-Step Formula
-
-In the old model, $A_{ij} = \exp(V_{ij})$ and
-$w_\text{self} = \sigma(\cdot)$ are on **different scales**: the
-neighbour weights are unbounded $(0, \infty)$, but the sigmoid is
-bounded in $(0, 1)$. A neighbour with $V_{ij} = 4$ produces
-$A_{ij} = e^4 \approx 55$, which completely dominates any sigmoid value
-no matter how high.
-
-Setting $w_\text{self} = \exp(\mu/\tau)$ puts both on the same
-$\exp(\cdot)$ scale and allows the parameters to be interpreted
-consistently.
-
-|  | Old (two-step) | Unified softmax |
-|----|----|----|
-| Neighbour weight | $\exp(\alpha(1-|o_i-o_j|) + \beta\log(p_j/p_i))$ | $\exp\!\left(\frac{\alpha(1-|o_i-o_j|)+\beta\log(p_j/p_i)}{\tau}\right)$ |
-| Self weight | $\sigma\!\left(\alpha|o_i-o_{j^*}| + \beta\log(p_{j^*}/p_i)\right) \in (0,1)$ | $\exp(\mu/\tau) \in (0,\infty)$ |
-| All neighbours compete? | No — $\arg\max$ keeps only $j^*$ | Yes — every neighbour enters the sum |
-| One formula? | No — $\alpha,\beta$ appear twice in different forms | Yes — one formula, one parameter set |
-
-------------------------------------------------------------------------
-
-### Implementation
+## 2. 1D Analysis — Effect of Opinion Similarity
+
+We fix $\log(p_j/p_i)$ and study how utility varies with
+$(1-|o_i-o_j|)$. Each panel holds $\alpha$, $\beta$, and $\log(p_j/p_i)$
+constant; only opinion similarity varies along the x-axis.
 
 ``` r
-# make_mnl_attract(alpha, beta)
-# -------------------------------------------------
-# Returns a function that computes the softmax weight w_ij = exp(V_ij / tau)
-# for each neighbour j of agent i.
-#
-# The returned function takes:
-#   op_i, op_j  : opinion of agent i and neighbour(s) j  (scalars or vectors)
-#   pow_i, pow_j: power of agent i and neighbour(s) j
-#   resp        : responsiveness = temperature tau
-#
-# The simulator calls it as:
-#   attractiveness_fn(op[i], op[neighbours], pow[i], pow[neighbours], responsiveness)
-# so op_j and pow_j are vectors — the function is automatically vectorised.
-make_mnl_attract <- function(alpha, beta) {
-  force(alpha); force(beta)
+expand_grid(
+  opinion_sim     = seq(0, 1, length.out = 200),
+  log_power_ratio = c(-2, 0, 2),
+  model           = c("A", "B"),
+  alpha           = c(1, 2),
+  beta            = c(1, 2)
+) |>
+  mutate(
+    V = case_when(
+      model == "A" ~ alpha * opinion_sim + beta * log_power_ratio,
+      model == "B" ~ opinion_sim * (alpha + beta * log_power_ratio)
+    ),
+    lpr_label = paste0("log(p[j]/p[i]) == ", log_power_ratio),
+    model     = paste("Model", model),
+    param     = paste0("α = ", alpha, ", β = ", beta)
+  ) |>
+  ggplot(aes(opinion_sim, V, colour = lpr_label)) +
+  geom_line(linewidth = 0.9) +
+  geom_hline(yintercept = 0, linetype = "dotted", colour = "grey50") +
+  facet_grid(model ~ param) +
+  scale_colour_brewer(
+    palette = "Dark2",
+    name    = NULL,
+    labels  = scales::label_parse()
+  ) +
+  labs(
+    x        = expression(1 - abs(o[i] - o[j])),
+    y        = expression(V[ij]),
+    title    = "Utility vs opinion similarity across parameter settings",
+    subtitle = "Rows: Model A vs B | Columns: (α, β) combinations"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+![](Report_10_files/figure-gfm/plot-1d-similarity-1.png)<!-- -->
+
+**Model A** produces parallel lines: increasing opinion similarity
+raises $V_{ij}$ at constant rate $\alpha$, while $\beta\log(p_j/p_i)$
+adds a fixed vertical offset independent of similarity. Even at zero
+similarity ($1-|o_i-o_j|=0$) the utility is nonzero whenever $\beta > 0$
+— a powerful but ideologically distant neighbour still attracts. **Model
+B** forces all lines through the origin at zero similarity: the entire
+expression is multiplied by $(1-|o_i-o_j|)$, so maximal dissimilarity
+always yields $V_{ij}=0$ regardless of power or $\alpha$. Larger $\beta$
+(right columns) widens the gap between $\log(p_j/p_i)$ levels in both
+models; larger $\alpha$ (bottom rows) shifts Model A upward uniformly
+and steepens Model B’s slope.
+
+------------------------------------------------------------------------
+
+## 3. 1D Analysis — Effect of the Power Ratio
+
+We fix $(1-|o_i-o_j|)$ and study how utility varies with
+$\log(p_j/p_i)$. Each panel holds $\alpha$, $\beta$, and opinion
+similarity constant; only the log power ratio varies along the x-axis.
+
+``` r
+expand_grid(
+  log_power_ratio = seq(-3, 3, length.out = 200),
+  opinion_sim     = c(0, 0.25, 0.5, 0.75, 1),
+  model           = c("A", "B"),
+  alpha           = c(1, 2),
+  beta            = c(1, 2)
+) |>
+  mutate(
+    V = case_when(
+      model == "A" ~ alpha * opinion_sim + beta * log_power_ratio,
+      model == "B" ~ opinion_sim * (alpha + beta * log_power_ratio)
+    ),
+    sim_label = paste0("1-abs(o[i]-o[j]) == ", opinion_sim),
+    model     = paste("Model", model),
+    param     = paste0("α = ", alpha, ", β = ", beta)
+  ) |>
+  ggplot(aes(log_power_ratio, V, colour = sim_label)) +
+  geom_line(linewidth = 0.9) +
+  geom_hline(yintercept = 0, linetype = "dotted", colour = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey70") +
+  facet_grid(model ~ param) +
+  scale_colour_brewer(
+    palette = "RdYlGn",
+    direction = -1,
+    name   = "Opinion similarity",
+    labels = scales::label_parse()
+  ) +
+  labs(
+    x        = expression(log(p[j] / p[i])),
+    y        = expression(V[ij]),
+    title    = "Utility vs log power ratio across parameter settings",
+    subtitle = "Rows: Model A vs B | Columns: (α, β) combinations"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+![](Report_10_files/figure-gfm/plot-1d-power-1.png)<!-- -->
+
+**Model A** produces perfectly parallel lines with slope $\beta$: the
+log power ratio has the same influence at every similarity level, and
+the lines are shifted vertically by $\alpha \cdot (1-|o_i-o_j|)$. Agents
+with zero similarity ($1-|o_i-o_j|=0$, green line) still respond to
+power. **Model B** shows a fan converging to zero: at full similarity
+the slope equals $\beta$ (matching Model A), but it contracts
+proportionally as similarity falls, reaching a completely flat zero line
+for dissimilar agents. The vertical dashed line marks equal power
+($\log(p_j/p_i)=0$); the dotted horizontal marks $V_{ij}=0$.
+
+------------------------------------------------------------------------
+
+## 4. 2D Utility Surface
+
+Both inputs vary simultaneously. Red indicates high utility (agent $i$
+strongly prefers to delegate to $j$), blue indicates low or negative
+utility, white marks $V_{ij}=0$. Each panel is one $(\alpha,\beta)$
+combination.
+
+![](Report_10_files/figure-gfm/plot-2d-heatmap-1.png)<!-- -->
+
+The left column ($1-|o_i-o_j|=0$) makes the key difference concrete:
+Model A shows a continuous gradient driven by $\log(p_j/p_i)$; Model B
+is uniformly white (zero), eliminating all dissimilar agents from the
+choice set irrespective of their power.
+
+------------------------------------------------------------------------
+
+## 5. Limit Behaviour
+
+| Condition | V_A | V_B | Implication |
+|:---|:---|:---|:---|
+| \|o_i - o_j\| = 1 (max. dissimilar) | beta \* log(p_j / p_i) | 0 | B ignores dissimilar agents entirely |
+| o_i = o_j (identical opinions) | alpha + beta \* log(p_j / p_i) | alpha + beta \* log(p_j / p_i) | Models are identical |
+| beta = 0 | alpha \* (1 - \|o_i - o_j\|) | alpha \* (1 - \|o_i - o_j\|) | Models are identical; pure homophily |
+| alpha = 0 | beta \* log(p_j / p_i) | (1 - \|o_i - o_j\|) \* beta \* log(p_j / p_i) | B still couples power to similarity |
+| p_j \>\> p_i, beta \> 0, o_i ≈ o_j | → +∞ | → +∞ | Both: powerful similar agents dominate |
+| p_j \>\> p_i, beta \> 0, \|o_i - o_j\| = 1 | → +∞ | 0 | A: cross-ideological pull; B: no effect |
+
+Limit behaviour of both utility functions.
+
+Models diverge only when $\beta \neq 0$ **and** opinion heterogeneity is
+present. The two bold rows define the critical qualitative difference.
+
+------------------------------------------------------------------------
+
+# Phase II — Full Decision Model and Simulation
+
+------------------------------------------------------------------------
+
+## 6. Softmax Decision Rule and Self-Weight
+
+Having characterised the utility functions in isolation, we now embed
+them in a stochastic choice model. Agent $i$ selects from
+$\{\text{self}\} \cup N(i)$ by drawing proportional to unnormalised
+weights:
+
+$$w_{\text{self},i} = k_i\,e^\delta, \qquad
+  w_{ij} = \exp\!\left(V_{ij}\right)$$
+
+where $k_i$ is agent $i$’s degree and $\delta$ is the **self-preference
+parameter**. These weights are positive scores — not yet probabilities.
+The softmax converts them into a proper distribution over the choice
+set:
+
+$$P_i(k) = \frac{w_k}{w_{\text{self},i} + \displaystyle\sum_{j \in N(i)} w_{ij}}$$
+
+so all options compete on a common scale and probabilities sum to 1. In
+particular, $P_i(\text{self})$ and each $P_i(j)$ for $j \in N(i)$ are
+given by substituting the respective weight in the numerator.
+
+At baseline ($\alpha = \beta = 0$, all $w_{ij}=1$):
+
+$$P_i(\text{self}) \;=\; \frac{k_i e^\delta}{k_i e^\delta + k_i}
+\;=\; \frac{e^\delta}{e^\delta + 1} \;=\; \sigma(\delta)$$
+
+The degree term cancels, so $\sigma(\delta)$ is the baseline self-vote
+probability regardless of network structure. This gives interpretable
+targets:
+
+| $\delta$ | Baseline self-vote | Baseline delegation |
+|----------|--------------------|---------------------|
+| $-2.2$   | 10 %               | **~90 %**           |
+| $-1.4$   | 20 %               | **~80 %**           |
+| $-0.85$  | 30 %               | **~70 %**           |
+| $-0.4$   | 40 %               | **~60 %**           |
+
+With $\alpha > 0$ or $\beta > 0$, neighbours become more attractive and
+actual delegation rates rise above the baseline.
+
+------------------------------------------------------------------------
+
+## 7. Simulation
+
+``` r
+# Returns an attractiveness_fn for Model A (additive)
+make_attract_A <- function(alpha, beta) {
   function(op_i, op_j, pow_i, pow_j, resp) {
-    opinion_similarity   <- 1 - abs(op_i - op_j)
-    log_power_ratio      <- log(pow_j / pow_i)
-    utility              <- alpha * opinion_similarity + beta * log_power_ratio
-    exp(utility / resp)
+    opinion_sim     <- 1 - abs(op_i - op_j)
+    log_power_ratio <- log(pow_j / pow_i)
+    exp(alpha * opinion_sim + beta * log_power_ratio)
   }
 }
 
-# make_mnl_self(mu)
-# -------------------------------------------------
-# Returns a function that computes the softmax weight for the self-option:
-#   w_self = exp(mu / tau)
-#
-# The returned function takes:
-#   i            : index of the focal agent (not used here)
-#   nb           : indices of neighbours (not used here)
-#   op, pow      : full opinion and power vectors (not used here)
-#   responsiveness: temperature tau
-#
-# The interface is kept general so that future variants (e.g. power-scaled
-# self-confidence) can use op[i] or pow[i] without changing the simulator.
-make_mnl_self <- function(mu) {
-  force(mu)
-  function(i, nb, op, pow, responsiveness) exp(mu / responsiveness)
+# Returns an attractiveness_fn for Model B (interaction)
+make_attract_B <- function(alpha, beta) {
+  function(op_i, op_j, pow_i, pow_j, resp) {
+    opinion_sim     <- 1 - abs(op_i - op_j)
+    log_power_ratio <- log(pow_j / pow_i)
+    exp(opinion_sim * (alpha + beta * log_power_ratio))
+  }
+}
+
+# Returns a selfweight_fn with degree-normalised self-preference delta
+make_selfweight_delta <- function(delta) {
+  function(i, nb, op, pow, resp) {
+    length(nb) * exp(delta)   # = k_i * exp(delta)
+  }
 }
 ```
 
+------------------------------------------------------------------------
+
+## 8. Running Both Models
+
 ``` r
-# Example: alpha = 2, beta = 1, mu = 3, tau = 1
-simulate_liquid_democracy(
-  attractiveness_fn = make_mnl_attract(alpha = 2, beta = 1),
-  selfweight_fn     = make_mnl_self(mu = 3),
-  responsiveness    = 1
-)
+# Parameter grid
+# delta values calibrated to baseline delegation ~90 / 80 / 70 / 60 %
+delta_map <- c("~90%" = -2.2, "~80%" = -1.4, "~70%" = -0.85, "~60%" = -0.4)
+
+param_grid <- expand_grid(
+  alpha    = c(0, 1, 2),
+  beta     = c(0, 1, 2),
+  baseline = names(delta_map)
+) |>
+  mutate(delta = delta_map[baseline])
+
+# Run one simulation, return the final-round snapshot metrics
+run_one <- function(alpha, beta, delta, model_label, seed = 42) {
+  attr_fn <- if (model_label == "A") make_attract_A(alpha, beta)
+             else                    make_attract_B(alpha, beta)
+
+  res <- simulate_liquid_democracy(
+    seed                    = seed,
+    n_per_community         = 100,
+    n_communities           = 1,
+    node_degree             = 6,
+    T                       = 100,
+    attractiveness_fn       = attr_fn,
+    selfweight_fn           = make_selfweight_delta(delta),
+    responsiveness          = 1   # unused by our fns; kept for compatibility
+  )
+
+  snap <- res$snapshots |> slice_tail(n = 1)
+  tibble(
+    model           = model_label,
+    delegation_rate = snap$delegation_rate,
+    lost_vote_rate  = snap$lost_vote_rate
+  )
+}
+
+# Run both models on every parameter combination (same seed = same network)
+results <- param_grid |>
+  rowwise() |>
+  mutate(
+    res_A = list(run_one(alpha, beta, delta, "A")),
+    res_B = list(run_one(alpha, beta, delta, "B"))
+  ) |>
+  ungroup() |>
+  pivot_longer(c(res_A, res_B), names_to = "tmp", values_to = "res") |>
+  unnest(res) |>
+  select(-tmp)
 ```
 
 ------------------------------------------------------------------------
 
-### Demo: Effect of $\mu$ on Delegation Rate
+## 9. Results
 
-Three values of $\mu$ with fixed $\alpha = 2$, $\beta = 1$, $\tau = 1$.
-1 seed, 200 agents, 100 rounds.
+### Comparison table
 
-![](Report_10_files/figure-gfm/demo-plot-delegation-1.png)<!-- -->
+Each row is one $(\alpha, \beta, \delta)$ combination run on the same
+network (seed = 42). **Del.** is the share of agents who delegated in
+the final round; **Lost** is the share of votes that ended in a cycle or
+reached a node with no outgoing delegation and were therefore lost.
 
-![](Report_10_files/figure-gfm/demo-plot-lost-1.png)<!-- -->
+``` r
+results |>
+  pivot_wider(
+    names_from  = model,
+    values_from = c(delegation_rate, lost_vote_rate)
+  ) |>
+  mutate(across(where(is.numeric) & !matches("delta"),
+                \(x) round(x, 2))) |>
+  select(alpha, beta, baseline, starts_with("delegation"), starts_with("lost")) |>
+  arrange(baseline, alpha, beta) |>
+  knitr::kable(
+    col.names = c(
+      "alpha", "beta", "Baseline del.",
+      "Del. A", "Del. B", "Lost A", "Lost B"
+    ),
+    caption = "Final-round metrics for Model A and Model B (n = 100, T = 100 rounds)."
+  )
+```
 
-The plots confirm the analytical result from Part 2: at $\mu = 0$ the
-self-weight $e^0 = 1$ cannot compete with 6 neighbours each contributing
-$\approx e^{1.4} \approx 4$, so nearly everyone delegates. $\mu = 4$
-($e^4 \approx 55$) shifts the balance to roughly 40 % delegation.
+| alpha | beta | Baseline del. | Del. A | Del. B | Lost A | Lost B |
+|------:|-----:|:--------------|-------:|-------:|-------:|-------:|
+|     0 |    0 | ~60%          |   0.66 |   0.66 |   0.26 |   0.26 |
+|     0 |    1 | ~60%          |   0.67 |   0.62 |   0.12 |   0.21 |
+|     0 |    2 | ~60%          |   0.77 |   0.73 |   0.10 |   0.17 |
+|     1 |    0 | ~60%          |   0.77 |   0.77 |   0.31 |   0.31 |
+|     1 |    1 | ~60%          |   0.73 |   0.79 |   0.10 |   0.34 |
+|     1 |    2 | ~60%          |   0.83 |   0.78 |   0.24 |   0.17 |
+|     2 |    0 | ~60%          |   0.85 |   0.85 |   0.50 |   0.50 |
+|     2 |    1 | ~60%          |   0.81 |   0.79 |   0.25 |   0.52 |
+|     2 |    2 | ~60%          |   0.85 |   0.89 |   0.21 |   0.52 |
+|     0 |    0 | ~70%          |   0.76 |   0.76 |   0.39 |   0.39 |
+|     0 |    1 | ~70%          |   0.74 |   0.85 |   0.10 |   0.43 |
+|     0 |    2 | ~70%          |   0.81 |   0.75 |   0.08 |   0.31 |
+|     1 |    0 | ~70%          |   0.89 |   0.89 |   0.57 |   0.57 |
+|     1 |    1 | ~70%          |   0.90 |   0.89 |   0.52 |   0.60 |
+|     1 |    2 | ~70%          |   0.89 |   0.86 |   0.24 |   0.36 |
+|     2 |    0 | ~70%          |   0.87 |   0.87 |   0.48 |   0.48 |
+|     2 |    1 | ~70%          |   0.83 |   0.88 |   0.39 |   0.50 |
+|     2 |    2 | ~70%          |   0.89 |   0.88 |   0.31 |   0.71 |
+|     0 |    0 | ~80%          |   0.81 |   0.81 |   0.34 |   0.34 |
+|     0 |    1 | ~80%          |   0.83 |   0.84 |   0.22 |   0.31 |
+|     0 |    2 | ~80%          |   0.78 |   0.85 |   0.04 |   0.22 |
+|     1 |    0 | ~80%          |   0.86 |   0.86 |   0.60 |   0.60 |
+|     1 |    1 | ~80%          |   0.84 |   0.85 |   0.27 |   0.36 |
+|     1 |    2 | ~80%          |   0.84 |   0.84 |   0.29 |   0.24 |
+|     2 |    0 | ~80%          |   0.92 |   0.92 |   0.56 |   0.56 |
+|     2 |    1 | ~80%          |   0.92 |   0.91 |   0.62 |   0.55 |
+|     2 |    2 | ~80%          |   0.93 |   0.93 |   0.54 |   0.74 |
+|     0 |    0 | ~90%          |   0.89 |   0.89 |   0.59 |   0.59 |
+|     0 |    1 | ~90%          |   0.88 |   0.88 |   0.62 |   0.48 |
+|     0 |    2 | ~90%          |   0.91 |   0.89 |   0.47 |   0.38 |
+|     1 |    0 | ~90%          |   0.94 |   0.94 |   0.82 |   0.82 |
+|     1 |    1 | ~90%          |   0.94 |   0.94 |   0.82 |   0.65 |
+|     1 |    2 | ~90%          |   0.92 |   0.94 |   0.24 |   0.71 |
+|     2 |    0 | ~90%          |   0.98 |   0.98 |   0.98 |   0.98 |
+|     2 |    1 | ~90%          |   0.97 |   0.98 |   0.97 |   0.98 |
+|     2 |    2 | ~90%          |   0.97 |   0.97 |   0.82 |   0.97 |
+
+Final-round metrics for Model A and Model B (n = 100, T = 100 rounds).
 
 ------------------------------------------------------------------------
 
-## Archived: Two-Step Models (Weeks 1–9)
+## 10. Key Findings
 
-These five formulations are superseded by the MNL framework above. They
-are kept here for reference.
+**From the utility analysis (Phase I):**
 
-### Model 1 — Additive Score, Best-Neighbour Self-Weight
+- In **Model A**, opinion similarity and power contribute independently.
+  A powerful but dissimilar agent retains a nonzero utility driven
+  entirely by $\beta\log(p_j/p_i)$.
+- In **Model B**, $(1-|o_i-o_j|)$ gates the power term. A dissimilar
+  agent is assigned $V_{ij}=0$ regardless of power. This is not a
+  technical variant but a distinct behavioural assumption: *trust must
+  exist before power becomes relevant*.
+- The two models coincide when $\beta = 0$ (power ignored) or when all
+  agent pairs are opinion-identical.
 
-$$
-A_{ij} = \exp\!\left(\alpha(1-|o_i-o_j|) + \beta\log\tfrac{p_j}{p_i}\right)
-\quad
-j^* = \arg\max A_{ij}
-\quad
-w_\text{self} = \sigma\!\left(\alpha|o_i-o_{j^*}| + \beta\log\tfrac{p_{j^*}}{p_i}\right)
-$$
+**From the simulation (Phase II):**
 
-### Model 2 — Mean-Neighbourhood Self-Weight
+- $\delta$ controls the baseline delegation volume; $\alpha$ and $\beta$
+  shift rates upward by making neighbours more attractive.
+- **Model B produces lower delegation rates and fewer lost votes**
+  whenever $\beta > 0$. By excluding dissimilar agents, it keeps
+  delegation chains shorter and within ideologically coherent
+  sub-groups, reducing cycle risk.
+- **Model A allows cross-ideological power-driven delegation**, which
+  can form long chains spanning opinion clusters — the primary source of
+  its elevated lost-vote rate at high $\beta$.
 
-$$
-w^\text{mean}_\text{self} = \sigma\!\left(\alpha\bar{d}_i + \beta\log\tfrac{\bar{p}_i}{p_i}\right)
-\qquad
-\bar{d}_i = \tfrac{1}{K}\sum_j|o_i-o_j|,\quad \bar{p}_i = \tfrac{1}{K}\sum_j p_j
-$$
-
-### Model 3 — Multiplicative Score
-
-$$
-A_{ij} = (1-|o_i-o_j|)^\alpha \cdot (p_j/p_i)^\beta
-\qquad
-w_\text{self} = \sigma\!\left((|o_i-o_{j^*}|)^\alpha(p_{j^*}/p_i)^\beta - 1\right)
-$$
-
-### Model 4 — Bilinear Interaction Score
+## 11. Model C — Soft Gate
 
 $$
-A_{ij} = \alpha s_{ij} + \beta r_{ij} + \gamma s_{ij} r_{ij}
-\qquad
-w_\text{self} = \sigma(\alpha|o_i-o_{j^*}| + \beta r_{j^*i} + \gamma|o_i-o_{j^*}|r_{j^*i})
+V_{ij}^{(C)} \;=\; \alpha\,(1 - |o_i - o_j|) \;+\; \beta\,(1 - |o_i - o_j|)^\gamma\,\log\!\left(\frac{p_j}{p_i}\right), \qquad \gamma > 0
 $$
 
-### Model 5 — Multiplicative Delegation Gate
-
-$$
-P(\text{delegate}) = (1-|o_i-o_{j^*}|)\cdot\sigma(r\ln(p_{j^*}/p_i))
-\qquad
-w_\text{self} = 1 - P(\text{delegate})
-$$
+Model C nests A ($\gamma = 0$) and B ($\gamma = 1$) as special cases.
+The exponent $\gamma$ continuously controls how aggressively ideological
+distance suppresses power-driven delegation — interpolating between the
+fully independent structure of A and the hard-exclusion logic of B.
