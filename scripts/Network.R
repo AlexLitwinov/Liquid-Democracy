@@ -242,7 +242,7 @@ connect_experts <- function(gF, agents, n_per_community,
 # HOMOPHILY OPINION SHUFFLE (Metropolis)
 #
 # Runs AFTER the friendship network is built and BEFORE the
-# simulation loop. The network topology is never touched —
+# simulation loop. The network structure is never touched —
 # only opinions are redistributed among lay agents so that
 # connected nodes become more similar.
 #

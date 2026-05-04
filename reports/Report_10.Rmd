@@ -1,0 +1,475 @@
+---
+title: "Weekly Report — Week 10 (24.04.2026 – 30.04.2026)"
+output: github_document
+date: "2026-04-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(here)
+```
+
+<!--
+  WORKFLOW NOTE
+  ─────────────────────────────────────────────────────────────────
+  Phase I  (Sections 1–5): Utility functions studied in isolation.
+           No softmax, no self-weight, no simulation noise.
+           Goal: understand the structural behaviour of the formulas
+           before any decision mechanism is introduced.
+
+  Phase II (Sections 6–9): The same functions are embedded in the
+           full stochastic decision model from scripts/Network.R.
+           Softmax and self-weight are reintroduced; outcomes are
+           compared across a parameter grid.
+  ─────────────────────────────────────────────────────────────────
+-->
+
+---
+
+# Phase I — Utility Analysis (No Decision Rule)
+
+---
+
+## 1. Utility Functions: Model A and Model B
+
+We compare two specifications for the utility agent $i$ assigns to delegating
+to neighbour $j$. Both depend on the same two quantities:
+
+$$\text{opinion similarity:} \quad (1 - |o_i - o_j|) \in [0, 1]$$
+
+$$\text{log power ratio:} \quad \log\!\left(\frac{p_j}{p_i}\right) \in \mathbb{R}$$
+
+**Model A — additive:**
+$$V_{ij}^{(A)} \;=\; \alpha\,(1 - |o_i - o_j|) \;+\; \beta\,\log\!\left(\frac{p_j}{p_i}\right)$$
+
+Opinion similarity and relative power contribute **independently**.
+A powerful but ideologically distant neighbour can still accumulate a large
+$\beta\log(p_j/p_i)$ term even when $(1-|o_i-o_j|)$ is small.
+
+**Model B — interaction:**
+$$V_{ij}^{(B)} \;=\; (1 - |o_i - o_j|)\,\left[\alpha \;+\; \beta\,\log\!\left(\frac{p_j}{p_i}\right)\right]$$
+
+Opinion similarity acts as a **multiplicative gate** on the power term.
+When agents are maximally dissimilar ($|o_i - o_j| = 1$), $V_{ij}^{(B)} = 0$
+regardless of power. This encodes a strong behavioural assumption:
+*power only matters if agents are similar*. Ideological distance is not
+a penalty — it is a hard exclusion.
+
+| | Model A | Model B |
+|---|---|---|
+| Structure | Additive, separable | $(1-\|o_i-o_j\|)$ gates the power term |
+| Dissimilar, powerful neighbour | $V_{ij} = \beta\log(p_j/p_i) \neq 0$ | $V_{ij} = 0$ always |
+| Models agree when | — | $\beta = 0$, $\log(p_j/p_i) = 0$, $o_i = o_j$  |
+
+---
+
+## 2. 1D Analysis — Effect of Opinion Similarity
+
+We fix $\log(p_j/p_i)$ and study how utility varies with $(1-|o_i-o_j|)$.
+Each panel holds $\alpha$, $\beta$, and $\log(p_j/p_i)$ constant; only
+opinion similarity varies along the x-axis.
+
+```{r plot-1d-similarity, fig.width=14, fig.height=9, dpi=300}
+expand_grid(
+  opinion_sim     = seq(0, 1, length.out = 200),
+  log_power_ratio = c(-2, 0, 2),
+  model           = c("A", "B"),
+  alpha           = c(1, 2),
+  beta            = c(1, 2)
+) |>
+  mutate(
+    V = case_when(
+      model == "A" ~ alpha * opinion_sim + beta * log_power_ratio,
+      model == "B" ~ opinion_sim * (alpha + beta * log_power_ratio)
+    ),
+    lpr_label = paste0("log(p[j]/p[i]) == ", log_power_ratio),
+    model     = paste("Model", model),
+    param     = paste0("α = ", alpha, ", β = ", beta)
+  ) |>
+  ggplot(aes(opinion_sim, V, colour = lpr_label)) +
+  geom_line(linewidth = 0.9) +
+  geom_hline(yintercept = 0, linetype = "dotted", colour = "grey50") +
+  facet_grid(model ~ param) +
+  scale_colour_brewer(
+    palette = "Dark2",
+    name    = NULL,
+    labels  = scales::label_parse()
+  ) +
+  labs(
+    x        = expression(1 - abs(o[i] - o[j])),
+    y        = expression(V[ij]),
+    title    = "Utility vs opinion similarity across parameter settings",
+    subtitle = "Rows: Model A vs B | Columns: (α, β) combinations"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+**Model A** produces parallel lines: increasing opinion similarity raises
+$V_{ij}$ at constant rate $\alpha$, while $\beta\log(p_j/p_i)$ adds a fixed
+vertical offset independent of similarity. Even at zero similarity
+($1-|o_i-o_j|=0$) the utility is nonzero whenever $\beta > 0$ — a
+powerful but ideologically distant neighbour still attracts.
+**Model B** forces all lines through the origin at zero similarity: the
+entire expression is multiplied by $(1-|o_i-o_j|)$, so maximal dissimilarity
+always yields $V_{ij}=0$ regardless of power or $\alpha$.
+Larger $\beta$ (right columns) widens the gap between $\log(p_j/p_i)$ levels
+in both models; larger $\alpha$ (bottom rows) shifts Model A upward uniformly
+and steepens Model B's slope.
+
+---
+
+## 3. 1D Analysis — Effect of the Power Ratio
+
+We fix $(1-|o_i-o_j|)$ and study how utility varies with $\log(p_j/p_i)$.
+Each panel holds $\alpha$, $\beta$, and opinion similarity constant; only
+the log power ratio varies along the x-axis.
+
+```{r plot-1d-power, fig.width=14, fig.height=9, dpi=300}
+expand_grid(
+  log_power_ratio = seq(-3, 3, length.out = 200),
+  opinion_sim     = c(0, 0.25, 0.5, 0.75, 1),
+  model           = c("A", "B"),
+  alpha           = c(1, 2),
+  beta            = c(1, 2)
+) |>
+  mutate(
+    V = case_when(
+      model == "A" ~ alpha * opinion_sim + beta * log_power_ratio,
+      model == "B" ~ opinion_sim * (alpha + beta * log_power_ratio)
+    ),
+    sim_label = paste0("1-abs(o[i]-o[j]) == ", opinion_sim),
+    model     = paste("Model", model),
+    param     = paste0("α = ", alpha, ", β = ", beta)
+  ) |>
+  ggplot(aes(log_power_ratio, V, colour = sim_label)) +
+  geom_line(linewidth = 0.9) +
+  geom_hline(yintercept = 0, linetype = "dotted", colour = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey70") +
+  facet_grid(model ~ param) +
+  scale_colour_brewer(
+    palette = "RdYlGn",
+    direction = -1,
+    name   = "Opinion similarity",
+    labels = scales::label_parse()
+  ) +
+  labs(
+    x        = expression(log(p[j] / p[i])),
+    y        = expression(V[ij]),
+    title    = "Utility vs log power ratio across parameter settings",
+    subtitle = "Rows: Model A vs B | Columns: (α, β) combinations"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+**Model A** produces perfectly parallel lines with slope $\beta$: the log
+power ratio has the same influence at every similarity level, and the lines
+are shifted vertically by $\alpha \cdot (1-|o_i-o_j|)$. Agents with zero
+similarity ($1-|o_i-o_j|=0$, green line) still respond to power.
+**Model B** shows a fan converging to zero: at full similarity the slope
+equals $\beta$ (matching Model A), but it contracts proportionally as
+similarity falls, reaching a completely flat zero line for dissimilar agents.
+The vertical dashed line marks equal power ($\log(p_j/p_i)=0$); the dotted
+horizontal marks $V_{ij}=0$.
+
+---
+
+## 4. 2D Utility Surface
+
+Both inputs vary simultaneously. Red indicates high utility (agent $i$ strongly
+prefers to delegate to $j$), blue indicates low or negative utility, white marks
+$V_{ij}=0$. Each panel is one $(\alpha,\beta)$ combination.
+
+```{r plot-2d-heatmap, fig.width=9, fig.height=4, echo=FALSE}
+expand_grid(
+  opinion_sim     = seq(0, 1, length.out = 150),
+  log_power_ratio = seq(-3, 3, length.out = 150),
+  model           = c("A", "B"),
+  alpha           = c(1, 2),
+  beta            = c(1, 2)
+) |>
+  mutate(
+    V = if_else(
+      model == "A",
+      alpha * opinion_sim + beta * log_power_ratio,
+      opinion_sim * (alpha + beta * log_power_ratio)
+    ),
+    model = paste("Model", model),
+    param = paste0("α = ", alpha, ", β = ", beta)
+  ) |>
+  ggplot(aes(opinion_sim, log_power_ratio, fill = V)) +
+  geom_tile() +
+  facet_grid(model ~ param) +
+  scale_fill_gradient2(
+    low = "steelblue",
+    mid = "white",
+    high = "firebrick",
+    midpoint = 0,
+    name = expression(V[ij])
+  ) +
+  labs(
+    x        = expression(1 - abs(o[i] - o[j])),
+    y        = expression(log(p[j] / p[i])),
+    title    = "Utility surfaces across parameter settings",
+    subtitle = "Rows: Model A vs B | Columns: (α, β) combinations"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+The left column ($1-|o_i-o_j|=0$) makes the key difference concrete:
+Model A shows a continuous gradient driven by $\log(p_j/p_i)$;
+Model B is uniformly white (zero), eliminating all dissimilar agents from
+the choice set irrespective of their power.
+
+---
+
+## 5. Limit Behaviour
+
+```{r limit-table, echo=FALSE}
+tibble::tribble(
+  ~Condition,
+  ~V_A,
+  ~V_B,
+  ~Implication,
+
+  "|o_i - o_j| = 1 (max. dissimilar)",
+  "beta * log(p_j / p_i)",
+  "0",
+  "B ignores dissimilar agents entirely",
+
+  "o_i = o_j (identical opinions)",
+  "alpha + beta * log(p_j / p_i)",
+  "alpha + beta * log(p_j / p_i)",
+  "Models are identical",
+
+  "beta = 0",
+  "alpha * (1 - |o_i - o_j|)",
+  "alpha * (1 - |o_i - o_j|)",
+  "Models are identical; pure homophily",
+
+  "alpha = 0",
+  "beta * log(p_j / p_i)",
+  "(1 - |o_i - o_j|) * beta * log(p_j / p_i)",
+  "B still couples power to similarity",
+
+  "p_j >> p_i, beta > 0, o_i ≈ o_j",
+  "→ +∞",
+  "→ +∞",
+  "Both: powerful similar agents dominate",
+
+  "p_j >> p_i, beta > 0, |o_i - o_j| = 1",
+  "→ +∞",
+  "0",
+  "A: cross-ideological pull; B: no effect"
+) |>
+  knitr::kable(
+    col.names = c("Condition", "V_A", "V_B", "Implication"),
+    caption   = "Limit behaviour of both utility functions."
+  )
+```
+
+Models diverge only when $\beta \neq 0$ **and** opinion heterogeneity is present.
+The two bold rows define the critical qualitative difference.
+
+---
+
+# Phase II — Full Decision Model and Simulation
+
+---
+
+## 6. Softmax Decision Rule and Self-Weight
+
+Having characterised the utility functions in isolation, we now embed them in
+a stochastic choice model. Agent $i$ selects from
+$\{\text{self}\} \cup N(i)$ by drawing proportional to unnormalised weights:
+
+$$w_{\text{self},i} = k_i\,e^\delta, \qquad
+  w_{ij} = \exp\!\left(V_{ij}\right)$$
+
+where $k_i$ is agent $i$'s degree and $\delta$ is the **self-preference
+parameter**. These weights are positive scores — not yet probabilities.
+The softmax converts them into a proper distribution over the choice set:
+
+$$P_i(k) = \frac{w_k}{w_{\text{self},i} + \displaystyle\sum_{j \in N(i)} w_{ij}}$$
+
+so all options compete on a common scale and probabilities sum to 1.
+In particular, $P_i(\text{self})$ and each $P_i(j)$ for $j \in N(i)$
+are given by substituting the respective weight in the numerator.
+
+At baseline ($\alpha = \beta = 0$, all $w_{ij}=1$):
+
+$$P_i(\text{self}) \;=\; \frac{k_i e^\delta}{k_i e^\delta + k_i}
+\;=\; \frac{e^\delta}{e^\delta + 1} \;=\; \sigma(\delta)$$
+
+The degree term cancels, so $\sigma(\delta)$ is the baseline self-vote
+probability regardless of network structure. This gives interpretable targets:
+
+| $\delta$ | Baseline self-vote | Baseline delegation |
+|---|---|---|
+| $-2.2$ | 10 % | **~90 %** |
+| $-1.4$ | 20 % | **~80 %** |
+| $-0.85$ | 30 % | **~70 %** |
+| $-0.4$ | 40 % | **~60 %** |
+
+With $\alpha > 0$ or $\beta > 0$, neighbours become more attractive and actual
+delegation rates rise above the baseline.
+
+---
+
+
+## 7. Simulation 
+
+```{r source-network, include=FALSE}
+source(here::here("scripts/Network.R"))
+```
+
+
+```{r wrapper-functions}
+# Returns an attractiveness_fn for Model A (additive)
+make_attract_A <- function(alpha, beta) {
+  function(op_i, op_j, pow_i, pow_j, resp) {
+    opinion_sim     <- 1 - abs(op_i - op_j)
+    log_power_ratio <- log(pow_j / pow_i)
+    exp(alpha * opinion_sim + beta * log_power_ratio)
+  }
+}
+
+# Returns an attractiveness_fn for Model B (interaction)
+make_attract_B <- function(alpha, beta) {
+  function(op_i, op_j, pow_i, pow_j, resp) {
+    opinion_sim     <- 1 - abs(op_i - op_j)
+    log_power_ratio <- log(pow_j / pow_i)
+    exp(opinion_sim * (alpha + beta * log_power_ratio))
+  }
+}
+
+# Returns a selfweight_fn with degree-normalised self-preference delta
+make_selfweight_delta <- function(delta) {
+  function(i, nb, op, pow, resp) {
+    length(nb) * exp(delta)   # = k_i * exp(delta)
+  }
+}
+```
+
+---
+
+## 8. Running Both Models
+
+```{r sim-grid, cache=TRUE}
+# Parameter grid
+# delta values calibrated to baseline delegation ~90 / 80 / 70 / 60 %
+delta_map <- c("~90%" = -2.2, "~80%" = -1.4, "~70%" = -0.85, "~60%" = -0.4)
+
+param_grid <- expand_grid(
+  alpha    = c(0, 1, 2),
+  beta     = c(0, 1, 2),
+  baseline = names(delta_map)
+) |>
+  mutate(delta = delta_map[baseline])
+
+# Run one simulation, return the final-round snapshot metrics
+run_one <- function(alpha, beta, delta, model_label, seed = 42) {
+  attr_fn <- if (model_label == "A") make_attract_A(alpha, beta)
+             else                    make_attract_B(alpha, beta)
+
+  res <- simulate_liquid_democracy(
+    seed                    = seed,
+    n_per_community         = 100,
+    n_communities           = 1,
+    node_degree             = 6,
+    T                       = 100,
+    attractiveness_fn       = attr_fn,
+    selfweight_fn           = make_selfweight_delta(delta),
+    responsiveness          = 1   # unused by our fns; kept for compatibility
+  )
+
+  snap <- res$snapshots |> slice_tail(n = 1)
+  tibble(
+    model           = model_label,
+    delegation_rate = snap$delegation_rate,
+    lost_vote_rate  = snap$lost_vote_rate
+  )
+}
+
+# Run both models on every parameter combination (same seed = same network)
+results <- param_grid |>
+  rowwise() |>
+  mutate(
+    res_A = list(run_one(alpha, beta, delta, "A")),
+    res_B = list(run_one(alpha, beta, delta, "B"))
+  ) |>
+  ungroup() |>
+  pivot_longer(c(res_A, res_B), names_to = "tmp", values_to = "res") |>
+  unnest(res) |>
+  select(-tmp)
+```
+
+---
+
+## 9. Results
+
+### Comparison table
+
+Each row is one $(\alpha, \beta, \delta)$ combination run on the same
+network (seed = 42). **Del.** is the share of agents who delegated in
+the final round; **Lost** is the share of votes that ended in a cycle
+or reached a node with no outgoing delegation and were therefore lost.
+
+```{r results-table}
+results |>
+  pivot_wider(
+    names_from  = model,
+    values_from = c(delegation_rate, lost_vote_rate)
+  ) |>
+  mutate(across(where(is.numeric) & !matches("delta"),
+                \(x) round(x, 2))) |>
+  select(alpha, beta, baseline, starts_with("delegation"), starts_with("lost")) |>
+  arrange(baseline, alpha, beta) |>
+  knitr::kable(
+    col.names = c(
+      "alpha", "beta", "Baseline del.",
+      "Del. A", "Del. B", "Lost A", "Lost B"
+    ),
+    caption = "Final-round metrics for Model A and Model B (n = 100, T = 100 rounds)."
+  )
+```
+
+---
+
+## 10. Key Findings
+
+**From the utility analysis (Phase I):**
+
+- In **Model A**, opinion similarity and power contribute independently.
+  A powerful but dissimilar agent retains a nonzero utility driven entirely
+  by $\beta\log(p_j/p_i)$.
+- In **Model B**, $(1-|o_i-o_j|)$ gates the power term. A dissimilar agent
+  is assigned $V_{ij}=0$ regardless of power. This is not a technical
+  variant but a distinct behavioural assumption: *trust must exist before
+  power becomes relevant*.
+- The two models coincide when $\beta = 0$ (power ignored) or when all
+  agent pairs are opinion-identical.
+
+**From the simulation (Phase II):**
+
+- $\delta$ controls the baseline delegation volume; $\alpha$ and $\beta$
+  shift rates upward by making neighbours more attractive.
+- **Model B produces lower delegation rates and fewer lost votes** whenever
+  $\beta > 0$. By excluding dissimilar agents, it keeps delegation chains
+  shorter and within ideologically coherent sub-groups, reducing cycle risk.
+- **Model A allows cross-ideological power-driven delegation**, which can
+  form long chains spanning opinion clusters — the primary source of its
+  elevated lost-vote rate at high $\beta$.
+  
+## 11. Model C — Soft Gate
+    
+$$
+V_{ij}^{(C)} \;=\; \alpha\,(1 - |o_i - o_j|) \;+\; \beta\,(1 - |o_i - o_j|)^\gamma\,\log\!\left(\frac{p_j}{p_i}\right), \qquad \gamma > 0
+$$
+
+Model C nests A ($\gamma = 0$) and B ($\gamma = 1$) as special cases.
+The exponent $\gamma$ continuously controls how aggressively ideological
+distance suppresses power-driven delegation — interpolating between the
+fully independent structure of A and the hard-exclusion logic of B.
