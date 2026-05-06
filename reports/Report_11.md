@@ -14,7 +14,7 @@ $A_{ij} = \sigma(-r_{op}\,s_{ij})\cdot\sigma(r_{pw}\log\tfrac{p_j}{p_i})$.
 
 ### Self-Weight
 
-$$j^* = \arg\max_{j \in N(i)} A_{ij}, \qquad w_{\text{self}}(i) = \sigma\!\left(r_{op} \cdot \bigl(1 - 2\,|o_i - o_{j^*}|\bigr)\right) \cdot \sigma\!\left(r_{pw} \cdot \log\frac{p_{j^*}}{p_i}\right)$$
+$${j^*} = \arg\max_{j \in N(i)} A_{ij}, \qquad w_{\text{self}}(i) = \sigma\!\left(r_{op} \cdot \bigl(1 - 2\,|o_i - o_{j^*}|\bigr)\right) \cdot \sigma\!\left(r_{pw} \cdot \log\frac{p_{j^*}}{p_i}\right)$$
 
 Equivalently,
 $w_{\text{self}}(i) = \sigma(r_{op}\,s_{ij^*})\cdot\sigma(r_{pw}\log\tfrac{p_{j^*}}{p_i})$.
