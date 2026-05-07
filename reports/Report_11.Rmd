@@ -24,91 +24,112 @@ equivalent to $A_{ij} = \sigma(-r_{op}\,s_{ij})\cdot\sigma(r_{pw}\log\tfrac{p_j}
 
 ### Self-Weight
 
-$${j^*} = \arg\max_{j \in N(i)} A_{ij}, \qquad w_{\text{self}}(i) = \sigma\!\left(r_{op} \cdot \bigl(1 - 2\,|o_i - o_{j^*}|\bigr)\right) \cdot \sigma\!\left(r_{pw} \cdot \log\frac{p_{j^*}}{p_i}\right)$$
+Let $j^\ast = \arg\max_{j \in N(i)} A_{ij}$ denote the most attractive neighbour of agent $i$.
+The self-weight is then defined as
 
-Equivalently, $w_{\text{self}}(i) = \sigma(r_{op}\,s_{ij^*})\cdot\sigma(r_{pw}\log\tfrac{p_{j^*}}{p_i})$.
-agent's own position.
+$$w_{\text{self}}(i)
+= \sigma\!\left(-r_{op}\,s_{ij^\ast}\right)
+\cdot \sigma\!\left(-r_{pw}\log\frac{p_i}{p_{j^\ast}}\right)$$
+
+Equivalently,
+
+$$w_{\text{self}}(i)
+= \sigma\!\left(r_{op}\bigl(2\,|o_i - o_{j^\ast}| - 1\bigr)\right)
+\cdot \sigma\!\left(r_{pw}\log\frac{p_{j^\ast}}{p_i}\right)$$
+
+Thus, the self-weight is the mirrored counterpart of the neighbour-weight:
+conditions that increase delegation attractiveness reduce self-weight, and vice versa.
 
 ---
 
 ## 2. Weight Surfaces (1-D Slices)
 
-```{r plot-1d-power, fig.width=14, fig.height=9, dpi=300}
-expand_grid(
+```{r plot-1d-power, fig.width=9, fig.height=8, dpi=300}
+dat_1d <- expand_grid(
   similarity      = seq(-1, 1, length.out = 200),
   log_power_ratio = c(-2, 0, 2),
   weight_type     = c("Neighbour-Weight", "Self-Weight"),
-  r_op            = c(1, 2),
-  r_pw            = c(1, 2)
+  r_op            = c(0, 1, 2),
+  r_pw            = c(0, 1, 2)
 ) |>
   mutate(
-    A_ij   = sigmoid( r_op * similarity) * sigmoid(r_pw * log_power_ratio),
-    w_self = sigmoid( r_op * similarity) * sigmoid(r_pw * log_power_ratio),
-    value  = if_else(weight_type == "Neighbour-Weight", A_ij, w_self),
-    lpr_label = paste0("log(p[j]/p[i])==", log_power_ratio),
-    param     = paste0("r[op]==", r_op, "~~r[pw]==", r_pw)
-  ) |>
-  ggplot(aes(similarity, value, colour = lpr_label)) +
-  geom_line(linewidth = 0.9) +
-  geom_hline(yintercept = 0.5, linetype = "dotted", colour = "grey60") +
-  facet_grid(weight_type ~ param,
-             labeller = labeller(weight_type = label_value, param = label_parsed)) +
-  scale_colour_brewer(
-    palette = "Dark2",
-    name    = expression(log(p[j] / p[i])),
-    labels  = scales::label_parse()
-  ) +
-  labs(
-    x     = expression(s[ij] == 1 - 2 * abs(o[i] - o[j])),
-    y     = "Weight",
-    title = "Weight vs. opinion similarity",
-    subtitle = expression("Neighbour-Weight: " * A[ij] * "   |   Self-Weight: " * w[self](i))
-  ) +
-  theme_minimal(base_size = 12) +
-  theme(legend.position = "bottom")
+    A_ij       = sigmoid( r_op * similarity) * sigmoid( r_pw * log_power_ratio),
+    w_self     = sigmoid(-r_op * similarity) * sigmoid( r_pw * log_power_ratio),
+    value      = if_else(weight_type == "Neighbour-Weight", A_ij, w_self),
+    lpr_label  = paste0("log(p[j]/p[i])==", log_power_ratio),
+    r_op_label = paste0("r[op]==", r_op),
+    r_pw_label = paste0("r[pw]==", r_pw)
+  )
+
+p_1d <- function(wt, subtitle) {
+  dat_1d |>
+    filter(weight_type == wt) |>
+    ggplot(aes(similarity, value, colour = lpr_label)) +
+    geom_line(linewidth = 0.9) +
+    geom_hline(yintercept = 0.5, linetype = "dotted", colour = "grey60") +
+    facet_grid(r_op_label ~ r_pw_label, labeller = label_parsed) +
+    scale_colour_brewer(
+      palette = "Dark2",
+      name    = expression(log(p[j] / p[i])),
+      labels  = scales::label_parse()
+    ) +
+    labs(
+      x        = expression(s[ij] == 1 - 2 * abs(o[i] - o[j])),
+      y        = "Weight",
+      title    = wt,
+      subtitle = subtitle
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "bottom")
+}
+
+print(p_1d("Neighbour-Weight", expression(A[ij])))
+print(p_1d("Self-Weight",      expression(w[self](i))))
 ```
 
 ## 3. Weight Surfaces (2-D Heatmaps)
 
-```{r plot-2d-heatmap, fig.width=9, fig.height=4}
-expand_grid(
+```{r plot-2d-heatmap, fig.width=9, fig.height=8}
+dat_2d <- expand_grid(
   similarity      = seq(-1, 1,  length.out = 150),
   log_power_ratio = seq(-3, 3, length.out = 150),
   weight_type     = c("Neighbour-Weight", "Self-Weight"),
-  r_op            = c(1, 2),
-  r_pw            = c(1, 2)
+  r_op            = c(0, 1, 2),
+  r_pw            = c(0, 1, 2)
 ) |>
   mutate(
-    A_ij   = sigmoid( r_op * similarity) * sigmoid(r_pw * log_power_ratio),
-    w_self = sigmoid( r_op * similarity) * sigmoid(r_pw * log_power_ratio),
-    V      = if_else(weight_type == "Neighbour-Weight", A_ij, w_self),
-    param  = paste0("r[op]==", r_op, "~~r[pw]==", r_pw)
-  ) |>
-  ggplot(aes(similarity, log_power_ratio, fill = V)) +
-  geom_tile() +
-  facet_grid(weight_type ~ param,
-             labeller = labeller(weight_type = label_value, param = label_parsed)) +
-  scale_fill_gradient(
-  low  = "steelblue",
-  high = "firebrick",
-  name = "Weight"
-  ) +
-  labs(
-    x     = expression(s[ij] == 1 - 2 * abs(o[i] - o[j])),
-    y     = expression(log(p[j] / p[i])),
-    title = "Weight surfaces",
-    subtitle = expression(
-      "Neighbour-Weight: " * A[ij] * "   |   Self-Weight: " * w[self](i)
-    )
-  ) +
-  theme_minimal(base_size = 12)
+    A_ij       = sigmoid( r_op * similarity) * sigmoid( r_pw * log_power_ratio),
+    w_self     = sigmoid(-r_op * similarity) * sigmoid( r_pw * log_power_ratio),
+    V          = if_else(weight_type == "Neighbour-Weight", A_ij, w_self),
+    r_op_label = paste0("r[op]==", r_op),
+    r_pw_label = paste0("r[pw]==", r_pw)
+  )
+
+p_2d <- function(wt, subtitle) {
+  dat_2d |>
+    filter(weight_type == wt) |>
+    ggplot(aes(similarity, log_power_ratio, fill = V)) +
+    geom_tile() +
+    facet_grid(r_op_label ~ r_pw_label, labeller = label_parsed) +
+    scale_fill_gradient(low = "steelblue", high = "firebrick", name = "Weight") +
+    labs(
+      x        = expression(s[ij] == 1 - 2 * abs(o[i] - o[j])),
+      y        = expression(log(p[j] / p[i])),
+      title    = wt,
+      subtitle = subtitle
+    ) +
+    theme_minimal(base_size = 12)
+}
+
+print(p_2d("Neighbour-Weight", expression(A[ij])))
+print(p_2d("Self-Weight",      expression(w[self](i))))
 ```
 
 ## 4. Simulation — Delegation Rate & Lost Vote Rate
 
 The simulation runs `simulate_liquid_democracy` from `Network.R` using the
 Neighbour-Weight and Self-Weight formulas across a $3\times3$ grid of
-$r_{op},r_{pw} \in \{0.5,\,1,\,2\}$ ($n=250$ agents, $T=100$ rounds,
+$r_{op},r_{pw} \in \{0,\,1,\,2\}$ ($n=250$ agents, $T=100$ rounds,
 averaged over 100 independent runs).
 
 ```{r sim-setup, include=FALSE}
@@ -127,17 +148,17 @@ selfweight <- function(i, nb, op, pow, r_op, r_pw) {
   a_nb <- attractiveness(op[i], op[nb], pow[i], pow[nb], r_op, r_pw)
   j_star <- nb[which.max(a_nb)]
   
-  sigmoid(r_op * (1 - 2 * abs(op[i] - op[j_star]))) *
+  sigmoid(r_op * (2 * abs(op[i] - op[j_star]) - 1)) *
   sigmoid(r_pw * log(pow[j_star] / pow[i]))
 }
 ```
 
-```{r simulation, fig.width=10, fig.height=6, cache=TRUE}
+```{r simulation, fig.width=9, fig.height=9, cache=TRUE}
 plan(multisession, workers = parallel::detectCores() - 1)
 
 full_grid <- expand_grid(
-  r_op = c(0.5, 1, 2),
-  r_pw = c(0.5, 1, 2),
+  r_op = c(0, 1, 2),
+  r_pw = c(0, 1, 2),
   run  = seq_len(100)
 )
 
@@ -161,7 +182,7 @@ sim_raw <- future_pmap_dfr(full_grid, function(r_op, r_pw, run) {
       a_nb   <- sigmoid(r_op * (1 - 2 * abs(op[i] - op[nb]))) *
                 sigmoid(r_pw * log(pow[nb] / pow[i]))
       j_star <- nb[which.max(a_nb)]
-      sigmoid(r_op * (1 - 2 * abs(op[i] - op[j_star]))) *
+      sigmoid(r_op * (2 * abs(op[i] - op[j_star]) - 1)) *
       sigmoid(r_pw * log(pow[j_star] / pow[i]))
     }
   )
@@ -190,15 +211,13 @@ sim_results <- sim_raw |>
 k <- 6  # node_degree used in simulate_liquid_democracy
 
 # Theoretical bounds, scoped to the correct facet rows
-r_op_labels <- paste0("r[op]==", c(0.5, 1, 2))
+r_op_labels <- paste0("r[op]==", c(0, 1, 2))
 
 bounds <- bind_rows(
-  # Delegation rate: lower = 1/2, upper = k/(k+1)
-  tibble(metric = "Delegation rate", r_op_label = r_op_labels,
-         yint = 1/2,       lty = "lower"),
+  # Delegation rate: null-model upper bound k/(k+1)
   tibble(metric = "Delegation rate", r_op_label = r_op_labels,
          yint = k / (k+1), lty = "upper"),
-  # Lost vote rate: upper = k/(k+1) only
+  # Lost vote rate: null-model upper bound k/(k+1)
   tibble(metric = "Lost vote rate",  r_op_label = r_op_labels,
          yint = k / (k+1), lty = "upper")
 )
@@ -215,14 +234,11 @@ sim_results |>
     r_op_label = paste0("r[op]==", r_op)
   ) |>
   ggplot(aes(round, value, colour = r_pw_label)) +
-  geom_hline(data = filter(bounds, lty == "lower"),
-             aes(yintercept = yint),
-             linetype = "dotted", colour = "grey40", linewidth = 0.5) +
-  geom_hline(data = filter(bounds, lty == "upper"),
+  geom_hline(data = bounds,
              aes(yintercept = yint),
              linetype = "dashed", colour = "grey40", linewidth = 0.5) +
   geom_line(linewidth = 0.8, alpha = 0.9) +
-  facet_grid(metric ~ r_op_label,
+  facet_grid(r_op_label ~ metric,
              scales   = "free_y",
              labeller = labeller(metric = label_value, r_op_label = label_parsed)) +
   scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
@@ -235,7 +251,7 @@ sim_results |>
     x       = "Round",
     y       = NULL,
     title   = "Delegation rate and lost vote rate over 100 rounds",
-    caption = "Dashed: upper bound k/(k+1) ≈ 85.7 %;  dotted: lower bound 1/2 (delegation rate only)"
+    caption = "Dashed: null-model upper bound k/(k+1) ≈ 85.7 %"
   ) +
   theme_minimal(base_size = 12) +
   theme(legend.position = "bottom",
