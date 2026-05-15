@@ -32,8 +32,8 @@ perceive_power <- function(true_val, sigma) {
 # Ideological proximity x competence sigmoid
 # =============================================================
 
-compute_attractiveness <- function(op_i, op_j, pow_i, pow_j, resp) {
-  (1 - abs(op_i - op_j)) / (1 + exp(-resp * (pow_j - pow_i)))
+compute_attractiveness <- function(op_i, op_j, pow_i, pow_j, r_op, r_pw) {
+  .sig(r_op * (1 - 2 * abs(op_i - op_j))) * .sig(r_pw * log(pow_j / pow_i))
 }
 
 # =============================================================
@@ -377,11 +377,12 @@ simulate_liquid_democracy <- function(
     n_experts_per_community = 0,
     expert_connectedness    = 0,
     p_rewire                = 0.05,
-    responsiveness          = 1,
+    r_op                    = 1,
+    r_pw                    = 1,
     inertia                 = 0,
     T                       = 200,
-    selfweight_fn           = selfweight_argmax_log,
-    attractiveness_fn       = attractiveness_log,
+    selfweight_fn           = selfweight_dual_sigmoid,
+    attractiveness_fn       = attractiveness_dual_sigmoid,
     sigma_opinion           = 0,       # SD of logit-space noise on perceived opinion
     sigma_pow               = 0,       # SD of log-space noise on perceived power
     target_homophily        = NULL,    # target assortativity; NULL disables shuffle
@@ -454,7 +455,7 @@ simulate_liquid_democracy <- function(
       op_perc  <- replace(op,  nb, op_nb)
       pow_perc <- replace(pow, nb, pow_nb)
 
-      w_self <- selfweight_fn(i, nb, op_perc, pow_perc, responsiveness)
+      w_self <- selfweight_fn(i, nb, op_perc, pow_perc, r_op, r_pw)
 
       # Inertia: retain current delegate with probability `inertia`
       if (inertia > 0 && agents$delegated[i]) {
@@ -464,7 +465,7 @@ simulate_liquid_democracy <- function(
       }
 
       w_nb <- if (length(nb))
-        attractiveness_fn(op[i], op_nb, pow[i], pow_nb, responsiveness)
+        attractiveness_fn(op[i], op_nb, pow[i], pow_nb, r_op, r_pw)
       else numeric(0)
 
       w <- pmax(c(w_self, w_nb), 0)

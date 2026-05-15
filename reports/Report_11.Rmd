@@ -17,13 +17,13 @@ sigmoid <- function(x) 1 / (1 + exp(-x))
 
 ### Neighbour-Weight (Attractiveness)
 
-$$A_{ij} = \sigma\!\left(r_{op} \cdot (1 - 2\,|o_i - o_j|)\right) \cdot \sigma\!\left(r_{pw} \cdot \log\frac{p_j}{p_i}\right)$$
+$$A_{ij} = \sigma\left(r_{op} \cdot (1 - 2|o_i - o_j|)\right) \cdot \sigma\left(r_{pw} \cdot \log\frac{p_j}{p_i}\right)$$
 
 ### Self-Weight
 
 Let $j^\ast = \arg\max_{j \in N(i)} A_{ij}$ denote the most attractive neighbour of agent $i$.
 
-$$w_{\text{self}}(i) = \sigma\!\left(r_{op} \cdot \bigl(2\,|o_i - o_{j^\ast}| - 1\bigr)\right) \cdot \sigma\!\left(r_{pw} \cdot \log\frac{p_i}{p_{j^\ast}}\right)$$
+$$w_{\text{self}}(i) = \sigma\left(r_{op} \cdot \bigl(2|o_i - o_{j^\ast}| - 1\bigr)\right) \cdot \sigma\left(r_{pw} \cdot \log\frac{p_i}{p_{j^\ast}}\right)$$
 
 ---
 

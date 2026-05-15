@@ -1,0 +1,758 @@
+---
+title: "Weekly Report — Week 12 (08.05.2026 – 14.05.2026)"
+output: github_document
+date: "2026-05-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(here)
+library(furrr)
+library(patchwork)
+
+sigmoid <- function(x) 1 / (1 + exp(-x))
+```
+
+## 1. Design
+
+Full **6 × 6 parameter grid** ($r_{op}, r_{pw} \in \{0,\ldots,5\}$) ×
+**4 agent counts** ($n \in \{100, 250, 1000, 2500\}$), 100 seeds each.
+All metrics are averaged over rounds 15–20.
+
+$$A_{ij} = \sigma\!\left(r_{op}(1-2|o_i-o_j|)\right)\cdot\sigma\!\left(r_{pw}\log\tfrac{p_j}{p_i}\right)$$
+
+$$w_{\text{self}}(i) = \sigma\!\left(r_{op}(2|o_i-o_{j^\ast}|-1)\right)\cdot\sigma\!\left(r_{pw}\log\tfrac{p_i}{p_{j^\ast}}\right)$$
+
+---
+
+```{r grid-setup, include=FALSE}
+source(here::here("scripts/Network.R"))
+
+metric_info <- tribble(
+  ~col,             ~label,                      ~pct,
+  "delegation_rate","Delegation Rate",            TRUE,
+  "lost_vote_rate", "Lost Vote Rate",             TRUE,
+  "avg_chain_len",  "Avg. Chain Length",          FALSE,
+  "avg_ideo_drift", "Avg. Ideological Drift",     FALSE,
+  "gini_coef",      "Gini Coefficient (Power)",   FALSE
+)
+```
+
+```{r grid-run, cache=TRUE}
+plan(multisession, workers = parallel::detectCores() - 1)
+
+full_grid <- expand_grid(
+  n_agents = c(100L, 250L, 1000, 2500L),
+  r_op     = 0:5,
+  r_pw     = 0:5,
+  seed     = seq_len(100)
+)
+
+.t0_grid <- Sys.time()
+
+sim_grid_raw <- future_pmap_dfr(
+  full_grid,
+  function(n_agents, r_op, r_pw, seed) {
+
+    res <- simulate_liquid_democracy(
+      seed            = seed,
+      n_per_community = n_agents,
+      n_communities   = 1,
+      node_degree     = 6,
+      T               = 20,
+      r_op            = r_op,
+      r_pw            = r_pw
+    )
+
+    snaps <- tail(res$snapshots, 2)
+    ag    <- res$agents
+
+    tibble(
+      n_agents        = n_agents,
+      r_op            = r_op,
+      r_pw            = r_pw,
+      seed            = seed,
+      delegation_rate = mean(res$history_delegation[15:20],  na.rm = TRUE),
+      lost_vote_rate  = mean(res$history_lost[15:20],        na.rm = TRUE),
+      avg_ideo_drift  = mean(res$history_drift[15:20],       na.rm = TRUE),
+      gini_coef       = mean(snaps$gini_power,               na.rm = TRUE),
+      avg_chain_len   = mean(snaps$avg_chain_length_delegators, na.rm = TRUE),
+      pct_high_drift  = mean(abs(ag$opinion - ag$my_vote) > 0.3, na.rm = TRUE)
+    )
+  },
+  .options = furrr_options(seed = NULL)
+)
+
+plan(sequential)
+.t1_grid  <- Sys.time()
+.el_grid  <- as.numeric(difftime(.t1_grid, .t0_grid, units = "mins"))
+.n_grid   <- nrow(full_grid)
+cat(sprintf(
+  "\n── grid-run ──────────────────────────────────────────\n  Combinations : %d n_agents × 6 r_op × 6 r_pw = %d\n  Seeds        : 100\n  Total runs   : %s\n  Workers      : %d\n  Elapsed      : %.1f min  (%.2f s / run)\n──────────────────────────────────────────────────────\n",
+  4L, 4L * 36L,
+  formatC(.n_grid, format = "d", big.mark = ","),
+  parallel::detectCores() - 1L,
+  .el_grid, .el_grid * 60 / .n_grid
+))
+
+grid_summary <- sim_grid_raw |>
+  group_by(n_agents, r_op, r_pw) |>
+  summarise(
+    across(
+      delegation_rate:pct_high_drift,
+      list(mean = \(x) mean(x, na.rm = TRUE),
+           sd   = \(x) sd(x,   na.rm = TRUE)),
+      .names = "{.col}__{.fn}"
+    ),
+    .groups = "drop"
+  ) |>
+  mutate(
+    delegation_rate__cv = if_else(delegation_rate__mean > 1e-9, delegation_rate__sd / delegation_rate__mean, NA_real_),
+    lost_vote_rate__cv  = if_else(lost_vote_rate__mean  > 1e-9, lost_vote_rate__sd  / lost_vote_rate__mean,  NA_real_),
+    avg_ideo_drift__cv  = if_else(avg_ideo_drift__mean  > 1e-9, avg_ideo_drift__sd  / avg_ideo_drift__mean,  NA_real_),
+    gini_coef__cv       = if_else(gini_coef__mean       > 1e-9, gini_coef__sd       / gini_coef__mean,       NA_real_),
+    avg_chain_len__cv   = if_else(avg_chain_len__mean   > 1e-9, avg_chain_len__sd   / avg_chain_len__mean,   NA_real_)
+  )
+
+# Baseline for main analysis
+g250 <- grid_summary |> filter(n_agents == 250)
+```
+
+---
+
+## 2. Parameter Profiles ($n = 250$)
+
+Solid lines: cross-seed mean. Ribbons: mean ± 1 SD.
+
+```{r line-plots, fig.width=9, fig.height=5}
+for (i in seq_len(nrow(metric_info))) {
+  col      <- metric_info$col[i]
+  label    <- metric_info$label[i]
+  pct      <- metric_info$pct[i]
+  mean_col <- paste0(col, "__mean")
+  sd_col   <- paste0(col, "__sd")
+
+  p <- g250 |>
+    mutate(r_op_f = factor(paste0("r[op]==", r_op))) |>
+    ggplot(aes(
+      x = r_pw, y = .data[[mean_col]],
+      ymin = .data[[mean_col]] - .data[[sd_col]],
+      ymax = .data[[mean_col]] + .data[[sd_col]],
+      colour = r_op_f, fill = r_op_f, group = r_op_f
+    )) +
+    geom_ribbon(alpha = 0.12, colour = NA) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 1.8) +
+    scale_x_continuous(breaks = 0:5) +
+    scale_colour_brewer(palette = "Dark2", name = expression(r[op]),
+                        labels = scales::label_parse()) +
+    scale_fill_brewer(palette = "Dark2", guide = "none") +
+    labs(x = expression(r[pw]), y = label, title = label) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "right")
+
+  if (pct) p <- p + scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1)
+  )
+
+  print(p)
+}
+```
+
+---
+
+## 3. Mean & Variability Heatmaps ($n = 250$)
+
+Left: cross-seed mean. Right: coefficient of variation (CV = SD/mean).
+CV peaks at phase-boundary cells — high CV indicates that small differences
+in initialisation are sufficient to tip the system between regimes.
+
+```{r heatmaps, fig.width=13, fig.height=5.5}
+for (i in seq_len(nrow(metric_info))) {
+  col      <- metric_info$col[i]
+  label    <- metric_info$label[i]
+  pct      <- metric_info$pct[i]
+  mean_col <- paste0(col, "__mean")
+  cv_col   <- paste0(col, "__cv")
+
+  fmt_mean <- if (pct) function(x) sprintf("%.0f%%", x * 100) else
+                        function(x) sprintf("%.2f", x)
+
+  p_mean <- g250 |>
+    mutate(lbl = fmt_mean(.data[[mean_col]])) |>
+    ggplot(aes(factor(r_pw), factor(r_op), fill = .data[[mean_col]])) +
+    geom_tile(colour = "white", linewidth = 0.4) +
+    geom_text(aes(label = lbl), size = 2.8, colour = "white", fontface = "bold") +
+    scale_fill_viridis_c(
+      option = "C", name = "Mean",
+      labels = if (pct) scales::percent_format(accuracy = 1) else waiver()
+    ) +
+    labs(x = expression(r[pw]), y = expression(r[op]),
+         title = label, subtitle = "Mean") +
+    theme_minimal(base_size = 11) +
+    theme(panel.grid = element_blank())
+
+  p_cv <- g250 |>
+    mutate(lbl = sprintf("%.2f", pmin(.data[[cv_col]], 2, na.rm = TRUE))) |>
+    ggplot(aes(factor(r_pw), factor(r_op), fill = .data[[cv_col]])) +
+    geom_tile(colour = "white", linewidth = 0.4) +
+    geom_text(aes(label = lbl), size = 2.8, colour = "white", fontface = "bold") +
+    scale_fill_viridis_c(option = "A", name = "CV",
+                         direction = -1, limits = c(0, NA)) +
+    labs(x = expression(r[pw]), y = expression(r[op]),
+         subtitle = "Coefficient of Variation (SD / mean)") +
+    theme_minimal(base_size = 11) +
+    theme(panel.grid = element_blank())
+
+  print(p_mean + p_cv)
+}
+```
+
+---
+
+## 4. Varying N 
+
+
+```{r robustness-heatmaps, fig.width=14, fig.height=8}
+rob_metrics <- tribble(
+  ~col,             ~label,
+  "delegation_rate","Delegation Rate",
+  "lost_vote_rate", "Lost Vote Rate",
+  "avg_chain_len",  "Avg. Chain Len.",
+  "avg_ideo_drift", "Avg. Ideo. Drift",
+  "gini_coef",      "Gini Coefficient "
+)
+
+for (i in seq_len(nrow(rob_metrics))) {
+  col      <- rob_metrics$col[i]
+  label    <- rob_metrics$label[i]
+  mean_col <- paste0(col, "__mean")
+  pct      <- col == "delegation_rate"
+
+  fmt <- if (pct) function(x) sprintf("%.0f%%", x * 100) else
+                   function(x) sprintf("%.2f", x)
+
+p <- grid_summary |>
+  mutate(
+    lbl   = fmt(.data[[mean_col]]),
+
+    n_lab = factor(
+      paste0("n = ", n_agents),
+      levels = paste0("n = ", c(100, 250, 1000, 2500))
+    )
+  ) |>
+  ggplot(aes(factor(r_pw), factor(r_op), fill = .data[[mean_col]])) +
+    geom_tile(colour = "white", linewidth = 0.35) +
+    geom_text(aes(label = lbl), size = 2.3, colour = "white", fontface = "bold") +
+    facet_wrap(~ n_lab, ncol = 2) +
+    scale_fill_viridis_c(
+      option = "C", name = label,
+      labels = if (pct) scales::percent_format(accuracy = 1) else waiver()
+    ) +
+    labs(x = expression(r[pw]), y = expression(r[op]), title = label) +
+    theme_minimal(base_size = 11) +
+    theme(panel.grid = element_blank(), legend.position = "right")
+
+  print(p)
+}
+```
+
+---
+
+## 5. Extension: Outcome-Aware Delegation via Trust
+
+### Formulas
+
+**Trust update** (after each round, using the effective vote propagated through
+$j$'s chain):
+
+$$\tau_{ij}(t) = \lambda \cdot \tau_{ij}(t-1) \;-\; (1-\lambda)\cdot\bigl|o_i - v_j(t-1)\bigr|$$
+
+**Modified attractiveness:**
+
+$$\tilde{A}_{ij}(t) = A_{ij} \cdot 2\,\sigma\!\bigl(\gamma\cdot\tau_{ij}(t)\bigr)$$
+
+where $A_{ij} = \sigma(r_{op}(1-2|o_i-o_j|))\cdot\sigma(r_{pw}\log(p_j/p_i))$
+is the baseline attractiveness. The factor $2\sigma(\cdot)$ is
+chosen so that $\tau=0$ (no experience) gives a neutral modifier of
+$2\sigma(0)=1$, recovering the unmodified $A_{ij}$ exactly. The self-weight
+$w_\text{self}$ is unchanged.
+
+| Parameter | Interpretation | Values tested |
+|---|---|---|
+| $\lambda \in [0,1]$ | Memory length — how much past experience persists | 0.1, 0.5, 0.9 |
+| $\gamma \geq 0$ | Trust sensitivity — how strongly trust history overrides static $A_{ij}$ | 0, 1, 2, 3 |
+| $r_{op}$ | Opinion sensitivity (fixed) | 2 |
+| $r_{pw}$ | Power sensitivity (fixed) | 2 |
+
+---
+
+```{r sim-function, include=FALSE}
+# Custom simulation implementing the trust mechanism.
+# Cannot use the attractiveness_fn interface from simulate_liquid_democracy()
+# because trust requires agent *indices* (not just values) and per-round
+# feedback from effective votes — neither is accessible through that API.
+
+simulate_with_trust <- function(seed, n_agents, node_degree, T,
+                                r_op, r_pw, lambda, gamma) {
+
+  sig <- function(x) 1 / (1 + exp(-x))
+  gini_fn <- function(x) {
+    if (sum(x) == 0) return(0)
+    x <- sort(x); n <- length(x)
+    sum((2 * seq_len(n) - n - 1) * x) / (n * sum(x))
+  }
+
+  # ── Network setup ─────────────────────────────────────────────────────────
+  st      <- setup_agents(n_agents, 1L, 0L, seed)
+  agents  <- st$agents
+  n       <- st$n_all
+
+  gF      <- setup_friendship_network(agents, 1L, node_degree, 0.05, seed)
+  adj     <- lapply(seq_len(n), \(v) as.integer(neighbors(gF, v, mode = "out")))
+  lay_ids <- which(agents$type == "lay")
+  op      <- agents$opinion
+
+  # ── Trust initialisation ──────────────────────────────────────────────────
+  # tau[[i]] is a numeric vector of length(adj[[i]]):
+  # tau[[i]][k] = trust of agent i in its k-th neighbour adj[[i]][k]
+  # Initialised at 0 → neutral modifier 2*sigma(0) = 1
+  tau <- lapply(seq_len(n), \(i) rep(0.0, length(adj[[i]])))
+
+  # ── History storage ───────────────────────────────────────────────────────
+  hist_mat <- matrix(NA_real_, nrow = T, ncol = 7,
+    dimnames = list(NULL, c("delegation_rate", "lost_vote_rate",
+                            "avg_ideo_drift",  "gini_coef",
+                            "avg_chain_len",   "stability",
+                            "tau_mean")))
+  prev_targets <- integer(n)
+
+  # ── Main simulation loop ──────────────────────────────────────────────────
+  for (t in seq_len(T)) {
+
+    pow <- agents$power
+
+    # Delegation decision
+    targets <- vapply(lay_ids, function(i) {
+      nb <- adj[[i]]
+      if (!length(nb)) return(i)
+
+      op_nb  <- op[nb]
+      pow_nb <- pow[nb]
+
+      # Baseline attractiveness (Report-12 formulas)
+      a_nb <- sig(r_op * (1 - 2 * abs(op[i] - op_nb))) *
+              sig(r_pw * log(pow_nb / pow[i]))
+
+      # Self-weight: argmax formulation
+      j_star <- which.max(a_nb)
+      w_self <- sig(r_op * (2 * abs(op[i] - op_nb[j_star]) - 1)) *
+                sig(r_pw * log(pow[i] / pow_nb[j_star]))
+
+      # Trust-modified attractiveness: 2*sigma(gamma*tau) — neutral at tau=0
+      w_nb <- a_nb * (2 * sig(gamma * tau[[i]]))
+
+      w <- pmax(c(w_self, w_nb), 0)
+      if (sum(w) == 0) w[] <- 1
+      c(i, nb)[sample.int(length(w), 1L, prob = w)]
+    }, integer(1L))
+
+    # Delegation graph
+    mask      <- targets != lay_ids
+    edge_from <- lay_ids[mask]
+    edge_to   <- targets[mask]
+
+    if (length(edge_from)) {
+      gD <- graph_from_edgelist(cbind(edge_from, edge_to), directed = TRUE)
+      gD <- add_vertices(gD, max(0L, n - vcount(gD)))
+    } else {
+      gD <- make_empty_graph(n = n, directed = TRUE)
+    }
+
+    agents$power     <- compute_power(n, edge_from, edge_to)
+    agents$my_vote   <- propagate_votes(op, n, edge_from, edge_to)
+    agents$delegated <- seq_len(n) %in% edge_from
+
+    # ── Trust update ─────────────────────────────────────────────────────────
+    # v_j^eff = effective vote cast through j's delegation chain.
+    # Disagreement with own opinion → accumulates negative trust.
+    # Cycles (NA vote): treated as maximum disagreement (= 1).
+    for (i in lay_ids) {
+      nb <- adj[[i]]
+      if (!length(nb)) next
+      disagreement       <- abs(op[i] - agents$my_vote[nb])
+      disagreement[is.na(disagreement)] <- 1
+      tau[[i]] <- lambda * tau[[i]] - (1 - lambda) * disagreement
+    }
+
+    # ── Metrics ───────────────────────────────────────────────────────────────
+    represented <- agents[!is.na(agents$my_vote), ]
+
+    curr_targets <- integer(n)
+    el_curr      <- as_edgelist(gD, names = FALSE)
+    if (nrow(el_curr)) curr_targets[el_curr[, 1]] <- el_curr[, 2]
+
+    hist_mat[t, "delegation_rate"] <- mean(agents$delegated[lay_ids])
+    hist_mat[t, "lost_vote_rate"]  <- mean(is.na(agents$my_vote))
+    hist_mat[t, "avg_ideo_drift"]  <- if (nrow(represented) > 0)
+      mean(abs(represented$opinion - represented$my_vote)) else NA_real_
+    hist_mat[t, "gini_coef"]       <- gini_fn(agents$power)
+    hist_mat[t, "avg_chain_len"]   <- if (length(edge_from) > 0) {
+      roots_d <- which(degree(gD, mode = "out") == 0)
+      if (length(roots_d) > 0) {
+        dm  <- distances(gD, v = edge_from, to = roots_d, mode = "out")
+        cl  <- apply(dm, 1, \(d) { fd <- d[is.finite(d)]; if (length(fd)) min(fd) else NA_real_ })
+        good <- cl[!is.na(cl)]
+        if (length(good)) mean(good) else 0
+      } else 0
+    } else 0
+    hist_mat[t, "stability"]       <- if (t > 1)
+      mean(prev_targets[lay_ids] == curr_targets[lay_ids]) else NA_real_
+    hist_mat[t, "tau_mean"]        <- mean(unlist(tau[lay_ids]))
+
+    prev_targets <- curr_targets
+  }
+
+  as_tibble(hist_mat) |>
+    mutate(round = seq_len(T), .before = 1)
+}
+```
+
+```{r trust-setup, include=FALSE}
+# Fixed baseline at phase boundary from Report 12
+R_OP <- 2
+R_PW <- 2
+T_SIM  <- 20   # rounds per run
+SS_WIN <- 15:20 # steady-state window
+
+metric_info <- tribble(
+  ~col,             ~label,                ~pct,
+  "delegation_rate","Delegation Rate",      TRUE,
+  "lost_vote_rate", "Lost Vote Rate",       TRUE,
+  "avg_ideo_drift", "Avg. Ideological Drift", FALSE,
+  "gini_coef",      "Gini Coefficient",     FALSE,
+  "tau_mean",       "Mean Trust (τ̄)",        FALSE
+)
+```
+
+```{r trust-run, cache=TRUE}
+plan(multisession, workers = parallel::detectCores() - 1)
+
+full_grid <- expand_grid(
+  lambda = c(0.1, 0.5, 0.9),
+  gamma  = c(0, 1, 2, 3),
+  seed   = seq_len(100)
+)
+
+.t0_trust <- Sys.time()
+
+sim_raw <- future_pmap_dfr(
+  full_grid,
+  function(lambda, gamma, seed) {
+    simulate_with_trust(
+      seed       = seed,
+      n_agents   = 250,
+      node_degree = 6,
+      T          = T_SIM,
+      r_op       = R_OP,
+      r_pw       = R_PW,
+      lambda     = lambda,
+      gamma      = gamma
+    ) |>
+      mutate(lambda = lambda, gamma = gamma, seed = seed)
+  },
+  .options = furrr_options(seed = NULL)
+)
+
+plan(sequential)
+.t1_trust  <- Sys.time()
+.el_trust  <- as.numeric(difftime(.t1_trust, .t0_trust, units = "mins"))
+.n_trust   <- nrow(full_grid)
+cat(sprintf(
+  "\n── trust-run ─────────────────────────────────────────\n  Combinations : 3 lambda × 4 gamma = 12\n  Seeds        : 100\n  Total runs   : %s\n  Workers      : %d\n  Elapsed      : %.1f min  (%.2f s / run)\n──────────────────────────────────────────────────────\n",
+  formatC(.n_trust, format = "d", big.mark = ","),
+  parallel::detectCores() - 1L,
+  .el_trust, .el_trust * 60 / .n_trust
+))
+
+# Time-series summary: mean ± SD per (lambda, gamma, round) across seeds
+ts_summary <- sim_raw |>
+  group_by(lambda, gamma, round) |>
+  summarise(
+    across(
+      delegation_rate:tau_mean,
+      list(mean = \(x) mean(x, na.rm = TRUE),
+           sd   = \(x) sd(x,   na.rm = TRUE)),
+      .names = "{.col}__{.fn}"
+    ),
+    .groups = "drop"
+  )
+
+# Steady-state summary: mean ± SD per (lambda, gamma) over SS_WIN rounds
+ss_summary <- sim_raw |>
+  filter(round %in% SS_WIN) |>
+  group_by(lambda, gamma, seed) |>
+  summarise(
+    across(delegation_rate:tau_mean, \(x) mean(x, na.rm = TRUE)),
+    .groups = "drop"
+  ) |>
+  group_by(lambda, gamma) |>
+  summarise(
+    across(
+      delegation_rate:tau_mean,
+      list(mean = \(x) mean(x, na.rm = TRUE),
+           sd   = \(x) sd(x,   na.rm = TRUE)),
+      .names = "{.col}__{.fn}"
+    ),
+    .groups = "drop"
+  ) |>
+  mutate(
+    delegation_rate__cv = if_else(delegation_rate__mean > 1e-9,
+      delegation_rate__sd / delegation_rate__mean, NA_real_),
+    lost_vote_rate__cv  = if_else(lost_vote_rate__mean  > 1e-9,
+      lost_vote_rate__sd  / lost_vote_rate__mean,  NA_real_),
+    avg_ideo_drift__cv  = if_else(avg_ideo_drift__mean  > 1e-9,
+      avg_ideo_drift__sd  / avg_ideo_drift__mean,  NA_real_),
+    gini_coef__cv       = if_else(gini_coef__mean       > 1e-9,
+      gini_coef__sd       / gini_coef__mean,       NA_real_),
+    tau_mean__cv        = if_else(abs(tau_mean__mean)   > 1e-9,
+      tau_mean__sd  / abs(tau_mean__mean),          NA_real_)
+  )
+```
+
+---
+
+## 6. Trust Dynamics Over Time
+
+Each panel shows one metric over 20 rounds for $\gamma \in \{0,1,2,3\}$
+(colour) and $\lambda \in \{0.1, 0.5, 0.9\}$ (facet rows).
+Ribbons: mean ± 1 SD across 100 seeds.
+$\gamma = 0$ is the baseline (no trust modulation).
+
+```{r time-series, fig.width=11, fig.height=9}
+for (i in seq_len(nrow(metric_info))) {
+  col      <- metric_info$col[i]
+  label    <- metric_info$label[i]
+  pct      <- metric_info$pct[i]
+  mean_col <- paste0(col, "__mean")
+  sd_col   <- paste0(col, "__sd")
+
+  p <- ts_summary |>
+    mutate(
+      lambda_lab = paste0("λ == ", lambda),
+      gamma_f    = factor(gamma)
+    ) |>
+    ggplot(aes(
+      x    = round,
+      y    = .data[[mean_col]],
+      ymin = .data[[mean_col]] - .data[[sd_col]],
+      ymax = .data[[mean_col]] + .data[[sd_col]],
+      colour = gamma_f, fill = gamma_f
+    )) +
+    geom_ribbon(alpha = 0.12, colour = NA) +
+    geom_line(linewidth = 0.85) +
+    geom_vline(xintercept = min(SS_WIN), linetype = "dashed",
+               colour = "grey50", linewidth = 0.4) +
+    facet_wrap(~ lambda_lab, ncol = 1, labeller = label_parsed) +
+    scale_colour_brewer(palette = "Dark2", name = expression(gamma)) +
+    scale_fill_brewer(  palette = "Dark2", guide = "none") +
+    labs(
+      x        = "Round",
+      y        = label,
+      title    = label,
+      subtitle = expression(r[op] == 2 ~~ r[pw] == 2 ~~ "(dashed line = steady-state window)")
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(legend.position = "right")
+
+  if (pct) p <- p + scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1)
+  )
+
+  print(p)
+}
+```
+
+---
+
+## 7. Steady-State Trust Parameter Profiles
+
+Mean over rounds 15–20 (steady-state window), averaged across 100 seeds.
+x-axis: $\gamma$ (trust sensitivity); colour: $\lambda$ (memory length).
+Ribbons: mean ± 1 SD.
+
+```{r ss-line-plots, fig.width=8, fig.height=4.5}
+for (i in seq_len(nrow(metric_info))) {
+  col      <- metric_info$col[i]
+  label    <- metric_info$label[i]
+  pct      <- metric_info$pct[i]
+  mean_col <- paste0(col, "__mean")
+  sd_col   <- paste0(col, "__sd")
+
+  p <- ss_summary |>
+    mutate(lambda_f = factor(paste0("λ == ", lambda))) |>
+    ggplot(aes(
+      x    = gamma,
+      y    = .data[[mean_col]],
+      ymin = .data[[mean_col]] - .data[[sd_col]],
+      ymax = .data[[mean_col]] + .data[[sd_col]],
+      colour = lambda_f, fill = lambda_f, group = lambda_f
+    )) +
+    geom_ribbon(alpha = 0.15, colour = NA) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 2) +
+    scale_x_continuous(breaks = c(0, 1, 2, 3)) +
+    scale_colour_brewer(palette = "Set1", name = expression(lambda),
+                        labels = scales::label_parse()) +
+    scale_fill_brewer(  palette = "Set1", guide = "none") +
+    labs(x = expression(gamma), y = label, title = label) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "right")
+
+  if (pct) p <- p + scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1)
+  )
+
+  print(p)
+}
+```
+---
+
+## 8. Steady-State Comparison: Trust Sensitivity × Parameter Combinations
+
+Steady-state means (rounds 15–20) for all $3 \times 3$ combinations of
+$r_{op}, r_{pw} \in \{0,1,2\}$ as $\gamma$ increases from 0 to 3, with $\lambda = 0.5$
+fixed throughout. Each line is one $(r_{op}, r_{pw})$ pair — colour encodes $r_{op}$,
+line type encodes $r_{pw}$. $\gamma = 0$ is the no-trust baseline.
+Averaged over 100 seeds per cell.
+
+```{r ts-run, cache=TRUE}
+plan(multisession, workers = parallel::detectCores() - 1)
+
+final_grid <- expand_grid(
+  r_op  = 0:2,
+  r_pw  = 0:2,
+  gamma = 0:3,
+  seed  = seq_len(100)
+)
+
+.t0_ts <- Sys.time()
+
+final_raw <- future_pmap_dfr(
+  final_grid,
+  function(r_op, r_pw, gamma, seed) {
+    simulate_with_trust(
+      seed        = seed,
+      n_agents    = 250,
+      node_degree = 6,
+      T           = T_SIM,
+      r_op        = r_op,
+      r_pw        = r_pw,
+      lambda      = 0.5,
+      gamma       = gamma
+    ) |>
+      filter(round %in% SS_WIN) |>
+      summarise(
+        across(
+          c(delegation_rate, lost_vote_rate, avg_ideo_drift,
+            gini_coef, avg_chain_len, tau_mean),
+          \(x) mean(x, na.rm = TRUE)
+        )
+      ) |>
+      mutate(r_op = r_op, r_pw = r_pw, gamma = gamma, seed = seed)
+  },
+  .options = furrr_options(seed = NULL)
+)
+
+plan(sequential)
+.t1_ts  <- Sys.time()
+.el_ts  <- as.numeric(difftime(.t1_ts, .t0_ts, units = "mins"))
+.n_ts   <- nrow(final_grid)
+cat(sprintf(
+  "\n── ts-run ────────────────────────────────────────────\n  Combinations : 3 r_op × 3 r_pw × 4 gamma = 36\n  Seeds        : 100\n  Total runs   : %s\n  Workers      : %d\n  Elapsed      : %.1f min  (%.2f s / run)\n──────────────────────────────────────────────────────\n",
+  formatC(.n_ts, format = "d", big.mark = ","),
+  parallel::detectCores() - 1L,
+  .el_ts, .el_ts * 60 / .n_ts
+))
+
+final_ss <- final_raw |>
+  group_by(r_op, r_pw, gamma) |>
+  summarise(
+    across(
+      c(delegation_rate, lost_vote_rate, avg_ideo_drift,
+        gini_coef, avg_chain_len, tau_mean),
+      \(x) mean(x, na.rm = TRUE)
+    ),
+    .groups = "drop"
+  )
+```
+
+```{r ts-plots, fig.width=11, fig.height=11}
+final_metric_info <- tribble(
+  ~col,             ~label,                   ~pct,
+  "delegation_rate","Delegation Rate",          TRUE,
+  "lost_vote_rate", "Lost Vote Rate",           TRUE,
+  "avg_ideo_drift", "Avg. Ideological Drift",   FALSE,
+  "gini_coef",      "Gini Coefficient",         FALSE,
+  "avg_chain_len",  "Avg. Chain Length",        FALSE,
+  "tau_mean",       "Mean Trust",               FALSE
+)
+
+final_long <- final_ss |>
+  pivot_longer(
+    cols      = c(delegation_rate, lost_vote_rate, avg_ideo_drift,
+                  gini_coef, avg_chain_len, tau_mean),
+    names_to  = "col",
+    values_to = "mean"
+  ) |>
+  inner_join(final_metric_info, by = "col") |>
+  mutate(
+    label  = factor(label, levels = final_metric_info$label),
+    r_op_f = factor(r_op),
+    r_pw_f = factor(r_pw)
+  )
+
+ggplot(final_long,
+       aes(x      = gamma,
+           y      = mean,
+           colour = r_op_f,
+           linetype = r_pw_f,
+           group  = interaction(r_op_f, r_pw_f))) +
+  geom_line(linewidth = 0.85) +
+  geom_point(size = 1.8) +
+  facet_wrap(~ label, scales = "free_y", ncol = 2) +
+  scale_x_continuous(breaks = 0:3) +
+  scale_colour_brewer(
+    palette = "Dark2",
+    name    = expression(r[op])
+  ) +
+  scale_linetype_manual(
+    values = c("solid", "dashed", "dotted"),
+    name   = expression(r[pw])
+  ) +
+  labs(
+    x        = expression(gamma ~ "(trust sensitivity)"),
+    y        = NULL,
+    title    = "Steady-state outcomes across parameter combinations",
+    subtitle = expression(lambda == 0.5 ~ "(100 seeds, rounds 15-20)")
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "right",
+    strip.text      = element_text(face = "bold")
+  )
+```
+
+```{r timing-summary, echo=FALSE}
+.total_runs <- .n_grid + .n_trust + .n_ts
+.total_min  <- .el_grid + .el_trust + .el_ts
+cat(sprintf(
+  "\n══ SIMULATION SUMMARY ════════════════════════════════\n  grid-run   : %6s runs  —  %.1f min\n  trust-run  : %6s runs  —  %.1f min\n  ts-run     : %6s runs  —  %.1f min\n  ─────────────────────────────────────────────────────\n  TOTAL      : %6s runs  —  %.1f min  (%.1f h)\n══════════════════════════════════════════════════════\n",
+  formatC(.n_grid,       format = "d", big.mark = ","), .el_grid,
+  formatC(.n_trust,      format = "d", big.mark = ","), .el_trust,
+  formatC(.n_ts,         format = "d", big.mark = ","), .el_ts,
+  formatC(.total_runs,   format = "d", big.mark = ","), .total_min,
+  .total_min / 60
+))
+```
