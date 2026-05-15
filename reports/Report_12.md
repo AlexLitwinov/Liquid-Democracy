@@ -8,9 +8,9 @@ Full **6 × 6 parameter grid** ($r_{op}, r_{pw} \in \{0,\ldots,5\}$) ×
 **4 agent counts** ($n \in \{100, 250, 1000, 2500\}$), 100 seeds each.
 All metrics are averaged over rounds 15–20.
 
-$$A_{ij} = \sigma\!\left(r_{op}(1-2|o_i-o_j|)\right)\cdot\sigma\!\left(r_{pw}\log\tfrac{p_j}{p_i}\right)$$
+$$A_{ij} = \sigma\left(r_{op}(1-2|o_i-o_j|)\right)\cdot\sigma\left(r_{pw}\log\tfrac{p_j}{p_i}\right)$$
 
-$$w_{\text{self}}(i) = \sigma\!\left(r_{op}(2|o_i-o_{j^\ast}|-1)\right)\cdot\sigma\!\left(r_{pw}\log\tfrac{p_i}{p_{j^\ast}}\right)$$
+$$w_{\text{self}}(i) = \sigma\left(r_{op}(2|o_i-o_{j^\ast}|-1)\right)\cdot\sigma\left(r_{pw}\log\tfrac{p_i}{p_{j^\ast}}\right)$$
 
 ------------------------------------------------------------------------
 
@@ -57,11 +57,11 @@ regimes.
 **Trust update** (after each round, using the effective vote propagated
 through $j$’s chain):
 
-$$\tau_{ij}(t) = \lambda \cdot \tau_{ij}(t-1) \;-\; (1-\lambda)\cdot\bigl|o_i - v_j(t-1)\bigr|$$
+$$\tau_{ij}(t) = \lambda \cdot \tau_{ij}(t-1) - (1-\lambda)\cdot\bigl|o_i - v_j(t-1)\bigr|$$
 
 **Modified attractiveness:**
 
-$$\tilde{A}_{ij}(t) = A_{ij} \cdot 2\,\sigma\!\bigl(\gamma\cdot\tau_{ij}(t)\bigr)$$
+$$\tilde{A}_{ij}(t) = A_{ij} \cdot 2\sigma\bigl(\gamma\cdot\tau_{ij}(t)\bigr)$$
 
 where
 $A_{ij} = \sigma(r_{op}(1-2|o_i-o_j|))\cdot\sigma(r_{pw}\log(p_j/p_i))$
