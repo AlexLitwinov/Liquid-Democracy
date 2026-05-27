@@ -139,23 +139,28 @@ propagate_votes <- function(opinion, n, edge_from, edge_to) {
 # =============================================================
 
 setup_agents <- function(n_per_community, n_communities,
-                         n_experts_per_community, seed = 1) {
+                         n_experts_per_community, seed = 1,
+                         minority_share = 0) {
   set.seed(seed)
   n_lay <- n_per_community * n_communities
   n_exp <- n_experts_per_community * n_communities
   n_all <- n_lay + n_exp
 
+  n_min   <- round(n_lay * minority_share)
+  grp_lay <- c(rep("minority", n_min), rep("majority", n_lay - n_min))
+
   agents <- tibble(
-    id         = 1:n_all,
-    type       = c(rep("lay", n_lay), rep("expert", n_exp)),
-    opinion    = runif(n_all),          # fixed ideological position on [0,1]
+    id        = 1:n_all,
+    type      = c(rep("lay", n_lay), rep("expert", n_exp)),
+    opinion   = runif(n_all),
     community = c(
-                (0:(n_lay - 1)) %% n_communities,
-                if (n_exp > 0) (0:(n_exp - 1)) %% n_communities else integer(0)
+                  (0:(n_lay - 1)) %% n_communities,
+                  if (n_exp > 0) (0:(n_exp - 1)) %% n_communities else integer(0)
                 ),
-    power      = 1L,                    # initialised to 1 (own vote)
-    my_vote    = NA_real_,
-    delegated  = FALSE
+    group     = c(grp_lay, rep("majority", n_exp)),
+    power     = 1L,
+    my_vote   = NA_real_,
+    delegated = FALSE
   )
   list(agents = agents, n_lay = n_lay, n_exp = n_exp, n_all = n_all)
 }
@@ -180,7 +185,8 @@ setup_agents <- function(n_per_community, n_communities,
 # =============================================================
 
 setup_friendship_network <- function(agents, n_communities, node_degree,
-                                     p_rewire = 0.05, seed = 1) {
+                                     p_rewire = 0.05, seed = 1,
+                                     p_ingroup = 0) {
   stopifnot(node_degree %% 2 == 0)
   set.seed(seed)
 
@@ -206,7 +212,15 @@ setup_friendship_network <- function(agents, n_communities, node_degree,
         existing <- c(edge_list[edge_list[, 1] == u, 2],
                       edge_list[edge_list[, 2] == u, 1], u)
         cands    <- lay_ids[!lay_ids %in% existing]
-        if (length(cands)) edge_list[i, 2] <- sample(cands, 1)
+        if (length(cands)) {
+          if (p_ingroup != 0) {
+            same_g <- agents$group[cands] == agents$group[u]
+            wts    <- ifelse(same_g, exp(p_ingroup), 1)
+            edge_list[i, 2] <- sample(cands, 1, prob = wts / sum(wts))
+          } else {
+            edge_list[i, 2] <- sample(cands, 1)
+          }
+        }
       }
     }
   }
@@ -385,17 +399,25 @@ simulate_liquid_democracy <- function(
     attractiveness_fn       = attractiveness_dual_sigmoid,
     sigma_opinion           = 0,       # SD of logit-space noise on perceived opinion
     sigma_pow               = 0,       # SD of log-space noise on perceived power
+    minority_share          = 0,       # fraction of lay agents in minority group
+    minority_opinion_mu     = NULL,    # if not NULL: minority opinions ~ N(mu, sigma_m)
+    minority_opinion_sigma  = 0.1,     # SD for clustered minority opinions
+    r_ingroup               = 0,       # ingroup responsiveness (0 = no preference)
+    p_ingroup               = 0,       # structural homophily in network rewiring
+    lambda                  = 0,       # trust decay/momentum  (0 = no trust)
+    gamma                   = 0,       # trust sensitivity     (0 = trust disabled)
     target_homophily        = NULL,    # target assortativity; NULL disables shuffle
     homophily_t             = 5,       # Metropolis temperature (higher = more greedy)
     homophily_steps         = 100000   # safety cap on proposed swaps
 ) {
   st     <- setup_agents(n_per_community, n_communities,
-                         n_experts_per_community, seed)
+                         n_experts_per_community, seed,
+                         minority_share = minority_share)
   agents <- st$agents
   n_all  <- st$n_all
 
   gF <- setup_friendship_network(agents, n_communities, node_degree,
-                                 p_rewire, seed)
+                                 p_rewire, seed, p_ingroup = p_ingroup)
   gF <- connect_experts(gF, agents, n_per_community,
                         expert_connectedness, seed)
 
@@ -404,10 +426,25 @@ simulate_liquid_democracy <- function(
   agents <- shuffle_opinions_homophily(agents, gF, target_homophily,
                                        homophily_t, homophily_steps, seed)
 
+  # Condition B: clustered minority opinions (overrides uniform / shuffled opinions)
+  if (!is.null(minority_opinion_mu)) {
+    min_ids_init <- which(agents$group == "minority")
+    agents$opinion[min_ids_init] <- pmin(pmax(
+      rnorm(length(min_ids_init), minority_opinion_mu, minority_opinion_sigma),
+      0), 1)
+  }
+
   adj     <- lapply(seq_len(n_all),
                     \(v) as.integer(neighbors(gF, v, mode = "out")))
   lay_ids <- which(agents$type == "lay")
   op      <- agents$opinion
+
+  # Trust state — only allocated when trust is active (gamma > 0 or lambda > 0)
+  trust_active <- (lambda != 0 || gamma != 0)
+  prev_my_vote <- rep(NA_real_, n_all)
+  tau <- if (trust_active)
+    lapply(adj, function(nb) setNames(rep(0.0, length(nb)), as.character(nb)))
+  else NULL
 
   # ---------------------------------------------------------
   # Snapshot rounds: 25%, 50%, 75%, 100% of T
@@ -468,6 +505,18 @@ simulate_liquid_democracy <- function(
         attractiveness_fn(op[i], op_nb, pow[i], pow_nb, r_op, r_pw)
       else numeric(0)
 
+      # Trust modifier: A_tilde = A * 2*sigma(gamma*tau); neutral at tau = 0
+      if (trust_active && gamma != 0 && length(nb)) {
+        trust_mod <- 2 * .sig(gamma * tau[[i]][as.character(nb)])
+        w_nb <- w_nb * trust_mod
+      }
+
+      # Ingroup modifier: A_tilde *= sigma(r_ingroup * I(g_i == g_j)), I in {-1, +1}
+      if (r_ingroup != 0 && length(nb)) {
+        same_g <- as.integer(agents$group[nb] == agents$group[i]) * 2L - 1L
+        w_nb   <- w_nb * .sig(r_ingroup * same_g)
+      }
+
       w <- pmax(c(w_self, w_nb), 0)
       if (sum(w) == 0) w[] <- 1
       c(i, nb)[sample.int(length(w), 1L, prob = w)]
@@ -491,6 +540,22 @@ simulate_liquid_democracy <- function(
     agents$power     <- compute_power(n_all, edge_from, edge_to)
     agents$my_vote   <- propagate_votes(op, n_all, edge_from, edge_to)
     agents$delegated <- seq_len(n_all) %in% edge_from
+
+    # --------------------------------------------------
+    # Trust update: tau_ij(t) = lambda*tau_ij(t-1) - (1-lambda)*|o_i - v_j(t-1)|
+    if (trust_active) {
+      for (i in lay_ids) {
+        nb <- adj[[i]]
+        if (!length(nb)) next
+        vj    <- prev_my_vote[nb]
+        valid <- !is.na(vj)
+        if (!any(valid)) next
+        nb_ch <- as.character(nb)
+        tau[[i]][nb_ch[valid]] <- lambda * tau[[i]][nb_ch[valid]] -
+          (1 - lambda) * abs(op[i] - vj[valid])
+      }
+      prev_my_vote <- agents$my_vote
+    }
 
     # --------------------------------------------------
     # Cheap metrics — recorded every round
@@ -556,6 +621,38 @@ simulate_liquid_democracy <- function(
 
       rep_power <- represented$power
 
+      # ---- Minority metrics ------------------------------------------------
+      min_ids_s   <- which(agents$group == "minority")
+      min_pop_shr <- length(min_ids_s) / n_all
+
+      if (min_pop_shr > 0 && sum(agents$power) > 0) {
+        min_pwr_shr <- sum(agents$power[min_ids_s]) / sum(agents$power)
+        RR_m        <- min_pwr_shr / min_pop_shr
+      } else {
+        min_pwr_shr <- 0; RR_m <- NA_real_
+      }
+
+      cross_grp_rate <- if (length(edge_from) > 0)
+        mean(agents$group[edge_from] != agents$group[edge_to])
+      else 0
+
+      min_vtr <- min_ids_s[!is.na(agents$my_vote[min_ids_s])]
+      min_enp <- if (length(min_vtr) > 0) {
+        pm <- agents$power[min_vtr]
+        if (sum(pm) > 0) 1 / sum((pm / sum(pm))^2) else NA_real_
+      } else NA_real_
+
+      min_dlg <- min_ids_s[agents$delegated[min_ids_s]]
+      min_chain <- if (length(min_dlg) > 0 && length(roots_snap) > 0 && ecount(gD) > 0) {
+        dm  <- distances(gD, v = min_dlg, to = roots_snap, mode = "out")
+        cls <- apply(dm, 1, function(d) { fd <- d[is.finite(d)]; if (length(fd)) min(fd) else NA_real_ })
+        mean(cls, na.rm = TRUE)
+      } else 0
+
+      min_rep   <- agents[min_vtr, ]
+      min_drift <- if (nrow(min_rep) > 0)
+        mean(abs(min_rep$opinion - min_rep$my_vote)) else NA_real_
+
       snapshot_list[[as.character(t)]] <- tibble(
         round                       = t,
         pct_T                       = t / T,
@@ -568,6 +665,12 @@ simulate_liquid_democracy <- function(
         largest_voting_bloc_share   = largest_voting_bloc,
         total_components            = total_components,
         delegation_stability        = stab,
+        minority_power_share        = min_pwr_shr,
+        RR_m                        = RR_m,
+        cross_group_dlg_rate        = cross_grp_rate,
+        minority_enp                = min_enp,
+        minority_chain_len          = min_chain,
+        minority_drift              = min_drift,
         direct_yes                  = sum(agents$opinion >= 0.5),
         direct_no                   = sum(agents$opinion  < 0.5),
         direct_margin               = sum(agents$opinion >= 0.5) -
