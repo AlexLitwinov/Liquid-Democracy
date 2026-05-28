@@ -270,10 +270,9 @@ $$\tau_{ij}(t) = \lambda \cdot \tau_{ij}(t-1) - (1-\lambda)\cdot\bigl|o_i - v_j(
 
 **Modified attractiveness:**
 
-$$\tilde{A}_{ij}(t) = A_{ij} \cdot 2\sigma\bigl(\gamma\cdot\tau_{ij}(t)\bigr)$$
-
+\$$\tilde{A}_{ij}(t) = A_{ij} \cdot 2\sigma\bigl(\gamma\cdot\tau_{ij}(t)\bigr)$
 where
-$A_{ij} = \sigma\!\left(r_{op}(1-2|o_i-o_j|)\right)\cdot\sigma\!\left(r_{pw}\log(p_j/p_i)\right)$
+$A_{ij} = \sigma\left(r_{op}(1-2|o_i-o_j|)\right)\cdot\sigma\left(r_{pw}\log(p_j/p_i)\right)$
 is the baseline attractiveness from Part 1. The factor $2\sigma(\cdot)$
 ensures that $\tau=0$ (no experience) gives a neutral modifier of
 $2\sigma(0)=1$, recovering the unmodified $A_{ij}$ exactly. The
@@ -360,24 +359,39 @@ of $r_{op}, r_{pw} \in \{0, 1, 2\}$ at $N = 300$.
 # Part 5 Cycle Fallback – Lost Vote Correction
 
 Parts 1–4 use the default simulation where agents in delegation cycles
-keep their vote lost (`my_vote = NA`). This section tests two correction
-mechanisms motivated by rational agent behaviour: an agent who discovers
-their vote is lost should react.
+keep their vote lost (`my_vote = NA`). This section tests three
+correction mechanisms based on between-round learning: if an agent’s
+vote was lost in round $t$, they adjust their delegation choice in round
+$t+1$. The vote is genuinely lost in round $t$ and recorded as such; the
+correction only takes effect from the following round onward.
 
-**Option A – Direct voting** (`cycle_fallback = "direct"`): Lost agents
-immediately cast their own opinion as a direct vote. Requires no
-knowledge of other agents’ states — the agent only knows their own vote
-was not represented.
+**Option A – Direct voting** (`cycle_fallback = "direct"`): If an
+agent’s vote was lost in the previous round, they cast their own opinion
+directly in the current round, bypassing delegation entirely. Requires
+minimal information — the agent only needs to know their own vote was
+not represented. Delegation can resume in subsequent rounds if the agent
+finds an attractive delegate again.
 
-**Option B – Re-delegation** (`cycle_fallback = "redelegate"`): Lost
-agents re-delegate to the highest-attractiveness neighbour whose vote
-*is already represented* in this round; fall back to direct voting if no
-such neighbour exists. Requires local feedback: the agent can observe
-which neighbours have an active, non-lost vote (analogous to
-LiquidFeedback’s delegation status display).
+**Option B – Re-delegation, excluding bad delegate**
+(`cycle_fallback = "redelegate"`): If an agent’s vote was lost in the
+previous round, their previous delegate is excluded from the choice set.
+The agent then selects normally from all remaining neighbours (including
+the self-weight), so they may still delegate or vote directly depending
+on relative attractiveness. Requires only local memory: the agent
+recalls who they delegated to last round.
 
-Both options are compared to the **baseline** (no fallback) across the
-same robustness sweep ($r_{op}, r_{pw} \in \{0,1,2\}$, N = 300, 100
+**Option C – Informed re-delegation** (`cycle_fallback = "informed"`):
+If an agent’s vote was lost in the previous round, only neighbours whose
+vote *was represented* in the previous round are considered as
+delegation targets. The agent selects among these verified-valid
+neighbours using the standard attractiveness weights, and falls back to
+direct voting if no such neighbour exists. Requires local transparency:
+the agent can observe which neighbours had an active, non-lost vote in
+the previous round — analogous to LiquidFeedback’s public
+delegation-status display.
+
+All three options are compared to the **baseline** (no fallback) across
+the same robustness sweep ($r_{op}, r_{pw} \in \{0,1,2\}$, N = 300, 25
 seeds).
 
 ## All Metrics: Fallback Comparison ($r_{pw} = 1$ fixed)
