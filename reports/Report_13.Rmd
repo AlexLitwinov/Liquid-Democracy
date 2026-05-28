@@ -29,8 +29,8 @@ fmt_coef  <- function(est, p) paste0(round(est, 4), sig_stars(p), " (", fmt_p(p)
 n_seeds_large <- 25L
 n_seeds_rob   <- 100L
 
-all_metrics <- c("avg_chain_len", "delegation_rate", "lost_vote_rate",
-                 "gini_coef", "avg_ideo_drift", "top5_share", "enp",
+all_metrics <- c("delegation_rate", "lost_vote_rate", "avg_chain_len",
+                 "avg_ideo_drift", "gini_coef", "top5_share", "enp",
                  "total_components")
 all_metrics_lbl <- c(
   delegation_rate  = "Delegation Rate",
@@ -48,12 +48,12 @@ all_metrics_lbl <- c(
 
 Two simulation sweeps underpin this report.
 
-**Large sweep** ($r_{op}, r_{pw} \in \{0,\ldots,15\}$, N $\in$ \{300, 1000\},
-`r n_seeds_large` seeds per cell): used for GAM overview plots that capture the global,
+**Large sweep** ($r_{op}, r_{pw} \in \{0,\ldots,15\}$, N $\in$ \{300, 1000\}, node degree  = 6,
+`r n_seeds_large` seeds per combination): used for GAM overview plots that capture the global,
 potentially nonlinear response surface.
 
 **Robustness sweep** ($r_{op}, r_{pw} \in \{0,1,2\}$,
-N $\in$ \{100, 200, \ldots, 1000\}, `r n_seeds_rob` seeds per cell): used for
+N $\in$ \{100, 200, \ldots, 1000\}, node degree  = 6, `r n_seeds_rob` seeds per combination): used for
 LMM inference (N = 300 subset) and N-scaling analysis across all ten network sizes.
 
 All metrics are averaged over simulation rounds 15--20.
@@ -210,7 +210,7 @@ cat(sprintf(
 
 ---
 
-# GAM Overview -- Delegation & Lost Vote Rate
+# Overview -- Delegation & Lost Vote Rate
 
 ```{r gam-ov-fit, cache=TRUE}
 metrics_gam     <- c("delegation_rate", "lost_vote_rate")
@@ -289,7 +289,8 @@ seed_means <- df_rob300 |>
   summarise(across(all_of(all_metrics), \(x) mean(x, na.rm = TRUE)),
             .groups = "drop") |>
   pivot_longer(-seed, names_to = "metric_key", values_to = "seed_mean") |>
-  mutate(metric = all_metrics_lbl[metric_key])
+  mutate(metric = factor(all_metrics_lbl[metric_key],
+                         levels = all_metrics_lbl[all_metrics]))
 
 seed_stats <- seed_means |>
   group_by(metric) |>
@@ -333,53 +334,7 @@ Within the approximately linear regime ($r \leq 2$) the interaction model
 
 $$y_{ijk} = \beta_0 + \beta_1\,r_{op} + \beta_2\,r_{pw} + \beta_3\,(r_{op} \cdot r_{pw}) + u_k + \varepsilon_{ijk}$$
 
-is fitted for all seven metrics simultaneously (delegation dynamics and power
-concentration). $u_k \sim \mathcal{N}(0, \sigma_u^2)$ is the seed random intercept.
-
-- **ENP** ($1/\sum s_i^2$): effective number of equally powerful agents; *higher = less concentrated*
-
-```{r lmm-all-fit, cache=TRUE, dependson=c("setup","robust-sweep")}
-lmm_all <- purrr::map(all_metrics, \(y)
-  lmer(reformulate(c("r_op * r_pw", "(1|seed)"), response = y),
-       data = df_rob300, REML = TRUE)
-) |> setNames(all_metrics)
-```
-
-```{r lmm-all-coef-table}
-lmm_coef_tbl <- purrr::map_dfr(all_metrics, function(y) {
-  m_ml  <- lmer(reformulate(c("r_op * r_pw", "(1|seed)"), response = y),
-                data = df_rob300, REML = FALSE)
-  m_add <- lmer(reformulate(c("r_op + r_pw",  "(1|seed)"), response = y),
-                data = df_rob300, REML = FALSE)
-  lrt   <- anova(m_add, m_ml)
-  coefs <- broom.mixed::tidy(lmm_all[[y]], effects = "fixed", conf.int = TRUE)
-  r2    <- MuMIn::r.squaredGLMM(lmm_all[[y]])
-
-  b1 <- dplyr::filter(coefs, term == "r_op")
-  b2 <- dplyr::filter(coefs, term == "r_pw")
-  b3 <- dplyr::filter(coefs, term == "r_op:r_pw")
-
-  tibble::tibble(
-    Metric           = all_metrics_lbl[y],
-    `b1 (r_op)`      = fmt_coef(b1$estimate, b1$p.value),
-    `b2 (r_pw)`      = fmt_coef(b2$estimate, b2$p.value),
-    `b3 (r_op:r_pw)` = fmt_coef(b3$estimate, b3$p.value),
-    R2m              = round(r2[1, "R2m"], 3),
-    R2c              = round(r2[1, "R2c"], 3)
-  )
-})
-
-knitr::kable(lmm_coef_tbl,
-  caption = "LMM fixed effects -- all metrics, r in {0,1,2,3}, N = 300. * p < 0.05, ** p < 0.01. R2m = marginal (fixed only), R2c = conditional (fixed + seed).")
-```
-
-**Per-metric interpretation:**
-
-**Delegation Dynamics: Delegation Rate and Lost Vote Rate** — Opinion responsiveness strongly increases both delegation activity and the likelihood of votes becoming lost within delegation chains. Agents are therefore substantially more likely to delegate when ideological similarity is prioritized, but this simultaneously creates more fragile delegation structures in which votes fail to reach an active representative. In contrast, power responsiveness slightly stabilizes the system by reducing lost votes, likely because delegations are directed toward already central and consistently active agents. Overall, the results suggest that ideological delegation promotes participation but also increases the lost vote rate due to cycles.
-**Delegation Structure: Average Chain Length and Ideological Drift** 
-- Higher opinion responsiveness produces longer delegation chains, indicating that agents delegate through sequences of ideologically similar intermediaries rather than directly to highly central actors. At the same time, both opinion responsiveness and power responsiveness increase (slightly) ideological drift, implying that indirect delegation can weaken representational fidelity between voters and final representatives. However, the negative interaction effect suggests that the simultaneous presence of both mechanisms partially constrains this increase in drift, whereas this effect almost 0. Together, these findings indicate that decentralized delegation dynamics can generate increasingly indirect and structurally complex forms of representation. But it needs to be said that those effects are relatively small! 
-**Power Concentration: Gini Coefficient, Top-5% Share, and ENP** 
-— Both responsiveness to public opinion and responsiveness to power contribute to a slight increase in overall inequality of political influence, although the effects are generally small. However, they act along different structural dimensions: opinion responsiveness strongly reduces the effective number of influential agents, which is most likely due to higher lost vote rate, while power responsiveness tends to distribute influence across multiple competing hubs rather than reinforcing a single dominant center. The absence of strong effects on the Top-5% power share suggests that concentration emerges more gradually across the system rather than through extreme domination by a very small elite. The absence of strong effects on the Top-5% power share suggests that concentration does not primarily take the form of extreme winner-takes-all (“rich-get-richer”) dynamics at the very top. Overall, the results demonstrate that local delegation preferences can generate macroscopic inequalities in political influence through self-reinforcing network dynamics.
+is fitted. $u_k \sim \mathcal{N}(0, \sigma_u^2)$ is the seed random intercept.
 
 
 ```{r lmm-marginal-plots, fig.width=13, fig.height=22}
@@ -405,6 +360,65 @@ wrap_plots(lmm_plots, ncol = 2) +
     subtitle = "Points = seed-averaged cell means | Lines = OLS regression per r_pw level | Colours = r_pw levels"
   )
 ```
+
+
+- **ENP** ($1/\sum s_i^2$): effective number of equally powerful agents; *higher = less concentrated*
+
+```{r lmm-all-fit, cache=TRUE, dependson=c("setup","robust-sweep"), cache.extra=list(all_metrics)}
+lmm_all <- purrr::map(all_metrics, \(y)
+  lmer(reformulate(c("r_op * r_pw", "(1|seed)"), response = y),
+       data = df_rob300, REML = TRUE)
+) |> setNames(all_metrics)
+```
+
+```{r lmm-all-coef-table}
+lmm_coef_tbl <- purrr::map_dfr(all_metrics, function(y) {
+  m_ml  <- lmer(reformulate(c("r_op * r_pw", "(1|seed)"), response = y),
+                data = df_rob300, REML = FALSE)
+  m_add <- lmer(reformulate(c("r_op + r_pw",  "(1|seed)"), response = y),
+                data = df_rob300, REML = FALSE)
+  lrt   <- anova(m_add, m_ml)
+  coefs <- broom.mixed::tidy(lmm_all[[y]], effects = "fixed", conf.int = TRUE)
+  r2    <- MuMIn::r.squaredGLMM(lmm_all[[y]])
+
+  b1 <- dplyr::filter(coefs, term == "r_op")
+  b2 <- dplyr::filter(coefs, term == "r_pw")
+  b3 <- dplyr::filter(coefs, term == "r_op:r_pw")
+
+  lrt_chi2 <- lrt$Chisq[2]
+  lrt_p    <- lrt[["Pr(>Chisq)"]][2]
+
+  tibble::tibble(
+    Metric           = all_metrics_lbl[y],
+    `b1 (r_op)`      = fmt_coef(b1$estimate, b1$p.value),
+    `b2 (r_pw)`      = fmt_coef(b2$estimate, b2$p.value),
+    `b3 (r_op:r_pw)` = fmt_coef(b3$estimate, b3$p.value),
+    `LRT χ²`         = paste0(round(lrt_chi2, 2), sig_stars(lrt_p),
+                               " (", fmt_p(lrt_p), ")"),
+    R2m              = round(r2[1, "R2m"], 3),
+    R2c              = round(r2[1, "R2c"], 3)
+  )
+})
+
+knitr::kable(lmm_coef_tbl,
+  caption = "LMM fixed effects -- all metrics, r in {0,1,2}, N = 300. * p < 0.05, ** p < 0.01. LRT χ² tests interaction term (r_op:r_pw) against additive model. R2m = marginal, R2c = conditional.")
+```
+
+**Interpretation:**
+
+**Note**  
+- All results must be interpreted with considering a very high delegation rate and therefore a very high lost vote rate especially for higher r values. Meaning some results might be related to the enormous loss of votes instead of their "true" effects.  
+
+**Delegation Dynamics: Delegation Rate and Lost Vote Rate**  
+- Opinion responsiveness strongly increases both delegation activity and the likelihood of votes becoming lost within delegation chains. Agents are therefore substantially more likely to delegate when ideological similarity is prioritized, but this simultaneously creates more fragile delegation structures in which votes fail to reach an active representative. In contrast, power responsiveness slightly stabilizes the system by reducing lost votes, likely because if an agent is more powerful than his neighbours it is very unlikely that he/she will not cast his/her vote. Overall, the results suggest that ideological delegation promotes participation but also increases the lost vote rate due to cycles.
+
+**Delegation Structure: Average Chain Length and Ideological Drift**  
+- Higher opinion responsiveness produces longer delegation chains, indicating that agents delegate through sequences of ideologically similar intermediaries rather than directly to highly central actors. At the same time, both opinion responsiveness and power responsiveness increase (slightly) ideological drift. However, the negative interaction effect suggests that the simultaneous presence of both mechanisms partially constrains this increase in drift, whereas this effect is almost 0.  
+Note: All effects are very very small! 
+
+**Power Concentration: Gini Coefficient, Top-5% Share, and ENP**  
+- Both responsiveness to opinion and responsiveness to power contribute to a small increase in overall inequality of political influence, although the effects are generally small. However, they act along different structural dimensions: opinion responsiveness strongly reduces the effective number of influential agents, which is most likely due to higher lost vote rate, while power responsiveness tends to distribute influence across multiple competing hubs rather than reinforcing a single dominant center. The absence of strong effects on the Top-5% power share suggests that concentration emerges more gradually across the system rather than through extreme domination by a very small elite. The absence of strong effects on the Top-5% power share suggests that concentration does not primarily take the form of extreme winner-takes-all (“rich-get-richer”) dynamics at the very top. Overall, the results are not what I expected especially from r_pw, I stil think the delegation rate has a strong effect on the power concentration.
+
 
 ```{r lmm-heatmaps, fig.width=11, fig.height=26}
 heat_pairs <- purrr::map(all_metrics, function(y) {
@@ -439,21 +453,21 @@ wrap_plots(heat_pairs, ncol = 1) +
 ```
 
 Close agreement between predicted and observed heatmaps confirms that the linear
-interaction model captures the dominant structure within $r \leq 3$. Systematic
+interaction model captures the dominant structure within $r \leq 2$. Systematic
 deviations (e.g. curvature in corners) would indicate residual nonlinearity not
 captured by $\beta_3$.
 
 ---
 
-# Part 3 -- Robustness: Effect of Network Size N
+# Part 2 -- Robustness: Effect of Network Size N
 
-The robustness sweep covers N $\in$ \{100, 200, \ldots, 1000\} at $r_{op}, r_{pw} \in \{0,1,2,3\}$.
+The robustness sweep covers N $\in$ \{100, 200, \ldots, 1000\} at $r_{op}, r_{pw} \in \{0,1,2\}$.
 Three complementary analyses address whether the parameter effects are N-dependent:
 (1) raw metric trajectories at a fixed reference point, (2) N included directly as a
 predictor to estimate the per-unit effect, and (3) separate LMMs at N = 200, 500, 1000
 compared side by side.
 
-ENP and Total Components are normalised for Part 3 comparisons across N: ENP is divided
+ENP and Total Components are normalised for Part 2 comparisons across N: ENP is divided
 by the number of direct voters ($n_\text{voters}$) and Total Components by $N$.
 
 ```{r part3-normalise, include=FALSE}
@@ -464,7 +478,7 @@ df_rob_n <- df_rob |>
 
 ---
 
-## 3.1  Metric trends across N (r_op = r_pw = 1)
+## 2.1  Metric trends across N (r_op = r_pw = 1)
 
 ```{r n-trends, fig.width=12, fig.height=10}
 trend_df <- df_rob_n |>
@@ -472,7 +486,10 @@ trend_df <- df_rob_n |>
   group_by(n_agents) |>
   summarise(across(all_of(all_metrics), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |>
   pivot_longer(all_of(all_metrics), names_to = "metric_key", values_to = "value") |>
-  mutate(metric = all_metrics_lbl[metric_key])
+  mutate(
+    metric = factor(all_metrics_lbl[metric_key],
+                    levels = all_metrics_lbl[all_metrics])
+  )
 
 ggplot(trend_df, aes(n_agents, value)) +
   geom_line(colour = "#3498DB", linewidth = 1) +
@@ -493,14 +510,14 @@ The strongest size dependence appears in ENP, Top-5% Power Share and Avg. Chain 
 
 ---
 
-## 3.2  N as a predictor
+## 2.2  N as a predictor
 
 To estimate *how much* each metric changes per unit increase in N -- controlling for
 $r_{op}$ and $r_{pw}$ -- the model $y \sim r_{op} \times r_{pw} + N$ is fitted on cell
 means (averaged over seeds within each parameter combination). The coefficient for N is
 directly interpretable as the expected change per additional agent.
 
-```{r n-predictor, cache=TRUE, dependson="setup"}
+```{r n-predictor, cache=TRUE, dependson="setup", cache.extra=list(all_metrics)}
 df_cell <- df_rob_n |>
   group_by(n_agents, r_op, r_pw) |>
   summarise(across(all_of(all_metrics), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
@@ -528,9 +545,9 @@ Some metrics vary partially around a mean while others appear to need to exceed 
 
 ---
 
-## 3.3  Coefficient tables -- N = 200, 500, 1000
+## 2.3  Coefficient tables -- N = 200, 500, 1000
 
-```{r n-coef-models, cache=TRUE, dependson="setup"}
+```{r n-coef-models, cache=TRUE, dependson="setup", cache.extra=list(all_metrics)}
 n_compare <- c(200L, 500L, 1000L)
 
 n_coef_raw <- purrr::map_dfr(n_compare, function(n) {
@@ -538,23 +555,28 @@ n_coef_raw <- purrr::map_dfr(n_compare, function(n) {
   purrr::map_dfr(all_metrics, function(y) {
     m_ml  <- lmer(reformulate(c("r_op * r_pw", "(1|seed)"), response = y),
                   data = df_n, REML = FALSE)
+    m_add <- lmer(reformulate(c("r_op + r_pw",  "(1|seed)"), response = y),
+                  data = df_n, REML = FALSE)
     m_r   <- lmer(reformulate(c("r_op * r_pw", "(1|seed)"), response = y),
                   data = df_n, REML = TRUE)
+    lrt   <- anova(m_add, m_ml)
     coefs <- broom.mixed::tidy(m_ml, effects = "fixed", conf.int = TRUE)
     r2    <- MuMIn::r.squaredGLMM(m_r)
     b1 <- dplyr::filter(coefs, term == "r_op")
     b2 <- dplyr::filter(coefs, term == "r_pw")
     b3 <- dplyr::filter(coefs, term == "r_op:r_pw")
     tibble::tibble(
-      N      = n, metric = y,
-      b1_est = b1$estimate, b1_p = b1$p.value,
-      b1_lo  = b1$conf.low, b1_hi = b1$conf.high,
-      b2_est = b2$estimate, b2_p = b2$p.value,
-      b2_lo  = b2$conf.low, b2_hi = b2$conf.high,
-      b3_est = b3$estimate, b3_p = b3$p.value,
-      b3_lo  = b3$conf.low, b3_hi = b3$conf.high,
-      R2m    = round(r2[1, "R2m"], 3),
-      R2c    = round(r2[1, "R2c"], 3)
+      N        = n, metric = y,
+      b1_est   = b1$estimate, b1_p = b1$p.value,
+      b1_lo    = b1$conf.low, b1_hi = b1$conf.high,
+      b2_est   = b2$estimate, b2_p = b2$p.value,
+      b2_lo    = b2$conf.low, b2_hi = b2$conf.high,
+      b3_est   = b3$estimate, b3_p = b3$p.value,
+      b3_lo    = b3$conf.low, b3_hi = b3$conf.high,
+      lrt_chi2 = lrt$Chisq[2],
+      lrt_p    = lrt[["Pr(>Chisq)"]][2],
+      R2m      = round(r2[1, "R2m"], 3),
+      R2c      = round(r2[1, "R2c"], 3)
     )
   })
 })
@@ -562,26 +584,35 @@ n_coef_raw <- purrr::map_dfr(n_compare, function(n) {
 
 ```{r n-coef-table}
 n_coef_raw |>
-  mutate(Metric = all_metrics_lbl[metric],
-         b1 = fmt_coef(b1_est, b1_p),
-         b2 = fmt_coef(b2_est, b2_p),
-         b3 = fmt_coef(b3_est, b3_p)) |>
-  dplyr::select(Metric, N, b1, b2, b3, R2m, R2c) |>
-  dplyr::arrange(Metric, N) |>
+  mutate(
+    metric_ord = factor(metric, levels = all_metrics),
+    Metric     = all_metrics_lbl[metric],
+    b1       = fmt_coef(b1_est, b1_p),
+    b2       = fmt_coef(b2_est, b2_p),
+    b3       = fmt_coef(b3_est, b3_p),
+    `LRT χ²` = paste0(round(lrt_chi2, 2), sig_stars(lrt_p),
+                       " (", fmt_p(lrt_p), ")")
+  ) |>
+  dplyr::arrange(metric_ord, N) |>
+  dplyr::select(Metric, N, b1, b2, b3, `LRT χ²`, R2m, R2c) |>
   knitr::kable(
-    col.names = c("Metric", "N", "b1 (r_op)", "b2 (r_pw)", "b3 (r_op:r_pw)", "R2m", "R2c"),
-    caption   = "LMM coefficients for N = 200, 500, 1000  (r in {0,1,2,3}). * p < 0.05, ** p < 0.01")
+    col.names = c("Metric", "N", "b1 (r_op)", "b2 (r_pw)", "b3 (r_op:r_pw)",
+                  "LRT χ²", "R2m", "R2c"),
+    caption   = "LMM coefficients for N = 200, 500, 1000 (r in {0,1,2}). * p < 0.05, ** p < 0.01. LRT χ² tests interaction term against additive model.")
 ```
 
 Across all system sizes, delegation rate and lost vote dynamics remain highly stable and strongly explained by the responsiveness parameters ($R^2_m \approx 0.95$), indicating robust and largely scale-independent delegation behavior. In contrast, chain length, ideological drift, and power concentration become increasingly sensitive to the parameters as $N$ grows, reflected in rising effect sizes and higher explanatory power at larger population sizes.
 
 ---
 
-## 3.4  Coefficient plot -- N = 200, 500, 1000
+## 2.4  Coefficient plot -- N = 200, 500, 1000
 
 ```{r n-coef-plot, fig.width=12, fig.height=10}
 n_coef_long <- n_coef_raw |>
-  mutate(Metric = all_metrics_lbl[metric]) |>
+  mutate(
+    Metric = factor(all_metrics_lbl[metric],
+                    levels = all_metrics_lbl[all_metrics])
+  ) |>
   tidyr::pivot_longer(c(b1_est, b2_est, b3_est),
                       names_to = "coef", values_to = "estimate") |>
   mutate(
@@ -619,7 +650,7 @@ ggplot(n_coef_long,
 
 ---
 
-# Part 2 -- Trust-Weighted Delegation
+# Part 3 -- Trust-Weighted Delegation
 
 ## Formulas
 
@@ -765,7 +796,7 @@ $\lambda = 0.5$ is held fixed throughout. The LRT tests whether the three-way
 interaction $\beta_6$ significantly improves fit over the model containing all
 two-way interactions but no three-way term.
 
-```{r trust-coef-table, cache=TRUE, dependson=c("setup","trust-sweep")}
+```{r trust-coef-table, cache=TRUE, dependson=c("setup","trust-sweep"), cache.extra=list(all_metrics)}
 trust_lmm <- purrr::map(all_metrics, \(y)
   lmer(reformulate(c("r_op * r_pw * gamma", "(1|seed)"), response = y),
        data = df_trust, REML = TRUE)
@@ -788,6 +819,9 @@ trust_coef_tbl <- purrr::map_dfr(all_metrics, function(y) {
     fmt_coef(row$estimate, row$p.value)
   }
 
+  lrt_chi2 <- lrt$Chisq[2]
+  lrt_p    <- lrt[["Pr(>Chisq)"]][2]
+
   tibble::tibble(
     Metric             = all_metrics_lbl[y],
     `b1 (r_op)`        = gc("r_op"),
@@ -797,6 +831,8 @@ trust_coef_tbl <- purrr::map_dfr(all_metrics, function(y) {
     `b4 (r_op:γ)`      = gc("r_op:gamma"),
     `b5 (r_pw:γ)`      = gc("r_pw:gamma"),
     `b6 (r_op:r_pw:γ)` = gc("r_op:r_pw:gamma"),
+    `LRT χ²`           = paste0(round(lrt_chi2, 2), sig_stars(lrt_p),
+                                 " (", fmt_p(lrt_p), ")"),
     R2m                = round(r2[1, "R2m"], 3),
     R2c                = round(r2[1, "R2c"], 3)
   )
@@ -806,5 +842,369 @@ knitr::kable(trust_coef_tbl,
   caption = paste0(
     "LMM with trust: y ~ r_op * r_pw * gamma + (1|seed), lambda = ", lambda_fixed,
     " fixed, N = ", n_trust, ". * p < 0.05, ** p < 0.01. ",
-    "LRT X2 tests the three-way term against the full two-way model."))
+    "LRT χ² tests three-way term (b6) against full two-way model."))
+```
+**Interpretation of $\gamma$ (trust sensitivity):**
+$\gamma$ acts consistently as a **decentralising signal**
+across all metrics.
+Higher trust sensitivity reduces delegation rate, chain length, lost votes, power
+concentration (Gini, Top-5%), and ideological drift, whileraising ENP and total
+components — indicating that agents become more selective:
+they retain their voterather than delegate to an unproven agent, which distributes power more evenly.
+The positive `r_op:γ` interaction (b4) shows that opinionsensitivity amplifies
+this selectivity: agents who filter by both opinion similarity *and* trust history
+delegate even less and to fewer hubs.
+The three-way term b6 is significant for delegation, lostvotes, Gini, drift,
+ENP, and components, confirming that the joint effect of all three parameters is not simply 
+additive — $\gamma$ reshapes how $r_{op}$ and $r_{pw}$ interact ratherthan just shifting outcomes by a fixed offset.
+---
+
+# Part 4  Node Degree Sensitivity
+
+`node_degree = 6` is the default WS ring-lattice parameter used throughout
+Parts 1, 2, and 3. A higher degree means more potential delegation partners per
+agent, which directly affects chain length and connectivity. This section
+checks whether the key results generalise across a wide range of degree values.
+
+The sweep varies `node_degree` from 6 to 30 across all nine combinations of
+$r_{op}, r_{pw} \in \{0, 1, 2\}$ at $N = 300$.
+
+```{r deg-sweep, include=FALSE}
+deg_vals_s   <- c(6L, 10L, 14L, 18L, 22L, 26L, 30L)
+r_vals_deg   <- 0:2
+n_seeds_deg  <- 25L
+n_agents_deg <- 300L
+
+sim_params_deg <- list(deg = deg_vals_s, r = r_vals_deg,
+                       n = n_agents_deg, seeds = n_seeds_deg,
+                       T = sim_T, version = 1L)
+hash_deg  <- digest::digest(sim_params_deg)
+cache_deg <- here::here("data/sim_deg_cache.rds")
+
+if (file.exists(cache_deg)) {
+  cd <- readRDS(cache_deg)
+  if (identical(cd$hash, hash_deg)) {
+    sim_deg_raw <- cd$data; t_deg <- cd$elapsed
+    message("Degree-sweep cache hit.")
+  } else cd <- NULL
+} else cd <- NULL
+
+if (is.null(cd)) {
+  dir.create(here::here("data"), showWarnings = FALSE)
+  grid_deg <- expand_grid(
+    node_degree = deg_vals_s,
+    r_op        = r_vals_deg,
+    r_pw        = r_vals_deg,
+    seed        = seq_len(n_seeds_deg)
+  )
+  plan(multisession, workers = parallel::detectCores() - 1)
+  t0 <- proc.time()
+  sim_deg_raw <- future_pmap_dfr(
+    grid_deg,
+    function(node_degree, r_op, r_pw, seed) {
+      res   <- simulate_liquid_democracy(
+        seed = seed, n_per_community = n_agents_deg, n_communities = 1,
+        node_degree = node_degree, T = sim_T,
+        r_op = r_op, r_pw = r_pw)
+      snaps <- tail(res$snapshots, 2)
+      ag    <- res$agents
+      tibble(
+        node_degree      = node_degree,
+        r_op             = r_op,
+        r_pw             = r_pw,
+        seed             = seed,
+        delegation_rate  = mean(res$history_delegation[15:20], na.rm = TRUE),
+        lost_vote_rate   = mean(res$history_lost[15:20],       na.rm = TRUE),
+        avg_chain_len    = mean(snaps$avg_chain_length_delegators, na.rm = TRUE),
+        avg_ideo_drift   = mean(res$history_drift[15:20],      na.rm = TRUE),
+        gini_coef        = mean(snaps$gini_power,              na.rm = TRUE),
+        top5_share       = mean(snaps$top5_power_share,        na.rm = TRUE),
+        enp              = { p <- ag$power[!is.na(ag$my_vote)]
+                             if (!length(p) || sum(p) == 0) NA_real_
+                             else 1 / sum((p / sum(p))^2) },
+        total_components = mean(snaps$total_components,        na.rm = TRUE)
+      )
+    },
+    .options = furrr_options(seed = NULL)
+  )
+  plan(sequential)
+  t_deg <- proc.time() - t0
+  saveRDS(list(hash = hash_deg, data = sim_deg_raw, elapsed = t_deg), cache_deg)
+  message("Degree sweep complete.")
+}
+df_deg <- sim_deg_raw |> filter(!is.na(avg_chain_len))
+```
+
+## All Metrics vs Node Degree
+
+```{r deg-all-metrics, fig.width=14, fig.height=20}
+lt_map_deg <- c("0" = "solid", "1" = "dashed", "2" = "dotted")
+
+cell_deg <- df_deg |>
+  group_by(node_degree, r_op, r_pw) |>
+  summarise(across(all_of(all_metrics), \(x) mean(x, na.rm = TRUE)),
+            .groups = "drop")
+
+deg_plots <- purrr::map(all_metrics, function(y) {
+  lbl <- all_metrics_lbl[y]
+  ggplot(cell_deg, aes(node_degree, .data[[y]],
+                       colour   = factor(r_op),
+                       linetype = factor(r_pw),
+                       group    = interaction(r_op, r_pw))) +
+    geom_point(size = 1.8, alpha = 0.85) +
+    geom_line(linewidth = 0.8) +
+    scale_colour_viridis_d(name = expression(r[op])) +
+    scale_linetype_manual(name = expression(r[pw]), values = lt_map_deg) +
+    scale_x_continuous(breaks = deg_vals_s) +
+    labs(title = lbl, x = "Node degree (k)", y = lbl)
+})
+
+wrap_plots(deg_plots, ncol = 2) +
+  plot_annotation(
+    title    = paste0("Node degree sensitivity  (N = ", n_agents_deg,
+                      ", r_op/r_pw ∈ {0,1,2})"),
+    subtitle = paste0("Points = mean over ", n_seeds_deg,
+                      " seeds | Colour = r_op | Linetype = r_pw")
+  )
+```
+
+## Delegation Rate and Chain Length: Core Degree Effects
+
+```{r deg-focus, fig.width=12, fig.height=5}
+p_dlg <- ggplot(
+  cell_deg |> filter(r_pw == 1),
+  aes(node_degree, delegation_rate,
+      colour = factor(r_op), group = factor(r_op))
+) +
+  geom_point(size = 2.2) + geom_line(linewidth = 0.9) +
+  scale_colour_viridis_d(name = expression(r[op])) +
+  scale_x_continuous(breaks = deg_vals_s) +
+  labs(title = "Delegation Rate vs degree  (r_pw = 1 fixed)",
+       x = "Node degree (k)", y = "Delegation Rate")
+
+p_chn <- ggplot(
+  cell_deg |> filter(r_pw == 1),
+  aes(node_degree, avg_chain_len,
+      colour = factor(r_op), group = factor(r_op))
+) +
+  geom_point(size = 2.2) + geom_line(linewidth = 0.9) +
+  scale_colour_viridis_d(name = expression(r[op])) +
+  scale_x_continuous(breaks = deg_vals_s) +
+  labs(title = "Avg. Chain Length vs degree  (r_pw = 1 fixed)",
+       x = "Node degree (k)", y = "Avg. Chain Length")
+
+(p_dlg | p_chn) + plot_annotation(
+  subtitle = paste0("Mean over ", n_seeds_deg, " seeds | N = ", n_agents_deg)
+)
+```
+
+---
+
+# Part 5  Cycle Fallback -- Lost Vote Correction
+
+Parts 1--4 use the default simulation where agents in delegation cycles
+keep their vote lost (`my_vote = NA`).
+This section tests two correction mechanisms motivated by rational agent
+behaviour: an agent who discovers their vote is lost should react.
+
+**Option A -- Direct voting** (`cycle_fallback = "direct"`):
+Lost agents immediately cast their own opinion as a direct vote.
+Requires no knowledge of other agents' states — the agent only knows their
+own vote was not represented.
+
+**Option B -- Re-delegation** (`cycle_fallback = "redelegate"`):
+Lost agents re-delegate to the highest-attractiveness neighbour whose vote
+*is already represented* in this round; fall back to direct voting if no
+such neighbour exists.
+Requires local feedback: the agent can observe which neighbours have an
+active, non-lost vote (analogous to LiquidFeedback's delegation status
+display).
+
+Both options are compared to the **baseline** (no fallback) across the
+same robustness sweep ($r_{op}, r_{pw} \in \{0,1,2\}$, N = 300,
+`r n_seeds_rob` seeds).
+
+```{r fallback-sweep, include=FALSE}
+n_seeds_fb  <- 25L
+n_agents_fb <- 300L
+
+run_fallback_sweep <- function(fb_type) {
+  params <- list(r = r_levels_rob, n = n_agents_fb,
+                 seeds = n_seeds_fb, T = sim_T, deg = node_deg,
+                 fallback = fb_type, version = 2L)
+  h    <- digest::digest(params)
+  path <- here::here(paste0("data/sim_fallback_", fb_type, "_cache.rds"))
+
+  if (file.exists(path)) {
+    cc <- readRDS(path)
+    if (identical(cc$hash, h)) {
+      message(fb_type, " cache hit.")
+      return(list(data = cc$data, elapsed = cc$elapsed))
+    }
+  }
+
+  grid <- expand_grid(
+    r_op = r_levels_rob, r_pw = r_levels_rob,
+    seed = seq_len(n_seeds_fb)
+  )
+  plan(multisession, workers = parallel::detectCores() - 1)
+  t0  <- proc.time()
+  dat <- future_pmap_dfr(grid, function(r_op, r_pw, seed) {
+    res   <- simulate_liquid_democracy(
+      seed = seed, n_per_community = n_agents_fb, n_communities = 1,
+      node_degree = node_deg, T = sim_T,
+      r_op = r_op, r_pw = r_pw,
+      cycle_fallback = fb_type)
+    snaps <- tail(res$snapshots, 2)
+    ag    <- res$agents
+    tibble(
+      r_op = r_op, r_pw = r_pw, seed = seed,
+      delegation_rate  = mean(res$history_delegation[15:20], na.rm = TRUE),
+      lost_vote_rate   = mean(res$history_lost[15:20],       na.rm = TRUE),
+      avg_chain_len    = mean(snaps$avg_chain_length_delegators, na.rm = TRUE),
+      avg_ideo_drift   = mean(res$history_drift[15:20],      na.rm = TRUE),
+      gini_coef        = mean(snaps$gini_power,              na.rm = TRUE),
+      top5_share       = mean(snaps$top5_power_share,        na.rm = TRUE),
+      enp              = { p <- ag$power[!is.na(ag$my_vote)]
+                           if (!length(p) || sum(p) == 0) NA_real_
+                           else 1 / sum((p / sum(p))^2) },
+      total_components = mean(snaps$total_components,        na.rm = TRUE)
+    )
+  }, .options = furrr_options(seed = NULL))
+  plan(sequential)
+  el <- proc.time() - t0
+  saveRDS(list(hash = h, data = dat, elapsed = el), path)
+  list(data = dat, elapsed = el)
+}
+
+res_direct   <- run_fallback_sweep("direct")
+res_redeleg  <- run_fallback_sweep("redelegate")
+res_informed <- run_fallback_sweep("informed")
+
+df_direct   <- res_direct$data   |> filter(!is.na(avg_chain_len))
+df_redeleg  <- res_redeleg$data  |> filter(!is.na(avg_chain_len))
+df_informed <- res_informed$data |> filter(!is.na(avg_chain_len))
+```
+
+```{r fallback-cells, include=FALSE}
+model_lvls <- c("Baseline", "Option A: Direct", "Option B: Re-delegate",
+                "Option C: Informed")
+model_cols <- c("Baseline"              = "#95a5a6",
+                "Option A: Direct"      = "#3498DB",
+                "Option B: Re-delegate" = "#E74C3C",
+                "Option C: Informed"    = "#2ECC71")
+lt_fb <- c("0" = "solid", "1" = "dashed", "2" = "dotted")
+
+cell_fb <- bind_rows(
+  df_rob300   |> mutate(model = "Baseline"),
+  df_direct   |> mutate(model = "Option A: Direct"),
+  df_redeleg  |> mutate(model = "Option B: Re-delegate"),
+  df_informed |> mutate(model = "Option C: Informed")
+) |>
+  group_by(model, r_op, r_pw) |>
+  summarise(across(all_of(all_metrics), \(x) mean(x, na.rm = TRUE)),
+            .groups = "drop") |>
+  mutate(model = factor(model, levels = model_lvls))
+```
+
+## All Metrics: Fallback Comparison ($r_{pw} = 1$ fixed)
+
+$r_{pw} = 1$ is held fixed; $r_{op}$ varies on the x-axis.
+Each panel shows one line per model; colour encodes the fallback strategy.
+
+```{r fallback-rop, fig.width=14, fig.height=20}
+cell_fb1 <- cell_fb |> filter(r_pw == 1)
+
+fb_plots <- purrr::map(all_metrics, function(y) {
+  lbl <- all_metrics_lbl[y]
+  ggplot(cell_fb1,
+         aes(r_op, .data[[y]], colour = model, group = model)) +
+    geom_point(size = 2.2, alpha = 0.85) +
+    geom_line(linewidth = 0.9) +
+    scale_colour_manual(values = model_cols, name = "Model") +
+    scale_x_continuous(breaks = r_levels_rob) +
+    labs(title = lbl, x = expression(r[op]), y = lbl) +
+    theme(legend.position = "right")
+})
+
+wrap_plots(fb_plots, ncol = 2) +
+  plot_annotation(
+    title    = paste0("Cycle fallback comparison  (r_pw = 1 fixed, N = ", n_agents_fb,
+                      ", ", n_seeds_fb, " seeds)"),
+    subtitle = "Colour = model | Points = seed-averaged cell means | r_pw = 1 fixed"
+  )
+```
+
+## Delegation Rate & Lost Vote Rate Over Rounds
+
+```{r fallback-history-sweep, include=FALSE}
+n_seeds_fb_hist <- 25L
+
+run_history_sweep <- function(fb_type) {
+  params <- list(r = r_levels_rob, n = n_agents_fb,
+                 seeds = n_seeds_fb_hist, T = sim_T, deg = node_deg,
+                 fallback = fb_type, version = 2L, type = "history")
+  h    <- digest::digest(params)
+  path <- here::here(paste0("data/sim_fb_hist_", fb_type, "_cache.rds"))
+  if (file.exists(path)) {
+    cc <- readRDS(path)
+    if (identical(cc$hash, h)) { message(fb_type, " hist cache hit."); return(cc$data) }
+  }
+  grid <- expand_grid(r_op = r_levels_rob, r_pw = 1L,
+                      seed = seq_len(n_seeds_fb_hist))
+  plan(multisession, workers = parallel::detectCores() - 1)
+  dat <- future_pmap_dfr(grid, function(r_op, r_pw, seed) {
+    res <- simulate_liquid_democracy(
+      seed = seed, n_per_community = n_agents_fb, n_communities = 1,
+      node_degree = node_deg, T = sim_T, r_op = r_op, r_pw = r_pw,
+      cycle_fallback = fb_type)
+    tibble(r_op = r_op, r_pw = r_pw, seed = seed,
+           round           = seq_len(sim_T),
+           delegation_rate = res$history_delegation,
+           lost_vote_rate  = res$history_lost)
+  }, .options = furrr_options(seed = NULL))
+  plan(sequential)
+  saveRDS(list(hash = h, data = dat), path)
+  dat
+}
+
+hist_none     <- run_history_sweep("none")
+hist_direct   <- run_history_sweep("direct")
+hist_redel    <- run_history_sweep("redelegate")
+hist_informed <- run_history_sweep("informed")
+```
+
+```{r fallback-history-plot, fig.width=13, fig.height=8}
+hist_all <- bind_rows(
+  hist_none     |> mutate(model = "Baseline"),
+  hist_direct   |> mutate(model = "Option A: Direct"),
+  hist_redel    |> mutate(model = "Option B: Re-delegate"),
+  hist_informed |> mutate(model = "Option C: Informed")
+) |>
+  group_by(model, r_op, round) |>
+  summarise(delegation_rate = mean(delegation_rate, na.rm = TRUE),
+            lost_vote_rate  = mean(lost_vote_rate,  na.rm = TRUE),
+            .groups = "drop") |>
+  mutate(model = factor(model, levels = model_lvls))
+
+hist_long <- hist_all |>
+  pivot_longer(c(delegation_rate, lost_vote_rate),
+               names_to = "metric_key", values_to = "value") |>
+  mutate(metric = factor(all_metrics_lbl[metric_key],
+                         levels = all_metrics_lbl[all_metrics]))
+
+ggplot(hist_long, aes(round, value, colour = model, group = model)) +
+  geom_line(linewidth = 0.85) +
+  scale_colour_manual(values = model_cols, name = "Model") +
+  scale_x_continuous(breaks = seq(0, sim_T, by = 5)) +
+  facet_grid(metric ~ factor(r_op, labels = paste0("r_op = ", r_levels_rob)),
+             scales = "free_y") +
+  labs(
+    title    = paste0("Delegation & Lost Vote Rate over rounds  (r_pw = 1 fixed, N = ",
+                      n_agents_fb, ", ", n_seeds_fb_hist, " seeds)"),
+    subtitle = "Lines = seed-averaged mean per round | Colour = model",
+    x = "Round", y = NULL
+  ) +
+  theme(strip.text       = element_text(face = "bold"),
+        legend.position  = "bottom")
 ```

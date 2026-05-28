@@ -406,6 +406,7 @@ simulate_liquid_democracy <- function(
     p_ingroup               = 0,       # structural homophily in network rewiring
     lambda                  = 0,       # trust decay/momentum  (0 = no trust)
     gamma                   = 0,       # trust sensitivity     (0 = trust disabled)
+    cycle_fallback          = "none",  # "none" | "direct" | "redelegate"
     target_homophily        = NULL,    # target assortativity; NULL disables shuffle
     homophily_t             = 5,       # Metropolis temperature (higher = more greedy)
     homophily_steps         = 100000   # safety cap on proposed swaps
@@ -446,6 +447,9 @@ simulate_liquid_democracy <- function(
     lapply(adj, function(nb) setNames(rep(0.0, length(nb)), as.character(nb)))
   else NULL
 
+  prev_lost_ids <- integer(0L)   # lay agents whose vote was NA last round
+  prev_target   <- integer(n_all) # who each agent delegated to last round (0 = direct)
+
   # ---------------------------------------------------------
   # Snapshot rounds: 25%, 50%, 75%, 100% of T
   # ---------------------------------------------------------
@@ -483,6 +487,19 @@ simulate_liquid_democracy <- function(
     # --------------------------------------------------
     targets <- vapply(lay_ids, function(i) {
       nb <- adj[[i]]
+
+      # Between-round fallback: if vote was lost last round, adjust choice
+      if (cycle_fallback != "none" && length(prev_lost_ids) && i %in% prev_lost_ids) {
+        if (cycle_fallback == "direct") return(i)
+        if (cycle_fallback == "redelegate") {
+          # exclude the specific delegate that caused the cycle last round
+          nb <- nb[nb != prev_target[i]]
+        } else if (cycle_fallback == "informed") {
+          # only consider neighbours whose vote was represented last round
+          nb <- nb[!is.na(prev_my_vote[nb])]
+          if (!length(nb)) return(i)
+        }
+      }
 
       # Perceived values for neighbours (own values always true)
       op_nb  <- perceive_opinion(op[nb],  sigma_opinion)
@@ -554,8 +571,8 @@ simulate_liquid_democracy <- function(
         tau[[i]][nb_ch[valid]] <- lambda * tau[[i]][nb_ch[valid]] -
           (1 - lambda) * abs(op[i] - vj[valid])
       }
-      prev_my_vote <- agents$my_vote
     }
+    prev_my_vote <- agents$my_vote  # always update: used by trust and informed fallback
 
     # --------------------------------------------------
     # Cheap metrics — recorded every round
@@ -565,6 +582,11 @@ simulate_liquid_democracy <- function(
     history_drift[t]       <- if (nrow(represented) > 0)
       mean(abs(represented$opinion - represented$my_vote)) else NA_real_
     history_delegation[t]  <- mean(agents$delegated[agents$type == "lay"])
+
+    # Update between-round fallback state for next round
+    prev_lost_ids          <- intersect(which(is.na(agents$my_vote)), lay_ids)
+    prev_target            <- integer(n_all)
+    prev_target[edge_from] <- edge_to
 
     history_stability[t]   <- if (t > 1) {
       el_prev     <- as_edgelist(delegation_graphs[[t - 1]], names = FALSE)

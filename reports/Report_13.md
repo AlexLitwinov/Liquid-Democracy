@@ -7,12 +7,13 @@ Weekly Report – Week 13 (15.05.2026 – 21.05.2026)
 Two simulation sweeps underpin this report.
 
 **Large sweep** ($r_{op}, r_{pw} \in \{0,\ldots,15\}$, N $\in$ {300,
-1000}, 25 seeds per cell): used for GAM overview plots that capture the
-global, potentially nonlinear response surface.
+1000}, node degree = 6, 25 seeds per combination): used for GAM overview
+plots that capture the global, potentially nonlinear response surface.
 
 **Robustness sweep** ($r_{op}, r_{pw} \in \{0,1,2\}$, N $\in$ {100, 200,
-, 1000}, 100 seeds per cell): used for LMM inference (N = 300 subset)
-and N-scaling analysis across all ten network sizes.
+, 1000}, node degree = 6, 100 seeds per combination): used for LMM
+inference (N = 300 subset) and N-scaling analysis across all ten network
+sizes.
 
 All metrics are averaged over simulation rounds 15–20.
 
@@ -22,7 +23,7 @@ All metrics are averaged over simulation rounds 15–20.
 
 ------------------------------------------------------------------------
 
-# GAM Overview – Delegation & Lost Vote Rate
+# Overview – Delegation & Lost Vote Rate
 
 ![](Report_13_files/figure-gfm/gam-ov-lineplot-1.png)<!-- -->
 
@@ -47,13 +48,13 @@ variation.
 
 | Metric                 | Grand mean |     SD |     CV |
 |:-----------------------|-----------:|-------:|-------:|
+| Delegation Rate        |     0.9097 | 0.0044 | 0.0049 |
+| Lost Vote Rate         |     0.6399 | 0.0189 | 0.0296 |
 | Avg. Chain Length      |     2.7157 | 0.2010 | 0.0740 |
 | Avg. Ideological Drift |     0.2482 | 0.0106 | 0.0426 |
-| Delegation Rate        |     0.9097 | 0.0044 | 0.0049 |
-| ENP                    |    39.5779 | 5.2716 | 0.1332 |
 | Gini Coefficient       |     0.3857 | 0.0086 | 0.0224 |
-| Lost Vote Rate         |     0.6399 | 0.0189 | 0.0296 |
 | Top-5% Power Share     |     0.2743 | 0.0155 | 0.0567 |
+| ENP                    |    39.5779 | 5.2716 | 0.1332 |
 | Total Components       |    45.9467 | 1.7064 | 0.0371 |
 
 Seed-level variability – CV \> 0.05 indicates meaningful seed bias
@@ -72,98 +73,103 @@ model
 
 $$y_{ijk} = \beta_0 + \beta_1\,r_{op} + \beta_2\,r_{pw} + \beta_3\,(r_{op} \cdot r_{pw}) + u_k + \varepsilon_{ijk}$$
 
-is fitted for all seven metrics simultaneously (delegation dynamics and
-power concentration). $u_k \sim \mathcal{N}(0, \sigma_u^2)$ is the seed
-random intercept.
+is fitted. $u_k \sim \mathcal{N}(0, \sigma_u^2)$ is the seed random
+intercept.
+
+![](Report_13_files/figure-gfm/lmm-marginal-plots-1.png)<!-- -->
 
 - **ENP** ($1/\sum s_i^2$): effective number of equally powerful agents;
   *higher = less concentrated*
 
-| Metric | b1 (r_op) | b2 (r_pw) | b3 (r_op:r_pw) | R2m | R2c |
-|:---|:---|:---|:---|---:|---:|
-| Avg. Chain Length | 0.1605\*\* (\< .001) | -0.0429 (0.118) | 0.0089 (0.675) | 0.090 | 0.182 |
-| Delegation Rate | 0.0497\*\* (\< .001) | 0.0023\*\* (\< .001) | -0.005\*\* (\< .001) | 0.956 | 0.966 |
-| Lost Vote Rate | 0.1521\*\* (\< .001) | -0.0426\*\* (\< .001) | 0.0011 (0.543) | 0.922 | 0.934 |
-| Gini Coefficient | 0.007\*\* (\< .001) | 0.0082\*\* (\< .001) | -0.0014 (0.063) | 0.152 | 0.291 |
-| Avg. Ideological Drift | 0.0074\*\* (\< .001) | 0.009\*\* (\< .001) | -0.002\*\* (0.004) | 0.159 | 0.424 |
-| Top-5% Power Share | -0.0017 (0.444) | 0.0039 (0.083) | 0.0026 (0.127) | 0.024 | 0.105 |
-| ENP | -20.1163\*\* (\< .001) | 3.0745\*\* (\< .001) | 0.5936 (0.137) | 0.757 | 0.817 |
-| Total Components | -4.5229\*\* (\< .001) | 0.2971 (0.094) | 0.3238\* (0.019) | 0.556 | 0.652 |
+| Metric | b1 (r_op) | b2 (r_pw) | b3 (r_op:r_pw) | LRT χ² | R2m | R2c |
+|:---|:---|:---|:---|:---|---:|---:|
+| Delegation Rate | 0.0497\*\* (\< .001) | 0.0023\*\* (\< .001) | -0.005\*\* (\< .001) | 186.66\*\* (\< .001) | 0.956 | 0.966 |
+| Lost Vote Rate | 0.1521\*\* (\< .001) | -0.0426\*\* (\< .001) | 0.0011 (0.543) | 0.37 (0.542) | 0.922 | 0.934 |
+| Avg. Chain Length | 0.1605\*\* (\< .001) | -0.0429 (0.118) | 0.0089 (0.675) | 0.18 (0.674) | 0.090 | 0.182 |
+| Avg. Ideological Drift | 0.0074\*\* (\< .001) | 0.009\*\* (\< .001) | -0.002\*\* (0.004) | 8.52\*\* (0.004) | 0.159 | 0.424 |
+| Gini Coefficient | 0.007\*\* (\< .001) | 0.0082\*\* (\< .001) | -0.0014 (0.063) | 3.46 (0.063) | 0.152 | 0.291 |
+| Top-5% Power Share | -0.0017 (0.444) | 0.0039 (0.083) | 0.0026 (0.127) | 2.33 (0.127) | 0.024 | 0.105 |
+| ENP | -20.1163\*\* (\< .001) | 3.0745\*\* (\< .001) | 0.5936 (0.137) | 2.22 (0.136) | 0.757 | 0.817 |
+| Total Components | -4.5229\*\* (\< .001) | 0.2971 (0.094) | 0.3238\* (0.019) | 5.55\* (0.018) | 0.556 | 0.652 |
 
-LMM fixed effects – all metrics, r in {0,1,2,3}, N = 300. \* p \< 0.05,
-\*\* p \< 0.01. R2m = marginal (fixed only), R2c = conditional (fixed +
-seed).
+LMM fixed effects – all metrics, r in {0,1,2}, N = 300. \* p \< 0.05,
+\*\* p \< 0.01. LRT χ² tests interaction term (r_op:r_pw) against
+additive model. R2m = marginal, R2c = conditional.
 
-**Per-metric interpretation:**
+**Interpretation:**
 
-**Delegation Dynamics: Delegation Rate and Lost Vote Rate** — Opinion
-responsiveness strongly increases both delegation activity and the
-likelihood of votes becoming lost within delegation chains. Agents are
-therefore substantially more likely to delegate when ideological
+**Note**  
+- All results must be interpreted with considering a very high
+delegation rate and therefore a very high lost vote rate especially for
+higher r values. Meaning some results might be related to the enormous
+loss of votes instead of their “true” effects.
+
+**Delegation Dynamics: Delegation Rate and Lost Vote Rate**  
+- Opinion responsiveness strongly increases both delegation activity and
+the likelihood of votes becoming lost within delegation chains. Agents
+are therefore substantially more likely to delegate when ideological
 similarity is prioritized, but this simultaneously creates more fragile
 delegation structures in which votes fail to reach an active
 representative. In contrast, power responsiveness slightly stabilizes
-the system by reducing lost votes, likely because delegations are
-directed toward already central and consistently active agents. Overall,
-the results suggest that ideological delegation promotes participation
-but also increases the lost vote rate due to cycles. **Delegation
-Structure: Average Chain Length and Ideological Drift** - Higher opinion
-responsiveness produces longer delegation chains, indicating that agents
-delegate through sequences of ideologically similar intermediaries
-rather than directly to highly central actors. At the same time, both
-opinion responsiveness and power responsiveness increase (slightly)
-ideological drift, implying that indirect delegation can weaken
-representational fidelity between voters and final representatives.
-However, the negative interaction effect suggests that the simultaneous
-presence of both mechanisms partially constrains this increase in drift,
-whereas this effect almost 0. Together, these findings indicate that
-decentralized delegation dynamics can generate increasingly indirect and
-structurally complex forms of representation. But it needs to be said
-that those effects are relatively small! **Power Concentration: Gini
-Coefficient, Top-5% Share, and ENP** — Both responsiveness to public
-opinion and responsiveness to power contribute to a slight increase in
-overall inequality of political influence, although the effects are
-generally small. However, they act along different structural
-dimensions: opinion responsiveness strongly reduces the effective number
-of influential agents, which is most likely due to higher lost vote
-rate, while power responsiveness tends to distribute influence across
-multiple competing hubs rather than reinforcing a single dominant
-center. The absence of strong effects on the Top-5% power share suggests
-that concentration emerges more gradually across the system rather than
-through extreme domination by a very small elite. The absence of strong
-effects on the Top-5% power share suggests that concentration does not
-primarily take the form of extreme winner-takes-all (“rich-get-richer”)
-dynamics at the very top. Overall, the results demonstrate that local
-delegation preferences can generate macroscopic inequalities in
-political influence through self-reinforcing network dynamics.
+the system by reducing lost votes, likely because if an agent is more
+powerful than his neighbours it is very unlikely that he/she will not
+cast his/her vote. Overall, the results suggest that ideological
+delegation promotes participation but also increases the lost vote rate
+due to cycles.
 
-![](Report_13_files/figure-gfm/lmm-marginal-plots-1.png)<!-- -->
+**Delegation Structure: Average Chain Length and Ideological Drift**  
+- Higher opinion responsiveness produces longer delegation chains,
+indicating that agents delegate through sequences of ideologically
+similar intermediaries rather than directly to highly central actors. At
+the same time, both opinion responsiveness and power responsiveness
+increase (slightly) ideological drift. However, the negative interaction
+effect suggests that the simultaneous presence of both mechanisms
+partially constrains this increase in drift, whereas this effect is
+almost 0.  
+Note: All effects are very very small!
+
+**Power Concentration: Gini Coefficient, Top-5% Share, and ENP**  
+- Both responsiveness to opinion and responsiveness to power contribute
+to a small increase in overall inequality of political influence,
+although the effects are generally small. However, they act along
+different structural dimensions: opinion responsiveness strongly reduces
+the effective number of influential agents, which is most likely due to
+higher lost vote rate, while power responsiveness tends to distribute
+influence across multiple competing hubs rather than reinforcing a
+single dominant center. The absence of strong effects on the Top-5%
+power share suggests that concentration emerges more gradually across
+the system rather than through extreme domination by a very small elite.
+The absence of strong effects on the Top-5% power share suggests that
+concentration does not primarily take the form of extreme
+winner-takes-all (“rich-get-richer”) dynamics at the very top. Overall,
+the results are not what I expected especially from r_pw, I stil think
+the delegation rate has a strong effect on the power concentration.
 
 ![](Report_13_files/figure-gfm/lmm-heatmaps-1.png)<!-- -->
 
 Close agreement between predicted and observed heatmaps confirms that
 the linear interaction model captures the dominant structure within
-$r \leq 3$. Systematic deviations (e.g. curvature in corners) would
+$r \leq 2$. Systematic deviations (e.g. curvature in corners) would
 indicate residual nonlinearity not captured by $\beta_3$.
 
 ------------------------------------------------------------------------
 
-# Part 3 – Robustness: Effect of Network Size N
+# Part 2 – Robustness: Effect of Network Size N
 
 The robustness sweep covers N $\in$ {100, 200, , 1000} at
-$r_{op}, r_{pw} \in \{0,1,2,3\}$. Three complementary analyses address
+$r_{op}, r_{pw} \in \{0,1,2\}$. Three complementary analyses address
 whether the parameter effects are N-dependent: (1) raw metric
 trajectories at a fixed reference point, (2) N included directly as a
 predictor to estimate the per-unit effect, and (3) separate LMMs at N =
 200, 500, 1000 compared side by side.
 
-ENP and Total Components are normalised for Part 3 comparisons across N:
+ENP and Total Components are normalised for Part 2 comparisons across N:
 ENP is divided by the number of direct voters ($n_\text{voters}$) and
 Total Components by $N$.
 
 ------------------------------------------------------------------------
 
-## 3.1 Metric trends across N (r_op = r_pw = 1)
+## 2.1 Metric trends across N (r_op = r_pw = 1)
 
 ![](Report_13_files/figure-gfm/n-trends-1.png)<!-- -->
 
@@ -177,7 +183,7 @@ Avg. Chain Length (for smaller sizes).
 
 ------------------------------------------------------------------------
 
-## 3.2 N as a predictor
+## 2.2 N as a predictor
 
 To estimate *how much* each metric changes per unit increase in N –
 controlling for $r_{op}$ and $r_{pw}$ – the model
@@ -187,11 +193,11 @@ directly interpretable as the expected change per additional agent.
 
 | Metric | b (N) | p | SE | t | 95% CI low | 95% CI high |
 |:---|:---|:---|---:|---:|---:|---:|
-| Avg. Chain Length | 0.000241\*\* | \< .001 | 3.5e-05 | 6.989 | 0.000173 | 3.1e-04 |
 | Delegation Rate | 0 | 0.918 | 2.0e-06 | -0.103 | -0.000004 | 4.0e-06 |
 | Lost Vote Rate | -2e-06 | 0.751 | 7.0e-06 | -0.318 | -0.000016 | 1.2e-05 |
-| Gini Coefficient | 2e-05\*\* | \< .001 | 3.0e-06 | 6.893 | 0.000014 | 2.6e-05 |
+| Avg. Chain Length | 0.000241\*\* | \< .001 | 3.5e-05 | 6.989 | 0.000173 | 3.1e-04 |
 | Avg. Ideological Drift | 1.1e-05\*\* | \< .001 | 2.0e-06 | 6.203 | 0.000007 | 1.4e-05 |
+| Gini Coefficient | 2e-05\*\* | \< .001 | 3.0e-06 | 6.893 | 0.000014 | 2.6e-05 |
 | Top-5% Power Share | 3.6e-05\*\* | \< .001 | 5.0e-06 | 6.939 | 0.000026 | 4.7e-05 |
 | ENP | -7.3e-05\*\* | \< .001 | 8.0e-06 | -9.050 | -0.000089 | -5.7e-05 |
 | Total Components | 0 | 0.822 | 1.0e-06 | 0.226 | -0.000001 | 2.0e-06 |
@@ -205,37 +211,37 @@ exceed a certain threshold before levelling off.
 
 ------------------------------------------------------------------------
 
-## 3.3 Coefficient tables – N = 200, 500, 1000
+## 2.3 Coefficient tables – N = 200, 500, 1000
 
-| Metric | N | b1 (r_op) | b2 (r_pw) | b3 (r_op:r_pw) | R2m | R2c |
-|:---|---:|:---|:---|:---|---:|---:|
-| Avg. Chain Length | 200 | 0.1074\*\* (0.006) | -0.0086 (0.825) | 0.0059 (0.844) | 0.037 | 0.215 |
-| Avg. Chain Length | 500 | 0.1038\*\* (\< .001) | -0.0716\* (0.016) | 0.0373 (0.105) | 0.107 | 0.229 |
-| Avg. Chain Length | 1000 | 0.1636\*\* (\< .001) | -0.0728\*\* (\< .001) | 0.006 (0.705) | 0.274 | 0.370 |
-| Avg. Ideological Drift | 200 | 0.0059\*\* (\< .001) | 0.0097\*\* (\< .001) | -0.0028\* (0.037) | 0.085 | 0.234 |
-| Avg. Ideological Drift | 500 | 0.0064\*\* (\< .001) | 0.0085\*\* (\< .001) | -0.002\* (0.012) | 0.199 | 0.445 |
-| Avg. Ideological Drift | 1000 | 0.0066\*\* (\< .001) | 0.0086\*\* (\< .001) | -0.0022\*\* (\< .001) | 0.378 | 0.548 |
-| Delegation Rate | 200 | 0.0482\*\* (\< .001) | 0.0015\* (0.041) | -0.0042\*\* (\< .001) | 0.938 | 0.956 |
-| Delegation Rate | 500 | 0.0487\*\* (\< .001) | 0.0018\*\* (0.002) | -0.0048\*\* (\< .001) | 0.966 | 0.970 |
-| Delegation Rate | 1000 | 0.0493\*\* (\< .001) | 0.0025\*\* (\< .001) | -0.005\*\* (\< .001) | 0.973 | 0.976 |
-| ENP | 200 | -0.0043 (0.634) | -0.0175 (0.053) | 0.0023 (0.746) | 0.013 | 0.214 |
-| ENP | 500 | -0.0111 (0.075) | -0.0106 (0.088) | -0.0029 (0.552) | 0.046 | 0.153 |
-| ENP | 1000 | -0.0234\*\* (\< .001) | -0.0077 (0.071) | 0.0013 (0.703) | 0.124 | 0.243 |
-| Gini Coefficient | 200 | 0.0021 (0.305) | 0.0091\*\* (\< .001) | -0.0011 (0.478) | 0.058 | 0.313 |
-| Gini Coefficient | 500 | 0.0048\*\* (\< .001) | 0.0085\*\* (\< .001) | -9e-04 (0.333) | 0.190 | 0.373 |
-| Gini Coefficient | 1000 | 0.008\*\* (\< .001) | 0.0078\*\* (\< .001) | -0.0014\* (0.011) | 0.441 | 0.491 |
-| Lost Vote Rate | 200 | 0.1493\*\* (\< .001) | -0.0462\*\* (\< .001) | 0.0042 (0.156) | 0.886 | 0.909 |
-| Lost Vote Rate | 500 | 0.1499\*\* (\< .001) | -0.0453\*\* (\< .001) | 0.0011 (0.589) | 0.939 | 0.949 |
-| Lost Vote Rate | 1000 | 0.1538\*\* (\< .001) | -0.0419\*\* (\< .001) | -3e-04 (0.851) | 0.959 | 0.963 |
-| Top-5% Power Share | 200 | 0.0024 (0.535) | 0.0081\* (0.038) | -9e-04 (0.764) | 0.016 | 0.210 |
-| Top-5% Power Share | 500 | 5e-04 (0.823) | 0.0032 (0.190) | 0.0034 (0.068) | 0.051 | 0.190 |
-| Top-5% Power Share | 1000 | 0.0095\*\* (\< .001) | 0.0027 (0.090) | 0.001 (0.438) | 0.202 | 0.250 |
-| Total Components | 200 | -0.0147\*\* (\< .001) | 0.0012 (0.181) | 0.001 (0.146) | 0.478 | 0.628 |
-| Total Components | 500 | -0.0146\*\* (\< .001) | 0.0014\* (0.025) | 8e-04 (0.103) | 0.664 | 0.752 |
-| Total Components | 1000 | -0.014\*\* (\< .001) | 0.0011\* (0.016) | 7e-04 (0.064) | 0.798 | 0.834 |
+| Metric | N | b1 (r_op) | b2 (r_pw) | b3 (r_op:r_pw) | LRT χ² | R2m | R2c |
+|:---|---:|:---|:---|:---|:---|---:|---:|
+| Delegation Rate | 200 | 0.0491\*\* (\< .001) | 0.0017\*\* (\< .001) | -0.0045\*\* (\< .001) | 129.94\*\* (\< .001) | 0.944 | 0.959 |
+| Delegation Rate | 500 | 0.0488\*\* (\< .001) | 0.0018\*\* (\< .001) | -0.0047\*\* (\< .001) | 186.8\*\* (\< .001) | 0.965 | 0.969 |
+| Delegation Rate | 1000 | 0.0492\*\* (\< .001) | 0.002\*\* (\< .001) | -0.0048\*\* (\< .001) | 230.23\*\* (\< .001) | 0.973 | 0.975 |
+| Lost Vote Rate | 200 | 0.1532\*\* (\< .001) | -0.0461\*\* (\< .001) | 0.003 (0.132) | 2.27 (0.132) | 0.897 | 0.918 |
+| Lost Vote Rate | 500 | 0.1529\*\* (\< .001) | -0.0458\*\* (\< .001) | 0.0016 (0.285) | 1.15 (0.285) | 0.939 | 0.948 |
+| Lost Vote Rate | 1000 | 0.1544\*\* (\< .001) | -0.0436\*\* (\< .001) | 9e-04 (0.473) | 0.52 (0.472) | 0.960 | 0.964 |
+| Avg. Chain Length | 200 | 0.054 (0.061) | -0.0437 (0.128) | 0.026 (0.242) | 1.37 (0.242) | 0.020 | 0.167 |
+| Avg. Chain Length | 500 | 0.0832\*\* (\< .001) | -0.0991\*\* (\< .001) | 0.0505\*\* (0.003) | 8.97\*\* (0.003) | 0.099 | 0.232 |
+| Avg. Chain Length | 1000 | 0.1942\*\* (\< .001) | -0.0777\*\* (\< .001) | 0.0036 (0.769) | 0.09 (0.769) | 0.300 | 0.393 |
+| Avg. Ideological Drift | 200 | 0.0042\*\* (\< .001) | 0.0089\*\* (\< .001) | -0.0022\* (0.014) | 6\* (0.014) | 0.071 | 0.310 |
+| Avg. Ideological Drift | 500 | 0.006\*\* (\< .001) | 0.0085\*\* (\< .001) | -0.0018\*\* (0.001) | 10.16\*\* (0.001) | 0.187 | 0.436 |
+| Avg. Ideological Drift | 1000 | 0.0065\*\* (\< .001) | 0.0085\*\* (\< .001) | -0.0021\*\* (\< .001) | 31.59\*\* (\< .001) | 0.356 | 0.555 |
+| Gini Coefficient | 200 | -1e-04 (0.953) | 0.0083\*\* (\< .001) | -5e-04 (0.685) | 0.16 (0.685) | 0.049 | 0.229 |
+| Gini Coefficient | 500 | 0.0045\*\* (\< .001) | 0.0076\*\* (\< .001) | -5e-04 (0.457) | 0.55 (0.457) | 0.190 | 0.335 |
+| Gini Coefficient | 1000 | 0.0087\*\* (\< .001) | 0.0078\*\* (\< .001) | -0.0018\*\* (\< .001) | 19.22\*\* (\< .001) | 0.444 | 0.510 |
+| Top-5% Power Share | 200 | -6e-04 (0.819) | 0.0065\* (0.020) | -7e-04 (0.755) | 0.1 (0.755) | 0.011 | 0.159 |
+| Top-5% Power Share | 500 | -0.0016 (0.370) | 0.0011 (0.555) | 0.0046\*\* (\< .001) | 11.16\*\* (\< .001) | 0.041 | 0.165 |
+| Top-5% Power Share | 1000 | 0.011\*\* (\< .001) | 0.0026\* (0.023) | 6e-04 (0.514) | 0.43 (0.514) | 0.212 | 0.291 |
+| ENP | 200 | -0.0045 (0.474) | -0.0117 (0.064) | 0.0024 (0.627) | 0.24 (0.627) | 0.005 | 0.182 |
+| ENP | 500 | -0.0111\*\* (0.008) | -0.005 (0.230) | -0.0036 (0.264) | 1.25 (0.263) | 0.041 | 0.148 |
+| ENP | 1000 | -0.0234\*\* (\< .001) | -0.0058 (0.057) | 5e-04 (0.847) | 0.04 (0.847) | 0.125 | 0.236 |
+| Total Components | 200 | -0.015\*\* (\< .001) | 0.0012 (0.077) | 0.001 (0.068) | 3.34 (0.068) | 0.480 | 0.611 |
+| Total Components | 500 | -0.0143\*\* (\< .001) | 0.0016\*\* (\< .001) | 7e-04 (0.053) | 3.75 (0.053) | 0.669 | 0.758 |
+| Total Components | 1000 | -0.0143\*\* (\< .001) | 0.0011\*\* (\< .001) | 8e-04\*\* (0.002) | 9.19\*\* (0.002) | 0.797 | 0.834 |
 
-LMM coefficients for N = 200, 500, 1000 (r in {0,1,2,3}). \* p \< 0.05,
-\*\* p \< 0.01
+LMM coefficients for N = 200, 500, 1000 (r in {0,1,2}). \* p \< 0.05,
+\*\* p \< 0.01. LRT χ² tests interaction term against additive model.
 
 Across all system sizes, delegation rate and lost vote dynamics remain
 highly stable and strongly explained by the responsiveness parameters
@@ -247,13 +253,13 @@ at larger population sizes.
 
 ------------------------------------------------------------------------
 
-## 3.4 Coefficient plot – N = 200, 500, 1000
+## 2.4 Coefficient plot – N = 200, 500, 1000
 
 ![](Report_13_files/figure-gfm/n-coef-plot-1.png)<!-- -->
 
 ------------------------------------------------------------------------
 
-# Part 2 – Trust-Weighted Delegation
+# Part 3 – Trust-Weighted Delegation
 
 ## Formulas
 
@@ -300,17 +306,87 @@ $\lambda = 0.5$ is held fixed throughout. The LRT tests whether the
 three-way interaction $\beta_6$ significantly improves fit over the
 model containing all two-way interactions but no three-way term.
 
-| Metric | b1 (r_op) | b2 (r_pw) | b_γ (γ) | b3 (r_op:r_pw) | b4 (r_op:γ) | b5 (r_pw:γ) | b6 (r_op:r_pw:γ) | R2m | R2c |
-|:---|:---|:---|:---|:---|:---|:---|:---|---:|---:|
-| Avg. Chain Length | 0.1643\*\* (\< .001) | -0.047\*\* (0.007) | -0.0984\*\* (\< .001) | -0.0029 (0.828) | 0.0204\* (0.034) | 0.0069 (0.474) | -0.0071 (0.343) | 0.159 | 0.179 |
-| Delegation Rate | 0.0477\*\* (\< .001) | 6e-04 (0.109) | -0.028\*\* (\< .001) | -0.0041\*\* (\< .001) | 0.0102\*\* (\< .001) | 0.0063\*\* (\< .001) | -0.0038\*\* (\< .001) | 0.965 | 0.970 |
-| Lost Vote Rate | 0.1513\*\* (\< .001) | -0.0456\*\* (\< .001) | -0.057\*\* (\< .001) | 0.0022 (0.082) | 0.0169\*\* (\< .001) | 0.0088\*\* (\< .001) | -0.0067\*\* (\< .001) | 0.935 | 0.940 |
-| Gini Coefficient | 0.0056\*\* (\< .001) | 0.0078\*\* (\< .001) | -0.0072\*\* (\< .001) | -0.0014\* (0.012) | 0.0023\*\* (\< .001) | 0.0016\*\* (\< .001) | -9e-04\*\* (0.002) | 0.245 | 0.281 |
-| Avg. Ideological Drift | 0.006\*\* (\< .001) | 0.0088\*\* (\< .001) | -0.0066\*\* (\< .001) | -0.0016\*\* (\< .001) | 0.001\*\* (0.002) | 9e-04\*\* (0.005) | -8e-04\*\* (0.002) | 0.266 | 0.415 |
-| Top-5% Power Share | -0.0021 (0.159) | 0.0031\* (0.037) | -0.0083\*\* (\< .001) | 0.0017 (0.135) | 0.004\*\* (\< .001) | 9e-04 (0.293) | -8e-04 (0.180) | 0.045 | 0.070 |
-| ENP | -19.1468\*\* (\< .001) | 4.3748\*\* (\< .001) | 9.967\*\* (\< .001) | -0.0789 (0.802) | -3.3527\*\* (\< .001) | -1.5289\*\* (\< .001) | 1.1205\*\* (\< .001) | 0.807 | 0.826 |
-| Total Components | -4.1781\*\* (\< .001) | 0.5344\*\* (\< .001) | 2.512\*\* (\< .001) | 0.1287 (0.208) | -0.7599\*\* (\< .001) | -0.3784\*\* (\< .001) | 0.2757\*\* (\< .001) | 0.656 | 0.680 |
+| Metric | b1 (r_op) | b2 (r_pw) | b_γ (γ) | b3 (r_op:r_pw) | b4 (r_op:γ) | b5 (r_pw:γ) | b6 (r_op:r_pw:γ) | LRT χ² | R2m | R2c |
+|:---|:---|:---|:---|:---|:---|:---|:---|:---|---:|---:|
+| Delegation Rate | 0.0477\*\* (\< .001) | 6e-04 (0.109) | -0.028\*\* (\< .001) | -0.0041\*\* (\< .001) | 0.0102\*\* (\< .001) | 0.0063\*\* (\< .001) | -0.0038\*\* (\< .001) | 563.05\*\* (\< .001) | 0.965 | 0.970 |
+| Lost Vote Rate | 0.1513\*\* (\< .001) | -0.0456\*\* (\< .001) | -0.057\*\* (\< .001) | 0.0022 (0.082) | 0.0169\*\* (\< .001) | 0.0088\*\* (\< .001) | -0.0067\*\* (\< .001) | 90.99\*\* (\< .001) | 0.935 | 0.940 |
+| Avg. Chain Length | 0.1643\*\* (\< .001) | -0.047\*\* (0.007) | -0.0984\*\* (\< .001) | -0.0029 (0.828) | 0.0204\* (0.034) | 0.0069 (0.474) | -0.0071 (0.343) | 0.9 (0.343) | 0.159 | 0.179 |
+| Avg. Ideological Drift | 0.006\*\* (\< .001) | 0.0088\*\* (\< .001) | -0.0066\*\* (\< .001) | -0.0016\*\* (\< .001) | 0.001\*\* (0.002) | 9e-04\*\* (0.005) | -8e-04\*\* (0.002) | 9.29\*\* (0.002) | 0.266 | 0.415 |
+| Gini Coefficient | 0.0056\*\* (\< .001) | 0.0078\*\* (\< .001) | -0.0072\*\* (\< .001) | -0.0014\* (0.012) | 0.0023\*\* (\< .001) | 0.0016\*\* (\< .001) | -9e-04\*\* (0.002) | 9.19\*\* (0.002) | 0.245 | 0.281 |
+| Top-5% Power Share | -0.0021 (0.159) | 0.0031\* (0.037) | -0.0083\*\* (\< .001) | 0.0017 (0.135) | 0.004\*\* (\< .001) | 9e-04 (0.293) | -8e-04 (0.180) | 1.8 (0.180) | 0.045 | 0.070 |
+| ENP | -19.1468\*\* (\< .001) | 4.3748\*\* (\< .001) | 9.967\*\* (\< .001) | -0.0789 (0.802) | -3.3527\*\* (\< .001) | -1.5289\*\* (\< .001) | 1.1205\*\* (\< .001) | 41.37\*\* (\< .001) | 0.807 | 0.826 |
+| Total Components | -4.1781\*\* (\< .001) | 0.5344\*\* (\< .001) | 2.512\*\* (\< .001) | 0.1287 (0.208) | -0.7599\*\* (\< .001) | -0.3784\*\* (\< .001) | 0.2757\*\* (\< .001) | 23.66\*\* (\< .001) | 0.656 | 0.680 |
 
 LMM with trust: y ~ r_op \* r_pw \* gamma + (1\|seed), lambda = 0.5
-fixed, N = 300. \* p \< 0.05, \*\* p \< 0.01. LRT X2 tests the three-way
-term against the full two-way model.
+fixed, N = 300. \* p \< 0.05, \*\* p \< 0.01. LRT χ² tests three-way
+term (b6) against full two-way model.
+
+**Interpretation of $\gamma$ (trust sensitivity):** $\gamma$ acts
+consistently as a **decentralising signal** across all metrics. Higher
+trust sensitivity reduces delegation rate, chain length, lost votes,
+power concentration (Gini, Top-5%), and ideological drift, whileraising
+ENP and total components — indicating that agents become more selective:
+they retain their voterather than delegate to an unproven agent, which
+distributes power more evenly. The positive `r_op:γ` interaction (b4)
+shows that opinionsensitivity amplifies this selectivity: agents who
+filter by both opinion similarity *and* trust history delegate even less
+and to fewer hubs. The three-way term b6 is significant for delegation,
+lostvotes, Gini, drift, ENP, and components, confirming that the joint
+effect of all three parameters is not simply additive — $\gamma$
+reshapes how $r_{op}$ and $r_{pw}$ interact ratherthan just shifting
+outcomes by a fixed offset. —
+
+# Part 4 Node Degree Sensitivity
+
+`node_degree = 6` is the default WS ring-lattice parameter used
+throughout Parts 1, 2, and 3. A higher degree means more potential
+delegation partners per agent, which directly affects chain length and
+connectivity. This section checks whether the key results generalise
+across a wide range of degree values.
+
+The sweep varies `node_degree` from 6 to 30 across all nine combinations
+of $r_{op}, r_{pw} \in \{0, 1, 2\}$ at $N = 300$.
+
+## All Metrics vs Node Degree
+
+![](Report_13_files/figure-gfm/deg-all-metrics-1.png)<!-- -->
+
+## Delegation Rate and Chain Length: Core Degree Effects
+
+![](Report_13_files/figure-gfm/deg-focus-1.png)<!-- -->
+
+------------------------------------------------------------------------
+
+# Part 5 Cycle Fallback – Lost Vote Correction
+
+Parts 1–4 use the default simulation where agents in delegation cycles
+keep their vote lost (`my_vote = NA`). This section tests two correction
+mechanisms motivated by rational agent behaviour: an agent who discovers
+their vote is lost should react.
+
+**Option A – Direct voting** (`cycle_fallback = "direct"`): Lost agents
+immediately cast their own opinion as a direct vote. Requires no
+knowledge of other agents’ states — the agent only knows their own vote
+was not represented.
+
+**Option B – Re-delegation** (`cycle_fallback = "redelegate"`): Lost
+agents re-delegate to the highest-attractiveness neighbour whose vote
+*is already represented* in this round; fall back to direct voting if no
+such neighbour exists. Requires local feedback: the agent can observe
+which neighbours have an active, non-lost vote (analogous to
+LiquidFeedback’s delegation status display).
+
+Both options are compared to the **baseline** (no fallback) across the
+same robustness sweep ($r_{op}, r_{pw} \in \{0,1,2\}$, N = 300, 100
+seeds).
+
+## All Metrics: Fallback Comparison ($r_{pw} = 1$ fixed)
+
+$r_{pw} = 1$ is held fixed; $r_{op}$ varies on the x-axis. Each panel
+shows one line per model; colour encodes the fallback strategy.
+
+![](Report_13_files/figure-gfm/fallback-rop-1.png)<!-- -->
+
+## Delegation Rate & Lost Vote Rate Over Rounds
+
+![](Report_13_files/figure-gfm/fallback-history-plot-1.png)<!-- -->
