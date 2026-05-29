@@ -11,7 +11,7 @@ Two simulation sweeps underpin this report.
 plots that capture the global, potentially nonlinear response surface.
 
 **Robustness sweep** ($r_{op}, r_{pw} \in \{0,1,2\}$, N $\in$ {100, 200,
-, 1000}, node degree = 6, 100 seeds per combination): used for LMM
+…, 1000}, node degree = 6, 100 seeds per combination): used for LMM
 inference (N = 300 subset) and N-scaling analysis across all ten network
 sizes.
 
@@ -173,7 +173,7 @@ Total Components by $N$.
 
 ![](Report_13_files/figure-gfm/n-trends-1.png)<!-- -->
 
-Across the explored range ($N = 200$–$1000$), most delegation and
+Across the explored range (N = 200–1000), most delegation and
 concentration metrics remain relatively stable, suggesting that the
 system operates in a largely size-invariant regime under
 $r_{op} = r_{pw} = 1$.
@@ -183,35 +183,7 @@ Avg. Chain Length (for smaller sizes).
 
 ------------------------------------------------------------------------
 
-## 2.2 N as a predictor
-
-To estimate *how much* each metric changes per unit increase in N –
-controlling for $r_{op}$ and $r_{pw}$ – the model
-$y \sim r_{op} \times r_{pw} + N$ is fitted on cell means (averaged over
-seeds within each parameter combination). The coefficient for N is
-directly interpretable as the expected change per additional agent.
-
-| Metric | b (N) | p | SE | t | 95% CI low | 95% CI high |
-|:---|:---|:---|---:|---:|---:|---:|
-| Delegation Rate | 0 | 0.918 | 2.0e-06 | -0.103 | -0.000004 | 4.0e-06 |
-| Lost Vote Rate | -2e-06 | 0.751 | 7.0e-06 | -0.318 | -0.000016 | 1.2e-05 |
-| Avg. Chain Length | 0.000241\*\* | \< .001 | 3.5e-05 | 6.989 | 0.000173 | 3.1e-04 |
-| Avg. Ideological Drift | 1.1e-05\*\* | \< .001 | 2.0e-06 | 6.203 | 0.000007 | 1.4e-05 |
-| Gini Coefficient | 2e-05\*\* | \< .001 | 3.0e-06 | 6.893 | 0.000014 | 2.6e-05 |
-| Top-5% Power Share | 3.6e-05\*\* | \< .001 | 5.0e-06 | 6.939 | 0.000026 | 4.7e-05 |
-| ENP | -7.3e-05\*\* | \< .001 | 8.0e-06 | -9.050 | -0.000089 | -5.7e-05 |
-| Total Components | 0 | 0.822 | 1.0e-06 | 0.226 | -0.000001 | 2.0e-06 |
-
-Effect of N on each metric, controlling for r_op \* r_pw. Model: lm(y ~
-r_op \* r_pw + n_agents) fitted on cell means. b(N) = estimated change
-per 1-unit increase in N. \* p \< 0.05, \*\* p \< 0.01.
-
-Some metrics vary partially around a mean while others appear to need to
-exceed a certain threshold before levelling off.
-
-------------------------------------------------------------------------
-
-## 2.3 Coefficient tables – N = 200, 500, 1000
+## 2.2 Coefficient tables – N = 200, 500, 1000
 
 | Metric | N | b1 (r_op) | b2 (r_pw) | b3 (r_op:r_pw) | LRT χ² | R2m | R2c |
 |:---|---:|:---|:---|:---|:---|---:|---:|
@@ -253,7 +225,7 @@ at larger population sizes.
 
 ------------------------------------------------------------------------
 
-## 2.4 Coefficient plot – N = 200, 500, 1000
+## 2.3 Coefficient plot – N = 200, 500, 1000
 
 ![](Report_13_files/figure-gfm/n-coef-plot-1.png)<!-- -->
 
@@ -270,7 +242,7 @@ $$\tau_{ij}(t) = \lambda \cdot \tau_{ij}(t-1) - (1-\lambda)\cdot\bigl|o_i - v_j(
 
 **Modified attractiveness:**
 
-\$$\tilde{A}_{ij}(t) = A_{ij} \cdot 2\sigma\bigl(\gamma\cdot\tau_{ij}(t)\bigr)$
+$\tilde{A}_{ij}(t) = A_{ij} \cdot 2\sigma\bigl(\gamma\cdot\tau_{ij}(t)\bigr)$
 where
 $A_{ij} = \sigma\left(r_{op}(1-2|o_i-o_j|)\right)\cdot\sigma\left(r_{pw}\log(p_j/p_i)\right)$
 is the baseline attractiveness from Part 1. The factor $2\sigma(\cdot)$

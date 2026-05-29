@@ -53,7 +53,7 @@ Two simulation sweeps underpin this report.
 potentially nonlinear response surface.
 
 **Robustness sweep** ($r_{op}, r_{pw} \in \{0,1,2\}$,
-N $\in$ \{100, 200, \ldots, 1000\}, node degree  = 6, `r n_seeds_rob` seeds per combination): used for
+N $\in$ \{100, 200, ..., 1000\}, node degree  = 6, `r n_seeds_rob` seeds per combination): used for
 LMM inference (N = 300 subset) and N-scaling analysis across all ten network sizes.
 
 All metrics are averaged over simulation rounds 15--20.
@@ -255,7 +255,7 @@ gam_line_plots <- purrr::map(metrics_gam, function(y) {
                  size = 1.8, alpha = 0.55, inherit.aes = FALSE) +
       geom_line(linewidth = 0.9) +
       scale_colour_viridis_d(name = expression(r[pw])) +
-      scale_x_continuous(breaks = seq(0, 15, by = 2)) +
+      scale_x_continuous(breaks = seq(0, 15, by = 3)) +
       labs(title = paste0(lbl, "  --  N = ", n),
            x = expression(r[op]), y = lbl) +
       theme(legend.position = "right")
@@ -482,7 +482,7 @@ df_rob_n <- df_rob |>
 
 ```{r n-trends, fig.width=12, fig.height=10}
 trend_df <- df_rob_n |>
-  filter(r_op == 1, r_pw == 1, n_agents >= 200) |>
+  filter(r_op == 1, r_pw == 1) |>
   group_by(n_agents) |>
   summarise(across(all_of(all_metrics), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |>
   pivot_longer(all_of(all_metrics), names_to = "metric_key", values_to = "value") |>
@@ -494,58 +494,23 @@ trend_df <- df_rob_n |>
 ggplot(trend_df, aes(n_agents, value)) +
   geom_line(colour = "#3498DB", linewidth = 1) +
   geom_point(colour = "#3498DB", size = 2.5) +
-  scale_x_continuous(breaks = seq(200, 1000, by = 100)) +
+  scale_x_continuous(breaks = seq(100, 1000, by = 100)) +
   facet_wrap(~metric, scales = "free_y", ncol = 4) +
   labs(
     title    = "Metric values across N at r_op = r_pw = 1",
-    subtitle = paste0("Each point = mean over ", n_seeds_rob, " seeds | N from 200 to 1000"),
+    subtitle = paste0("Each point = mean over ", n_seeds_rob, " seeds | N from 100 to 1000"),
     x = "N (agents per community)", y = NULL
   ) +
   theme(strip.text = element_text(face = "bold"))
 ```
 
-Across the explored range ($N = 200$–$1000$), most delegation and concentration metrics remain relatively stable, suggesting that the system operates in a largely size-invariant regime under $r_{op} = r_{pw} = 1$.
+Across the explored range (N = 200–1000), most delegation and concentration metrics remain relatively stable, suggesting that the system operates in a largely size-invariant regime under $r_{op} = r_{pw} = 1$.
 
 The strongest size dependence appears in ENP, Top-5% Power Share and Avg. Chain Length (for smaller sizes).
 
 ---
 
-## 2.2  N as a predictor
-
-To estimate *how much* each metric changes per unit increase in N -- controlling for
-$r_{op}$ and $r_{pw}$ -- the model $y \sim r_{op} \times r_{pw} + N$ is fitted on cell
-means (averaged over seeds within each parameter combination). The coefficient for N is
-directly interpretable as the expected change per additional agent.
-
-```{r n-predictor, cache=TRUE, dependson="setup", cache.extra=list(all_metrics)}
-df_cell <- df_rob_n |>
-  group_by(n_agents, r_op, r_pw) |>
-  summarise(across(all_of(all_metrics), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
-
-n_pred_tbl <- purrr::map_dfr(all_metrics, function(y) {
-  m  <- lm(reformulate(c("r_op * r_pw", "n_agents"), response = y), data = df_cell)
-  cf <- broom::tidy(m, conf.int = TRUE) |> dplyr::filter(term == "n_agents")
-  tibble::tibble(
-    Metric        = all_metrics_lbl[y],
-    `b (N)`       = paste0(round(cf$estimate,  6), sig_stars(cf$p.value)),
-    `p`           = fmt_p(cf$p.value),
-    `SE`          = round(cf$std.error,  6),
-    `t`           = round(cf$statistic,  3),
-    `95% CI low`  = round(cf$conf.low,   6),
-    `95% CI high` = round(cf$conf.high,  6)
-  )
-})
-
-knitr::kable(n_pred_tbl,
-  caption = "Effect of N on each metric, controlling for r_op * r_pw. Model: lm(y ~ r_op * r_pw + n_agents) fitted on cell means. b(N) = estimated change per 1-unit increase in N. * p < 0.05, ** p < 0.01.")
-```
-
-
-Some metrics vary partially around a mean while others appear to need to exceed a certain threshold before levelling off.
-
----
-
-## 2.3  Coefficient tables -- N = 200, 500, 1000
+## 2.2  Coefficient tables -- N = 200, 500, 1000
 
 ```{r n-coef-models, cache=TRUE, dependson="setup", cache.extra=list(all_metrics)}
 n_compare <- c(200L, 500L, 1000L)
@@ -605,7 +570,7 @@ Across all system sizes, delegation rate and lost vote dynamics remain highly st
 
 ---
 
-## 2.4  Coefficient plot -- N = 200, 500, 1000
+## 2.3  Coefficient plot -- N = 200, 500, 1000
 
 ```{r n-coef-plot, fig.width=12, fig.height=10}
 n_coef_long <- n_coef_raw |>
@@ -661,7 +626,7 @@ $$\tau_{ij}(t) = \lambda \cdot \tau_{ij}(t-1) - (1-\lambda)\cdot\bigl|o_i - v_j(
 
 **Modified attractiveness:**
 
-$$\tilde{A}_{ij}(t) = A_{ij} \cdot 2\sigma\bigl(\gamma\cdot\tau_{ij}(t)\bigr)$
+$\tilde{A}_{ij}(t) = A_{ij} \cdot 2\sigma\bigl(\gamma\cdot\tau_{ij}(t)\bigr)$
 where $A_{ij} = \sigma\left(r_{op}(1-2|o_i-o_j|)\right)\cdot\sigma\left(r_{pw}\log(p_j/p_i)\right)$
 is the baseline attractiveness from Part 1. The factor $2\sigma(\cdot)$ ensures that
 $\tau=0$ (no experience) gives a neutral modifier of $2\sigma(0)=1$, recovering the
