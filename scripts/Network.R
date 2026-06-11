@@ -127,11 +127,36 @@ propagate_votes <- function(opinion, n, edge_from, edge_to) {
   roots <- find_roots_vectorized(n, delegate_of)
 
   # Delegating agents inherit the opinion of their root
-  for (i in edge_from) {
-    r        <- roots[i]
-    votes[i] <- if (is.na(r)) NA_real_ else opinion[r]
-  }
+  r  <- roots[edge_from]
+  ok <- !is.na(r)
+  votes[edge_from[ok]]  <- opinion[r[ok]]
+  votes[edge_from[!ok]] <- NA_real_
   votes
+}
+
+# =============================================================
+# COMBINED POWER + VOTE PROPAGATION (single root search)
+# Runs find_roots_vectorized once and computes both results.
+# =============================================================
+
+compute_power_and_votes <- function(opinion, n, edge_from, edge_to) {
+  power <- rep(1L, n)
+  votes <- opinion
+  if (!length(edge_from)) return(list(power = power, votes = votes))
+
+  delegate_of <- integer(n)
+  delegate_of[edge_from] <- edge_to
+  roots <- find_roots_vectorized(n, delegate_of)
+
+  valid <- edge_from[!is.na(roots[edge_from])]
+  if (length(valid)) power <- power + tabulate(roots[valid], nbins = n)
+
+  r  <- roots[edge_from]
+  ok <- !is.na(r)
+  votes[edge_from[ok]]  <- opinion[r[ok]]
+  votes[edge_from[!ok]] <- NA_real_
+
+  list(power = power, votes = votes)
 }
 
 # =============================================================
@@ -369,11 +394,12 @@ compute_network_homophily <- function(gF, agents) {
 #     Setting both sigmas to 0 (default) reproduces the original
 #     model where perceived = true values.
 #
-#     Choose probabilistically:
-#       (a) Vote directly (target = self)
-#           Weight: selfweight_fn(i, nb, op, pow, responsiveness)
-#       (b) Delegate to neighbour j
-#           Weight: attractiveness(i,j) = proximity x competence
+#     Two-step decision:
+#       Step 1: vote directly with fixed probability p_self;
+#               if no neighbours exist, always vote directly.
+#       Step 2: if delegating, choose neighbour j by
+#               attractiveness(i,j) = proximity x competence
+#               (trust and ingroup modifiers applied here)
 #
 #   EXPERTS:
 #     Always vote directly with their own opinion.
@@ -395,7 +421,7 @@ simulate_liquid_democracy <- function(
     r_pw                    = 1,
     inertia                 = 0,
     T                       = 200,
-    selfweight_fn           = selfweight_dual_sigmoid,
+    p_self                  = 0.5,
     attractiveness_fn       = attractiveness_dual_sigmoid,
     sigma_opinion           = 0,       # SD of logit-space noise on perceived opinion
     sigma_pow               = 0,       # SD of log-space noise on perceived power
@@ -448,6 +474,7 @@ simulate_liquid_democracy <- function(
   else NULL
 
   prev_lost_ids <- integer(0L)   # lay agents whose vote was NA last round
+  prev_lost_set <- logical(n_all)
   prev_target   <- integer(n_all) # who each agent delegated to last round (0 = direct)
 
   # ---------------------------------------------------------
@@ -489,7 +516,7 @@ simulate_liquid_democracy <- function(
       nb <- adj[[i]]
 
       # Between-round fallback: if vote was lost last round, adjust choice
-      if (cycle_fallback != "none" && length(prev_lost_ids) && i %in% prev_lost_ids) {
+      if (cycle_fallback != "none" && prev_lost_set[i]) {
         if (cycle_fallback == "direct") return(i)
         if (cycle_fallback == "redelegate") {
           # exclude the specific delegate that caused the cycle last round
@@ -501,42 +528,33 @@ simulate_liquid_democracy <- function(
         }
       }
 
-      # Perceived values for neighbours (own values always true)
+      # Step 1: vote directly with fixed probability p_self (always direct if no neighbours)
+      if (!length(nb) || runif(1) < p_self) return(i)
+
+      # Step 2: choose neighbour by attractiveness
       op_nb  <- perceive_opinion(op[nb],  sigma_opinion)
       pow_nb <- perceive_power(pow[nb], sigma_pow)
 
-      # Build perceived vectors (only neighbour slots replaced)
-      op_perc  <- replace(op,  nb, op_nb)
-      pow_perc <- replace(pow, nb, pow_nb)
-
-      w_self <- selfweight_fn(i, nb, op_perc, pow_perc, r_op, r_pw)
-
       # Inertia: retain current delegate with probability `inertia`
-      if (inertia > 0 && agents$delegated[i]) {
-        el      <- as_edgelist(delegation_graphs[[max(1, t - 1)]], names = FALSE)
-        matches <- el[el[, 1] == i, 2]
-        if (length(matches) && runif(1) < inertia) return(matches[1])
-      }
+      if (inertia > 0 && prev_target[i] != 0L && runif(1) < inertia) return(prev_target[i])
 
-      w_nb <- if (length(nb))
-        attractiveness_fn(op[i], op_nb, pow[i], pow_nb, r_op, r_pw)
-      else numeric(0)
+      w_nb <- attractiveness_fn(op[i], op_nb, pow[i], pow_nb, r_op, r_pw)
 
       # Trust modifier: A_tilde = A * 2*sigma(gamma*tau); neutral at tau = 0
-      if (trust_active && gamma != 0 && length(nb)) {
+      if (trust_active && gamma != 0) {
         trust_mod <- 2 * .sig(gamma * tau[[i]][as.character(nb)])
         w_nb <- w_nb * trust_mod
       }
 
       # Ingroup modifier: A_tilde *= sigma(r_ingroup * I(g_i == g_j)), I in {-1, +1}
-      if (r_ingroup != 0 && length(nb)) {
+      if (r_ingroup != 0) {
         same_g <- as.integer(agents$group[nb] == agents$group[i]) * 2L - 1L
         w_nb   <- w_nb * .sig(r_ingroup * same_g)
       }
 
-      w <- pmax(c(w_self, w_nb), 0)
+      w <- pmax(w_nb, 0)
       if (sum(w) == 0) w[] <- 1
-      c(i, nb)[sample.int(length(w), 1L, prob = w)]
+      nb[sample.int(length(w), 1L, prob = w)]
     }, integer(1L))
 
     # --------------------------------------------------
@@ -546,17 +564,16 @@ simulate_liquid_democracy <- function(
     edge_from <- lay_ids[mask]
     edge_to   <- targets[mask]
 
-    if (length(edge_from)) {
-      gD <- graph_from_edgelist(cbind(edge_from, edge_to), directed = TRUE)
-      gD <- add_vertices(gD, max(0, n_all - vcount(gD)))
-    } else {
-      gD <- make_empty_graph(n = n_all, directed = TRUE)
-    }
+    gD <- make_empty_graph(n = n_all, directed = TRUE)
+    if (length(edge_from)) gD <- add_edges(gD, as.vector(rbind(edge_from, edge_to)))
     delegation_graphs[[t]] <- gD
 
-    agents$power     <- compute_power(n_all, edge_from, edge_to)
-    agents$my_vote   <- propagate_votes(op, n_all, edge_from, edge_to)
-    agents$delegated <- seq_len(n_all) %in% edge_from
+    pv             <- compute_power_and_votes(op, n_all, edge_from, edge_to)
+    agents$power   <- pv$power
+    agents$my_vote <- pv$votes
+    delegated_vec  <- logical(n_all)
+    if (length(edge_from)) delegated_vec[edge_from] <- TRUE
+    agents$delegated <- delegated_vec
 
     # --------------------------------------------------
     # Trust update: tau_ij(t) = lambda*tau_ij(t-1) - (1-lambda)*|o_i - v_j(t-1)|
@@ -581,22 +598,21 @@ simulate_liquid_democracy <- function(
     history_lost[t]        <- mean(is.na(agents$my_vote))
     history_drift[t]       <- if (nrow(represented) > 0)
       mean(abs(represented$opinion - represented$my_vote)) else NA_real_
-    history_delegation[t]  <- mean(agents$delegated[agents$type == "lay"])
+    history_delegation[t]  <- mean(agents$delegated[lay_ids])
+
+    # Stability: compare prev_target (round t-1) with current edges, before update
+    history_stability[t]   <- if (t > 1) {
+      target_curr <- integer(n_all)
+      target_curr[edge_from] <- edge_to
+      mean(prev_target[lay_ids] == target_curr[lay_ids])
+    } else NA_real_
 
     # Update between-round fallback state for next round
-    prev_lost_ids          <- intersect(which(is.na(agents$my_vote)), lay_ids)
+    prev_lost_ids <- lay_ids[is.na(agents$my_vote[lay_ids])]
+    prev_lost_set <- logical(n_all)
+    prev_lost_set[prev_lost_ids] <- TRUE
     prev_target            <- integer(n_all)
     prev_target[edge_from] <- edge_to
-
-    history_stability[t]   <- if (t > 1) {
-      el_prev     <- as_edgelist(delegation_graphs[[t - 1]], names = FALSE)
-      el_curr     <- as_edgelist(gD, names = FALSE)
-      target_prev <- integer(n_all)
-      target_curr <- integer(n_all)
-      if (nrow(el_prev)) target_prev[el_prev[, 1]] <- el_prev[, 2]
-      if (nrow(el_curr)) target_curr[el_curr[, 1]] <- el_curr[, 2]
-      mean(target_prev[lay_ids] == target_curr[lay_ids])
-    } else NA_real_
 
     # --------------------------------------------------
     # Full snapshot — recorded at 25%, 50%, 75%, 100% of T
@@ -621,25 +637,14 @@ simulate_liquid_democracy <- function(
         gD_active           <- induced_subgraph(gD, active_nodes)
         comps               <- components(gD_active)
         largest_voting_bloc <- max(comps$csize) / n_all
-        total_components    <- comps$no
+        n_isolated          <- n_all - length(active_nodes)
+        total_components    <- comps$no + n_isolated
       } else {
-        largest_voting_bloc <- 0
-        total_components    <- 0
+        largest_voting_bloc <- 1 / n_all
+        total_components    <- n_all
       }
 
-      stab <- if (t > 1) {
-        g_prev      <- delegation_graphs[[t - 1]]
-        el_prev     <- as_edgelist(g_prev, names = FALSE)
-        el_curr     <- as_edgelist(gD,     names = FALSE)
-
-        target_prev <- integer(n_all)
-        target_curr <- integer(n_all)
-
-        if (nrow(el_prev)) target_prev[el_prev[, 1]] <- el_prev[, 2]
-        if (nrow(el_curr)) target_curr[el_curr[, 1]] <- el_curr[, 2]
-
-        mean(target_prev[lay_ids] == target_curr[lay_ids])
-      } else NA_real_
+      stab <- history_stability[t]
 
       rep_power <- represented$power
 

@@ -1,0 +1,1048 @@
+---
+title: "Report 14 -- Systematic Parameter Analysis"
+output: github_document
+date: "2026-06-04"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5)
+library(tidyverse)
+library(here)
+library(furrr)
+library(patchwork)
+library(digest)
+library(knitr)
+
+theme_set(theme_minimal(base_size = 12))
+
+# ── Main sweep parameters ─────────────────────────────────────────────────────
+n_conv        <- c(100L, 200L, 400L, 800L, 1600L, 3200L)
+deg_conv      <- c(6L, 12L, 24L, 48L, 96L)
+r_conv        <- c(0, 1, 2, 4, 8, 16, 32, 64, 128)
+p_self_conv   <- c(0.25,0.5)
+n_seeds_conv  <- 50
+T_conv        <- 20L
+
+# r×r reference point (used to filter main sweep for r_op × r_pw section)
+N_RR   <- 400L
+DEG_RR <- 12L
+
+# ── Trust sweep ───────────────────────────────────────────────────────────────
+lambda_conv   <- 0.5
+gamma_conv    <- c(0, 4, 8, 16, 32, 64, 128, 256)
+r_trust       <- c(0, 4, 8, 16, 32, 64, 128, 256)
+n_trust       <- 400L
+n_seeds_trust <- 50L
+
+# ── Sweep A: diagonal main sweep (r_op = r_pw) ───────────────────────────────
+# Covers: Sections 1, 3, 4 (N-scaling, degree-scaling, saturation, k-sensitivity)
+# 30 valid (N,k) pairs × 9 r × 2 p_self × 50 seeds = 27 000 simulations
+grid_main <- expand_grid(
+  n_agents    = n_conv,
+  node_degree = deg_conv,
+  r_val       = r_conv,
+  p_self      = p_self_conv,
+  seed        = seq_len(n_seeds_conv)
+) |> filter(node_degree < n_agents)   # WS lattice requires degree < N
+
+# ── Sweep B: r×r interaction sweep ───────────────────────────────────────────
+# Covers: Section 2 (r_op × r_pw asymmetry), fixed N = N_RR, k = DEG_RR
+# 9 × 9 × 2 p_self × 50 seeds = 8 100 simulations
+grid_rr <- expand_grid(
+  r_op   = r_conv,
+  r_pw   = r_conv,
+  p_self = p_self_conv,
+  seed   = seq_len(n_seeds_conv)
+)
+
+# ── Metric labels ─────────────────────────────────────────────────────────────
+all_metrics <- c("delegation_rate", "lost_vote_rate", "avg_chain_len",
+                 "avg_ideo_drift", "gini_coef", "top5_share",
+                 "enp", "total_components")
+
+all_metrics_lbl <- c(
+  delegation_rate  = "Delegation Rate",
+  lost_vote_rate   = "Lost Vote Rate",
+  avg_chain_len    = "Avg. Chain Length",
+  avg_ideo_drift   = "Avg. Ideological Drift",
+  gini_coef        = "Gini Coefficient",
+  top5_share       = "Top-5% Power Share",
+  enp              = "ENP (normalised by voters)",
+  total_components = "Components (normalised by N)"
+)
+
+# r_metrics: all metrics except delegation_rate for loops where ylim handling is
+# done separately (delegation_rate gets coord_cartesian(ylim=c(0,1)) to prevent
+# auto-scaling from making ±0.01 Binomial noise look like a real effect).
+r_metrics <- setdiff(all_metrics, "delegation_rate")
+```
+
+## Design
+
+Three cached sweeps:
+
+**Sweep A — diagonal main sweep** (r\_op = r\_pw, Sections 1/3/4):
+
+| Dimension | Values | Levels |
+|-----------|--------|--------|
+| N (agents) | 100, 200, 400, 800, 1600, 3200 | 6 (doubling) |
+| node\_degree *k* | 6, 12, 24, 48, 96 | 5 (doubling) |
+| r\_op = r\_pw | 0, 1, 2, 4, 8, 16, 32, 64, 128 | 9 (doubling) |
+| p\_self | 0.5, 0.25 | 2 |
+| λ, γ | 0 | fixed (trust off) |
+| Seeds | `r n_seeds_conv` per cell | |
+| T | `r T_conv` rounds | |
+| **Total** | **`r nrow(grid_main)` simulations** | |
+
+**Sweep B — r\_op × r\_pw interaction sweep** (Section 2, N = `r N_RR`, k = `r DEG_RR`):
+
+| Dimension | Values | Levels |
+|-----------|--------|--------|
+| r\_op | 0, 1, 2, 4, 8, 16, 32, 64, 128 | 9 |
+| r\_pw | 0, 1, 2, 4, 8, 16, 32, 64, 128 | 9 |
+| p\_self | 0.5, 0.25 | 2 |
+| Seeds | `r n_seeds_conv` per cell | |
+| **Total** | **`r nrow(grid_rr)` simulations** | |
+
+**Trust sweep** — γ sensitivity (N = `r n_trust`, k = 6, λ = `r lambda_conv` fixed):
+
+| Dimension | Values | Levels |
+|-----------|--------|--------|
+| γ | 0, 4, 8, 16, 32, 64, 128, 256 | 8 |
+| r\_op = r\_pw | 0, 4, 8, 16, 32, 64, 128, 256 | 8 |
+| Seeds | `r n_seeds_trust` per cell | |
+
+All metrics averaged over the final 5 rounds.
+ENP normalised by $n_\text{voters}$; Total Components by $N$.
+
+```{r main-sweep, include=FALSE}
+source(here::here("scripts/Network.R"))
+
+sim_params_main <- list(n = n_conv, deg = deg_conv, r = r_conv,
+                        p_self = p_self_conv,
+                        seeds = n_seeds_conv, T = T_conv,
+                        version = 1L)
+hash_main  <- digest::digest(sim_params_main)
+cache_main <- here::here("data/sim_main15_cache.rds")
+
+if (file.exists(cache_main)) {
+  cm <- readRDS(cache_main)
+  if (identical(cm$hash, hash_main)) {
+    sim_main_raw <- cm$data; t_main <- cm$elapsed
+    message("Main sweep cache hit.")
+  } else { cm <- NULL }
+} else { cm <- NULL }
+
+if (is.null(cm)) {
+  dir.create(here::here("data"), showWarnings = FALSE)
+  plan(multisession, workers = parallel::detectCores() - 1)
+  t0 <- proc.time()
+  sim_main_raw <- future_pmap_dfr(
+    grid_main,
+    function(n_agents, node_degree, r_val, p_self, seed) {
+      res   <- simulate_liquid_democracy(
+        seed            = seed,
+        n_per_community = n_agents,
+        n_communities   = 1,
+        node_degree     = node_degree,
+        T               = T_conv,
+        r_op            = r_val,
+        r_pw            = r_val,
+        p_self          = p_self)
+      snaps <- tail(res$snapshots, 5)
+      ag    <- res$agents
+      tibble(
+        n_agents         = n_agents,
+        node_degree      = node_degree,
+        r_val            = r_val,
+        p_self           = p_self,
+        seed             = seed,
+        delegation_rate  = mean(tail(res$history_delegation, 5), na.rm = TRUE),
+        lost_vote_rate   = mean(tail(res$history_lost,       5), na.rm = TRUE),
+        avg_ideo_drift   = mean(tail(res$history_drift,      5), na.rm = TRUE),
+        gini_coef        = mean(snaps$gini_power,                    na.rm = TRUE),
+        avg_chain_len    = mean(snaps$avg_chain_length_delegators,   na.rm = TRUE),
+        top5_share       = mean(snaps$top5_power_share,              na.rm = TRUE),
+        n_voters         = sum(!is.na(ag$my_vote)),
+        enp              = { p <- ag$power[!is.na(ag$my_vote)]
+                             if (!length(p) || sum(p) == 0) NA_real_
+                             else 1 / sum((p / sum(p))^2) },
+        total_components = mean(snaps$total_components,              na.rm = TRUE),
+        ts_delegation    = list(res$history_delegation),
+        ts_lost          = list(res$history_lost),
+        ts_drift         = list(res$history_drift),
+        ts_gini          = list(res$snapshots$gini_power),
+        ts_chain         = list(res$snapshots$avg_chain_length_delegators),
+        ts_top5          = list(res$snapshots$top5_power_share),
+        ts_components    = list(res$snapshots$total_components)
+      )
+    },
+    .options = furrr_options(seed = NULL)
+  )
+  plan(sequential)
+  t_main <- proc.time() - t0
+  saveRDS(list(hash = hash_main, data = sim_main_raw, elapsed = t_main), cache_main)
+  message("Main sweep complete.")
+}
+
+# Snapshot rounds at which total_components is recorded (25/50/75/100% of T)
+snap_idx <- unique(round(c(0.25, 0.50, 0.75, 1.00) * T_conv))   # c(5,10,15,20)
+
+df_main <- sim_main_raw |>
+  filter(!is.na(avg_chain_len)) |>
+  mutate(
+    enp              = enp / n_voters,
+    total_components = total_components / n_agents,
+    # Re-align delegation_rate to the same snapshot rounds as total_components.
+    # Raw delegation_rate used rounds 16-20; total_components used rounds 5,10,15,20.
+    # Both now averaged over rounds 5,10,15,20 so the structural identity holds.
+    delegation_rate  = map_dbl(ts_delegation,
+                               \(h) mean(h[snap_idx], na.rm = TRUE))
+  )
+```
+
+```{r rr-sweep, include=FALSE}
+sim_params_rr <- list(r_op = r_conv, r_pw = r_conv,
+                      p_self = p_self_conv,
+                      n = N_RR, deg = DEG_RR,
+                      seeds = n_seeds_conv, T = T_conv,
+                      version = 1L)
+hash_rr  <- digest::digest(sim_params_rr)
+cache_rr <- here::here("data/sim_rr15_cache.rds")
+
+if (file.exists(cache_rr)) {
+  cr <- readRDS(cache_rr)
+  if (identical(cr$hash, hash_rr)) {
+    sim_rr_raw <- cr$data; t_rr <- cr$elapsed
+    message("r×r sweep cache hit.")
+  } else { cr <- NULL }
+} else { cr <- NULL }
+
+if (is.null(cr)) {
+  plan(multisession, workers = parallel::detectCores() - 1)
+  t0 <- proc.time()
+  sim_rr_raw <- future_pmap_dfr(
+    grid_rr,
+    function(r_op, r_pw, p_self, seed) {
+      res   <- simulate_liquid_democracy(
+        seed            = seed,
+        n_per_community = N_RR,
+        n_communities   = 1,
+        node_degree     = DEG_RR,
+        T               = T_conv,
+        r_op            = r_op,
+        r_pw            = r_pw,
+        p_self          = p_self)
+      snaps <- tail(res$snapshots, 5)
+      ag    <- res$agents
+      tibble(
+        r_op             = r_op,
+        r_pw             = r_pw,
+        p_self           = p_self,
+        seed             = seed,
+        delegation_rate  = mean(tail(res$history_delegation, 5), na.rm = TRUE),
+        lost_vote_rate   = mean(tail(res$history_lost,       5), na.rm = TRUE),
+        avg_ideo_drift   = mean(tail(res$history_drift,      5), na.rm = TRUE),
+        gini_coef        = mean(snaps$gini_power,                    na.rm = TRUE),
+        avg_chain_len    = mean(snaps$avg_chain_length_delegators,   na.rm = TRUE),
+        top5_share       = mean(snaps$top5_power_share,              na.rm = TRUE),
+        n_voters         = sum(!is.na(ag$my_vote)),
+        enp              = { p <- ag$power[!is.na(ag$my_vote)]
+                             if (!length(p) || sum(p) == 0) NA_real_
+                             else 1 / sum((p / sum(p))^2) },
+        total_components = mean(snaps$total_components,              na.rm = TRUE)
+      )
+    },
+    .options = furrr_options(seed = NULL)
+  )
+  plan(sequential)
+  t_rr <- proc.time() - t0
+  saveRDS(list(hash = hash_rr, data = sim_rr_raw, elapsed = t_rr), cache_rr)
+  message("r×r sweep complete.")
+}
+
+df_rr <- sim_rr_raw |>
+  filter(!is.na(avg_chain_len)) |>
+  mutate(
+    enp              = enp / n_voters,
+    total_components = total_components / N_RR
+  )
+```
+
+```{r trust-sweep, include=FALSE}
+grid_trust <- expand_grid(
+  lambda = lambda_conv,
+  gamma  = gamma_conv,
+  r_val  = r_trust,
+  seed   = seq_len(n_seeds_trust)
+)
+
+sim_params_trust <- list(lambda = lambda_conv, gamma = gamma_conv, r = r_trust,
+                         n = n_trust, deg = 6L,
+                         seeds = n_seeds_trust, T = T_conv,
+                         p_self = 0.5, version = 2L)  # r extended to 64
+hash_trust  <- digest::digest(sim_params_trust)
+cache_trust <- here::here("data/sim_trust15_cache.rds")
+
+if (file.exists(cache_trust)) {
+  ct <- readRDS(cache_trust)
+  if (identical(ct$hash, hash_trust)) {
+    sim_trust_raw <- ct$data; t_trust <- ct$elapsed
+    message("Trust-sweep cache hit.")
+  } else { ct <- NULL }
+} else { ct <- NULL }
+
+if (is.null(ct)) {
+  plan(multisession, workers = parallel::detectCores() - 1)
+  t0 <- proc.time()
+  sim_trust_raw <- future_pmap_dfr(
+    grid_trust,
+    function(lambda, gamma, r_val, seed) {
+      res   <- simulate_liquid_democracy(
+        seed            = seed,
+        n_per_community = n_trust,
+        n_communities   = 1,
+        node_degree     = 6L,
+        T               = T_conv,
+        r_op            = r_val,
+        r_pw            = r_val,
+        p_self          = 0.5,
+        lambda          = lambda,
+        gamma           = gamma)
+      snaps <- tail(res$snapshots, 5)
+      ag    <- res$agents
+      tibble(
+        lambda           = lambda,
+        gamma            = gamma,
+        r_val            = r_val,
+        seed             = seed,
+        delegation_rate  = mean(tail(res$history_delegation, 5), na.rm = TRUE),
+        lost_vote_rate   = mean(tail(res$history_lost,       5), na.rm = TRUE),
+        avg_ideo_drift   = mean(tail(res$history_drift,      5), na.rm = TRUE),
+        gini_coef        = mean(snaps$gini_power,                    na.rm = TRUE),
+        avg_chain_len    = mean(snaps$avg_chain_length_delegators,   na.rm = TRUE),
+        top5_share       = mean(snaps$top5_power_share,              na.rm = TRUE),
+        n_voters         = sum(!is.na(ag$my_vote)),
+        enp              = { p <- ag$power[!is.na(ag$my_vote)]
+                             if (!length(p) || sum(p) == 0) NA_real_
+                             else 1 / sum((p / sum(p))^2) },
+        total_components = mean(snaps$total_components,              na.rm = TRUE),
+        ts_delegation    = list(res$history_delegation),
+        ts_lost          = list(res$history_lost),
+        ts_drift         = list(res$history_drift)
+      )
+    },
+    .options = furrr_options(seed = NULL)
+  )
+  plan(sequential)
+  t_trust <- proc.time() - t0
+  saveRDS(list(hash = hash_trust, data = sim_trust_raw, elapsed = t_trust), cache_trust)
+  message("Trust sweep complete.")
+}
+
+df_trust <- sim_trust_raw |>
+  filter(!is.na(avg_chain_len)) |>
+  mutate(
+    enp              = enp / n_voters,
+    total_components = total_components / n_trust
+  )
+```
+
+```{r sweep-summary, include=TRUE}
+secs_m <- as.numeric(t_main["elapsed"])
+secs_r <- as.numeric(t_rr["elapsed"])
+secs_t <- as.numeric(t_trust["elapsed"])
+n_combos_m <- nrow(distinct(select(grid_main, n_agents, node_degree, r_val, p_self)))
+n_combos_r <- nrow(distinct(select(grid_rr, r_op, r_pw, p_self)))
+n_combos_t <- nrow(distinct(select(grid_trust, lambda, gamma, r_val)))
+cat(sprintf(
+  "Main sweep (diagonal):  %d min %04.1f sec  |  %d param combinations  |  %d simulations\n",
+  floor(secs_m / 60), secs_m %% 60, n_combos_m, nrow(sim_main_raw)
+))
+cat(sprintf(
+  "r×r sweep:              %d min %04.1f sec  |  %d param combinations  |  %d simulations\n",
+  floor(secs_r / 60), secs_r %% 60, n_combos_r, nrow(sim_rr_raw)
+))
+cat(sprintf(
+  "Trust sweep:            %d min %04.1f sec  |  %d param combinations  |  %d simulations\n",
+  floor(secs_t / 60), secs_t %% 60, n_combos_t, nrow(sim_trust_raw)
+))
+```
+
+---
+
+# 1  Convergence over Time
+
+Fixed: k = 6, r\_op = r\_pw = 1. Each line = mean over `r n_seeds_conv` seeds; colour = N.
+
+**`delegation_rate` in this plot:** the round-to-round variation is **not** convergence dynamics —
+it is Binomial sampling noise (each round is an independent Bernoulli draw per agent).
+Variance ≈ p(1−p)/N, so larger N → flatter line. There is no systematic drift; the expected
+value is always p\_self = 0.5 from round 1.
+
+```{r ts-unnest, include=FALSE}
+# Convention: new_name = "old_col" (matches dplyr::rename expectation)
+# history_* vectors: one value per round (length = T_conv = 20)
+ts_hist_map <- c(delegation_rate = "ts_delegation",
+                 lost_vote_rate  = "ts_lost",
+                 avg_ideo_drift  = "ts_drift")
+
+# snapshot columns: one value per snapshot interval (length = T_conv / snapshot_interval)
+ts_snap_map <- c(gini_coef        = "ts_gini",
+                 avg_chain_len    = "ts_chain",
+                 top5_share       = "ts_top5",
+                 total_components = "ts_components")
+
+ts_col_map <- c(ts_hist_map, ts_snap_map)   # for T-sufficiency reuse
+
+make_n_label <- function(df)
+  mutate(df, n_label = factor(paste0("N = ", formatC(n_agents, big.mark = ",")),
+                              levels = paste0("N = ", formatC(sort(n_conv), big.mark = ","))))
+
+ts_base <- df_main |> filter(node_degree == 6, r_val == 1, p_self == 0.5)
+snap_interval <- T_conv / length(df_main$ts_gini[[1]])
+
+ts_hist_mean <- ts_base |>
+  select(n_agents, seed, all_of(unname(ts_hist_map))) |>
+  mutate(round = map(ts_delegation, seq_along)) |>
+  unnest(c(round, all_of(unname(ts_hist_map)))) |>
+  rename(all_of(ts_hist_map)) |>
+  group_by(n_agents, round) |>
+  summarise(across(all_of(names(ts_hist_map)), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |>
+  make_n_label()
+
+ts_snap_mean <- ts_base |>
+  select(n_agents, seed, all_of(unname(ts_snap_map))) |>
+  mutate(round = map(ts_gini, \(x) seq_along(x) * (T_conv / length(x)))) |>
+  unnest(c(round, all_of(unname(ts_snap_map)))) |>
+  rename(all_of(ts_snap_map)) |>
+  group_by(n_agents, round) |>
+  summarise(across(all_of(names(ts_snap_map)), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |>
+  mutate(total_components = total_components / n_agents) |>
+  make_n_label()
+```
+
+```{r ts-plot, fig.width=14, fig.height=10}
+make_ts_plot <- function(df, y, x_lab = "Round") {
+  lbl <- all_metrics_lbl[y]
+  p <- ggplot(df, aes(round, .data[[y]], colour = n_label, group = n_label)) +
+    geom_line(linewidth = 0.85) +
+    geom_point(size = 1.5) +
+    scale_colour_viridis_d(name = "N") +
+    scale_x_continuous(breaks = seq(0, T_conv, by = 5)) +
+    labs(title = lbl, x = x_lab, y = NULL) +
+    theme(legend.position = "right")
+  if (y == "delegation_rate") p <- p + coord_cartesian(ylim = c(0, 1))
+  p
+}
+
+ts_plots <- c(
+  purrr::map(names(ts_hist_map), \(y) make_ts_plot(ts_hist_mean, y)),
+  purrr::map(names(ts_snap_map), \(y) make_ts_plot(ts_snap_mean, y,
+                                                    x_lab = "Round (snapshot)"))
+)
+
+wrap_plots(ts_plots, ncol = 4) +
+  plot_annotation(
+    title    = "Convergence over rounds  (k = 6, r = 1, p_self = 0.5)",
+    subtitle = paste0("Mean over ", n_seeds_conv,
+                      " seeds | Colour = N | Snapshot metrics sampled every ",
+                      snap_interval, " rounds")
+  )
+```
+-The round-to-round variance across the time series decreases noticeably as $N$ increases. Rather than reflecting distinct convergence dynamics, this stabilization is driven by the law of large numbers: larger agent populations effectively average out individual binomial sampling noise.
+## Variation over k  (N = 400, r = 1)
+
+
+```{r ts-k-check, fig.width=14, fig.height=10}
+make_k_label <- function(df)
+  mutate(df, k_label = factor(paste0("k = ", node_degree),
+                              levels = paste0("k = ", deg_conv[deg_conv < 400L])))
+
+tk_base <- df_main |> filter(r_val == 1, p_self == 0.5, n_agents == 400L)
+
+ts_k_hist_mean <- tk_base |>
+  select(node_degree, seed, all_of(unname(ts_hist_map))) |>
+  mutate(round = map(ts_delegation, seq_along)) |>
+  unnest(c(round, all_of(unname(ts_hist_map)))) |>
+  rename(all_of(ts_hist_map)) |>
+  group_by(node_degree, round) |>
+  summarise(across(all_of(names(ts_hist_map)), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |>
+  make_k_label()
+
+ts_k_snap_mean <- tk_base |>
+  select(node_degree, seed, all_of(unname(ts_snap_map))) |>
+  mutate(round = map(ts_gini, \(x) seq_along(x) * (T_conv / length(x)))) |>
+  unnest(c(round, all_of(unname(ts_snap_map)))) |>
+  rename(all_of(ts_snap_map)) |>
+  group_by(node_degree, round) |>
+  summarise(across(all_of(names(ts_snap_map)), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |>
+  mutate(total_components = total_components / 400L) |>
+  make_k_label()
+
+make_tk_plot <- function(df, y, x_lab = "Round") {
+  lbl <- all_metrics_lbl[y]
+  p <- ggplot(df, aes(round, .data[[y]], colour = k_label, group = k_label)) +
+    geom_line(linewidth = 0.85) +
+    geom_point(size = 1.5) +
+    scale_colour_viridis_d(name = "k") +
+    scale_x_continuous(breaks = seq(0, T_conv, by = 5)) +
+    labs(title = lbl, x = x_lab, y = NULL) +
+    theme(legend.position = "right")
+  if (y == "delegation_rate") p <- p + coord_cartesian(ylim = c(0, 1))
+  p
+}
+
+ts_k_plots <- c(
+  purrr::map(names(ts_hist_map), \(y) make_tk_plot(ts_k_hist_mean, y)),
+  purrr::map(names(ts_snap_map), \(y) make_tk_plot(ts_k_snap_mean, y,
+                                                    x_lab = "Round (snapshot)"))
+)
+
+wrap_plots(ts_k_plots, ncol = 4) +
+  plot_annotation(
+    title    = "T-Sufficiency: convergence over k  (N = 400, r = 1, p_self = 0.5)",
+    subtitle = paste0("Mean over ", n_seeds_conv,
+                      " seeds | Colour = k | Snapshot metrics every ", snap_interval, " rounds")
+  )
+```
+
+## Structural Identity Check: delegation\_rate + components/N ≥ 1
+
+**`delegation_rate`** is the share of lay agents who have an outgoing edge in the delegation
+graph in a given round — i.e. they chose to delegate rather than vote directly.
+
+**`total_components`** counts the number of weakly connected components in the same
+delegation graph (active subgraph plus isolated nodes). Each isolated direct voter is its
+own component; each delegation tree (a direct voter at the root with delegators below) is
+one component; and each delegation *cycle* — a closed loop where all members delegate and
+no one votes directly — also forms its own component.
+
+The sum $\text{delegation\_rate} + \text{components}/N \geq 1$ because every direct voter
+anchors exactly one component, so components $\geq N \times (1 - \text{delegation\_rate})$.
+Values above 1 arise whenever delegation cycles are present: a cycle contributes one
+component without containing any direct voter, pushing the sum above 1 by exactly
+$K/N$ where $K$ is the number of cycles.
+
+**Variante A** (standard delegation rate) yields the diagnostic identity:
+
+$$\text{delegation\_rate} + \frac{\text{components}}{N} = 1 + \frac{K}{N}$$
+
+where $K \geq 0$ is the number of delegation cycles. In  graphs without cycles ($K = 0$) the
+equality holds exactly; any deviation above 1 quantifies cycle density.
+
+**Variante B** (effective delegation rate) counts only agents whose delegation chain
+eventually reaches a direct voter — cycle members are excluded:
+
+$$b := \text{eff\_delegation\_rate} = \frac{\#\{\text{Agents who reach a direct voter}\}}{N} = 1 - \frac{\text{components}}{N}$$
+
+This definition restores a strict identity regardless of cycles:
+
+$$b + \frac{\text{components}}{N} = 1$$
+
+```{r identity-check, fig.width=9, fig.height=4}
+id_check <- df_main |>
+  mutate(identity_sum        = delegation_rate + total_components,
+         deviation           = identity_sum - 1,   # should be >= 0
+         has_cycles          = deviation > 1e-6,
+         eff_delegation_rate = 1 - total_components)
+
+id_summary <- id_check |>
+  summarise(
+    Mean        = round(mean(identity_sum,  na.rm = TRUE), 6),
+    SD          = round(sd(identity_sum,    na.rm = TRUE), 6),
+    Min         = round(min(identity_sum,   na.rm = TRUE), 6),
+    Max         = round(max(identity_sum,   na.rm = TRUE), 6),
+    `Pct >= 1`  = round(mean(identity_sum >= 1 - 1e-9, na.rm = TRUE) * 100, 2),
+    `Pct cycles`= round(mean(has_cycles,    na.rm = TRUE) * 100, 2)
+  )
+
+kable(id_summary,
+      caption = paste0(
+        "Variante A: delegation_rate + components/N (expected >= 1; excess = K/N = cycles/N). ",
+        "Both metrics averaged over snapshot rounds 5,10,15,20."))
+
+# Variante B: eff_delegation_rate = 1 - components/N  →  b + components/N = 1 always
+id_summary_b <- id_check |>
+  summarise(
+    Mean        = round(mean(eff_delegation_rate,                        na.rm = TRUE), 4),
+    SD          = round(sd(eff_delegation_rate,                          na.rm = TRUE), 4),
+    Min         = round(min(eff_delegation_rate,                         na.rm = TRUE), 4),
+    Max         = round(max(eff_delegation_rate,                         na.rm = TRUE), 4),
+    `Mean (b + comp/N)` = round(mean(eff_delegation_rate + total_components, na.rm = TRUE), 8),
+    `Max |dev from 1|`  = round(max(abs(eff_delegation_rate + total_components - 1), na.rm = TRUE), 10)
+  )
+
+kable(id_summary_b,
+      caption = paste0(
+        "Variante B: eff_delegation_rate = 1 − components/N. ",
+        "The sum b + components/N = 1 by construction (last two columns verify floating-point precision). ",
+        "Metrics averaged over snapshot rounds 5,10,15,20."))
+
+ggplot(id_check, aes(deviation)) +
+  geom_histogram(bins = 60, fill = "steelblue", colour = "white", linewidth = 0.2) +
+  geom_vline(xintercept = 0, colour = "red", linetype = "dashed") +
+  labs(title = "Distribution of (delegation_rate + components/N) − 1",
+       subtitle = paste0("n = ", nrow(id_check),
+                         " simulations | red = min (0) | excess above 0 = cycles/N"),
+       x = "Excess above 1  (= cycles / N)", y = "Count")
+```
+
+---
+
+# 2  r\_op × r\_pw Interaction  (N = 400, k = 12, p\_self = 0.5)
+
+Source: main sweep filtered to N = `r N_RR`, k = `r DEG_RR`, p\_self = 0.5.
+Each cell averaged over `r n_seeds_conv` seeds.
+
+**Note on `delegation_rate`:** its y-axis is fixed to [0, 1] in all panels below.
+The Bernoulli draw is independent of r\_op and r\_pw, so all lines sit at ≈ p\_self = 0.5.
+The [0, 1] scale prevents auto-scaling from making Binomial sampling noise (±0.01) look like a real effect.
+
+```{r rr-prep, include=FALSE}
+rr_agg <- df_rr |>
+  filter(p_self == 0.5) |>
+  group_by(r_op, r_pw) |>
+  summarise(across(all_of(all_metrics), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |>
+  mutate(r_op_f = factor(r_op), r_pw_f = factor(r_pw))
+```
+
+```{r rr-paired, fig.width=14, fig.height=32}
+rr_pair_rows <- purrr::map(all_metrics, function(y) {
+  lbl <- all_metrics_lbl[y]
+
+  p_rop <- ggplot(rr_agg, aes(r_op, .data[[y]], colour = r_pw_f, group = r_pw_f)) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 2.2) +
+    scale_colour_viridis_d(name = "r_pw") +
+    scale_x_continuous(breaks = r_conv) +
+    labs(title = paste0(lbl, "  —  r_op on x"), x = "r_op", y = lbl) +
+    theme(legend.position = "right")
+
+  p_rpw <- ggplot(rr_agg, aes(r_pw, .data[[y]], colour = r_op_f, group = r_op_f)) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 2.2) +
+    scale_colour_viridis_d(name = "r_op") +
+    scale_x_continuous(breaks = r_conv) +
+    labs(title = paste0(lbl, "  —  r_pw on x"), x = "r_pw", y = lbl) +
+    theme(legend.position = "right")
+
+  if (y == "delegation_rate") {
+    p_rop <- p_rop + coord_cartesian(ylim = c(0, 1))
+    p_rpw <- p_rpw + coord_cartesian(ylim = c(0, 1))
+  }
+
+  p_rop + p_rpw
+})
+
+wrap_plots(rr_pair_rows, ncol = 1) +
+  plot_annotation(
+    title    = "r_op × r_pw interaction  (N = 400, k = 12)",
+    subtitle = paste0("Each point = mean over ", n_seeds_conv,
+                      " seeds | Left: r_op on x, r_pw as lines  |  Right: r_pw on x, r_op as lines")
+  )
+```
+
+## Marginal Effects of r on the Diagonal  (r\_op = r\_pw, N = 400, k = 12, p\_self = 0.5)
+
+**Table 1** — absolute mean metric values at each r level.
+**Table 2** — relative change vs. the previous r level: $(y_i - y_{i-1})\,/\,|y_{i-1}|$.
+Values near 0% indicate saturation.
+
+```{r rr-saturation}
+sat_rr_base <- df_rr |>
+  filter(r_op == r_pw, p_self == 0.5) |>
+  group_by(r_op) |>
+  summarise(across(all_of(all_metrics), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |>
+  arrange(r_op)
+
+# Table 1: absolute values
+sat_rr_abs <- sat_rr_base |>
+  mutate(across(all_of(all_metrics), \(x) round(x, 4)),
+         r = as.character(r_op)) |>
+  select(r, all_of(all_metrics))
+colnames(sat_rr_abs) <- c("r", all_metrics_lbl[all_metrics])
+
+kable(sat_rr_abs,
+      caption = "Absolute metric values per r level (diagonal r_op = r_pw, N = 400, k = 12, p_self = 0.5).",
+      align   = c("l", rep("r", length(all_metrics))))
+
+# Table 2: relative change %
+fmt_pct <- function(x) ifelse(is.na(x), "—", sprintf("%+.1f%%", x))
+
+sat_rr_rel <- purrr::map_dfr(seq_len(nrow(sat_rr_base) - 1), function(i) {
+  prev <- unlist(sat_rr_base[i,     all_metrics])
+  curr <- unlist(sat_rr_base[i + 1, all_metrics])
+  rel  <- ifelse(abs(prev) < 1e-9, NA_real_, (curr - prev) / abs(prev) * 100)
+  as_tibble_row(c(
+    list(`r-Step` = paste0(sat_rr_base$r_op[i], " → ", sat_rr_base$r_op[i + 1])),
+    setNames(as.list(fmt_pct(rel)), all_metrics)
+  ))
+})
+colnames(sat_rr_rel) <- c("r-Step", all_metrics_lbl[all_metrics])
+
+kable(sat_rr_rel,
+      caption = "Relative change per r-step on the diagonal (r_op = r_pw, N = 400, k = 12, p_self = 0.5).",
+      align   = c("l", rep("r", length(all_metrics))))
+```
+
+---
+
+# 3  N-Scaling  (r\_op = r\_pw = 1, p\_self = 0.5, k as lines)
+
+Source: main sweep filtered to diagonal r = 1, p\_self = 0.5. All k levels shown.
+x-axis log-scaled (doublings). `delegation_rate` y-axis fixed to [0, 1] — all lines sit at ≈ p\_self.
+
+```{r n-scale-all, fig.width=14, fig.height=22}
+n_scale_df <- df_main |>
+  filter(r_val == 1, p_self == 0.5) |>
+  group_by(n_agents, node_degree) |>
+  summarise(across(all_of(all_metrics), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |>
+  mutate(k_label = factor(paste0("k = ", node_degree),
+                          levels = paste0("k = ", deg_conv)))
+
+n_plots <- purrr::map(all_metrics, function(y) {
+  lbl <- all_metrics_lbl[y]
+  p <- ggplot(n_scale_df, aes(n_agents, .data[[y]], colour = k_label, group = k_label)) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 2.2) +
+    scale_x_log10(breaks = n_conv, labels = scales::comma) +
+    scale_colour_viridis_d(name = "k") +
+    labs(title = lbl, x = "N (log₂ scale)", y = lbl) +
+    theme(legend.position = "right",
+          axis.text.x = element_text(angle = 35, hjust = 1))
+  if (y == "delegation_rate") p <- p + coord_cartesian(ylim = c(0, 1))
+  p
+})
+
+wrap_plots(n_plots, ncol = 2) +
+  plot_annotation(
+    title    = "All metrics vs N  (r = 1, k as lines)",
+    subtitle = paste0("Each point = mean over ", n_seeds_conv,
+                      " seeds | Metrics averaged over final 5 rounds | delegation_rate y-axis fixed [0,1]")
+  )
+```
+
+- N has a relatively small effects on (almost) all metrics while K has a very strong effect.
+
+## Network Density k/N  (r = 1)
+
+Do outcomes scale with relative degree k/N or with absolute k?
+If density were the sole driver, points at the same x-position (same k/N) but different N
+would overlap. The doubling structure of both k and N creates many exact density matches
+across network sizes — e.g. (k=6, N=100), (k=12, N=200), (k=24, N=400) all share k/N = 6 %.
+Lines connect same-N points; colour = N.
+
+Lines do **not** overlap across N levels, indicating that **N exerts an independent effect
+beyond network density**: larger networks produce longer delegation chains and higher power
+concentration even when each agent has the same share of direct neighbours.
+
+```{r density-plot, fig.width=14, fig.height=20}
+density_df <- df_main |>
+  filter(r_val == 1, p_self == 0.5) |>
+  group_by(n_agents, node_degree) |>
+  summarise(across(all_of(r_metrics), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |>
+  mutate(
+    density = node_degree / n_agents,
+    n_label = factor(formatC(n_agents, big.mark = ","),
+                     levels = formatC(n_conv, big.mark = ","))
+  )
+
+dens_plots <- purrr::map(r_metrics, function(y) {
+  lbl <- all_metrics_lbl[y]
+  ggplot(density_df, aes(density, .data[[y]], colour = n_label, group = n_label)) +
+    geom_line(linewidth = 0.8, linetype = "dashed") +
+    geom_point(size = 2.5) +
+    scale_x_log10(labels = scales::percent_format(accuracy = 0.1)) +
+    scale_colour_viridis_d(name = "N") +
+    labs(title = lbl, x = "k / N  (log scale)", y = lbl) +
+    theme(legend.position = "right")
+})
+
+wrap_plots(dens_plots, ncol = 2) +
+  plot_annotation(
+    title    = "Metrics vs network density k/N  (r = 1)",
+    subtitle = "Dashed lines connect same N | Colour = N | Overlap would indicate density-driven behaviour"
+  )
+```
+
+---
+
+```{r deg-ext-sweep, include=FALSE}
+# Minimal extension sweep: N = 400, k in {192, 384, 398}, p_self = 0.5 only.
+# k = 398 is the largest even value below N = 400 (near-complete graph).
+deg_ext_k <- c(192L, 400L)
+
+grid_deg_ext <- expand_grid(
+  n_agents    = 400L,
+  node_degree = deg_ext_k,
+  r_val       = r_conv,
+  p_self      = 0.5,
+  seed        = seq_len(n_seeds_conv)
+)
+
+sim_params_deg_ext <- list(n = 400L, deg = deg_ext_k, r = r_conv,
+                           p_self = 0.5, seeds = n_seeds_conv, T = T_conv,
+                           version = 1L)
+hash_deg_ext  <- digest::digest(sim_params_deg_ext)
+cache_deg_ext <- here::here("data/sim_deg_ext_cache.rds")
+
+if (file.exists(cache_deg_ext)) {
+  cx <- readRDS(cache_deg_ext)
+  if (identical(cx$hash, hash_deg_ext)) {
+    sim_deg_ext_raw <- cx$data
+    message("Deg-ext sweep cache hit.")
+  } else { cx <- NULL }
+} else { cx <- NULL }
+
+if (is.null(cx)) {
+  dir.create(here::here("data"), showWarnings = FALSE)
+  plan(multisession, workers = parallel::detectCores() - 1)
+  t0 <- proc.time()
+  sim_deg_ext_raw <- future_pmap_dfr(
+    grid_deg_ext,
+    function(n_agents, node_degree, r_val, p_self, seed) {
+      res   <- simulate_liquid_democracy(
+        seed            = seed,
+        n_per_community = n_agents,
+        n_communities   = 1,
+        node_degree     = node_degree,
+        T               = T_conv,
+        r_op            = r_val,
+        r_pw            = r_val,
+        p_self          = p_self)
+      snaps <- tail(res$snapshots, 5)
+      ag    <- res$agents
+      tibble(
+        n_agents         = n_agents,
+        node_degree      = node_degree,
+        r_val            = r_val,
+        p_self           = p_self,
+        seed             = seed,
+        delegation_rate  = mean(tail(res$history_delegation, 5), na.rm = TRUE),
+        lost_vote_rate   = mean(tail(res$history_lost,       5), na.rm = TRUE),
+        avg_ideo_drift   = mean(tail(res$history_drift,      5), na.rm = TRUE),
+        gini_coef        = mean(snaps$gini_power,                    na.rm = TRUE),
+        avg_chain_len    = mean(snaps$avg_chain_length_delegators,   na.rm = TRUE),
+        top5_share       = mean(snaps$top5_power_share,              na.rm = TRUE),
+        n_voters         = sum(!is.na(ag$my_vote)),
+        enp              = { p <- ag$power[!is.na(ag$my_vote)]
+                             if (!length(p) || sum(p) == 0) NA_real_
+                             else 1 / sum((p / sum(p))^2) },
+        total_components = mean(snaps$total_components,              na.rm = TRUE),
+        ts_delegation    = list(res$history_delegation),
+        ts_lost          = list(res$history_lost),
+        ts_drift         = list(res$history_drift),
+        ts_gini          = list(res$snapshots$gini_power),
+        ts_chain         = list(res$snapshots$avg_chain_length_delegators),
+        ts_top5          = list(res$snapshots$top5_power_share),
+        ts_components    = list(res$snapshots$total_components)
+      )
+    },
+    .options = furrr_options(seed = NULL)
+  )
+  plan(sequential)
+  saveRDS(list(hash = hash_deg_ext, data = sim_deg_ext_raw), cache_deg_ext)
+  message("Deg-ext sweep complete.")
+}
+
+df_deg_ext <- sim_deg_ext_raw |>
+  filter(!is.na(avg_chain_len)) |>
+  mutate(
+    enp              = enp / n_voters,
+    total_components = total_components / n_agents,
+    delegation_rate  = map_dbl(ts_delegation, \(h) mean(h[snap_idx], na.rm = TRUE))
+  )
+```
+
+# 4  Degree-Scaling  (N = 400, p\_self = 0.5, r as lines)
+
+Fixed: N = 400, p\_self = 0.5. Lines = diagonal r levels (r\_op = r\_pw). x-axis log-scaled.
+`delegation_rate` y-axis fixed to [0, 1].
+
+```{r deg-scale-all, fig.width=14, fig.height=22}
+deg_scale_df <- bind_rows(
+  df_main   |> filter(n_agents == 400L, p_self == 0.5),
+  df_deg_ext
+) |>
+  group_by(node_degree, r_val) |>
+  summarise(across(all_of(all_metrics), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
+
+deg_plots <- purrr::map(all_metrics, function(y) {
+  lbl <- all_metrics_lbl[y]
+  p <- ggplot(deg_scale_df, aes(node_degree, .data[[y]],
+                           colour = factor(r_val), group = factor(r_val))) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 2.2) +
+    scale_x_log10(breaks = sort(c(deg_conv[deg_conv < 400L], deg_ext_k))) +
+    scale_colour_viridis_d(name = "r") +
+    labs(title = lbl, x = "k (log scale)", y = lbl) +
+    theme(legend.position = "right")
+  if (y == "delegation_rate") p <- p + coord_cartesian(ylim = c(0, 1))
+  p
+})
+
+wrap_plots(deg_plots, ncol = 2) +
+  plot_annotation(
+    title    = "All metrics vs k  (N = 400, r_op = r_pw as lines)",
+    subtitle = paste0("Each point = mean over ", n_seeds_conv,
+                      " seeds | Metrics averaged over final 5 rounds")
+  )
+```
+
+## Saturation Check: Marginal Effects of k
+
+Relative change $(y_i - y_{i-1})\,/\,|y_{i-1}|$ per k-step, averaged across all r levels
+(N = 400, p\_self = 0.5). Values near 0 % indicate saturation.
+
+```{r k-saturation}
+sat_k_base <- deg_scale_df |>
+  group_by(node_degree) |>
+  summarise(across(all_of(all_metrics), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |>
+  arrange(node_degree)
+
+sat_k_rel <- purrr::map_dfr(seq_len(nrow(sat_k_base) - 1), function(i) {
+  prev <- unlist(sat_k_base[i,     all_metrics])
+  curr <- unlist(sat_k_base[i + 1, all_metrics])
+  rel  <- ifelse(abs(prev) < 1e-9, NA_real_, (curr - prev) / abs(prev) * 100)
+  as_tibble_row(c(
+    list(`k-Step` = paste0(sat_k_base$node_degree[i], " → ", sat_k_base$node_degree[i + 1])),
+    setNames(as.list(fmt_pct(rel)), all_metrics)
+  ))
+})
+colnames(sat_k_rel) <- c("k-Step", all_metrics_lbl[all_metrics])
+
+kable(sat_k_rel,
+      caption = paste0("Relative change per k-step (N = 400, p_self = 0.5), ",
+                       "averaged across all r levels and ", n_seeds_conv, " seeds per cell."),
+      align   = c("l", rep("r", length(all_metrics))))
+```
+
+---
+
+# 5  Trust: $\gamma$-Sensitivity  ($\lambda$ = `r lambda_conv`, r as lines)
+
+Fixed: N = `r n_trust`, k = 6. x-axis = $\gamma$; lines = r levels {0, 1, 2}.
+`delegation_rate` y-axis fixed to [0, 1].
+
+```{r trust-gamma-all-r, fig.width=14, fig.height=22}
+tg_df <- df_trust |>
+  group_by(gamma, r_val) |>
+  summarise(across(all_of(all_metrics), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |>
+  mutate(r_label = factor(paste0("r = ", r_val), levels = paste0("r = ", r_trust)))
+
+tg_plots <- purrr::map(all_metrics, function(y) {
+  lbl <- all_metrics_lbl[y]
+  p <- ggplot(tg_df, aes(gamma, .data[[y]], colour = r_label, group = r_label)) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 2.2) +
+    scale_colour_viridis_d(name = "r") +
+    scale_x_continuous(breaks = gamma_conv) +
+    labs(title = lbl, x = expression(gamma), y = lbl) +
+    theme(legend.position = "right")
+  if (y == "delegation_rate") p <- p + coord_cartesian(ylim = c(0, 1))
+  p
+})
+
+wrap_plots(tg_plots, ncol = 2) +
+  plot_annotation(
+    title    = paste0("All metrics vs γ  (N = ", n_trust, ", k = 6, λ = ", lambda_conv, ")"),
+    subtitle = paste0("Each point = mean over ", n_seeds_trust,
+                      " seeds | Final 5 rounds averaged | Colour = r level")
+  )
+```
+
+## Marginal Effects of γ (averaged across all r levels)
+
+Absolute change in each metric per γ-step, averaged across all r levels and seeds.
+Values near 0 in the last rows indicate saturation of the trust effect.
+
+```{r trust-gamma-saturation}
+gamma_steps <- paste0(head(gamma_conv, -1), " → ", tail(gamma_conv, -1))
+
+gamma_sat_base <- df_trust |>
+  group_by(gamma) |>
+  summarise(across(all_of(r_metrics), \(x) mean(x, na.rm = TRUE)), .groups = "drop") |>
+  arrange(gamma)
+
+gamma_sat_delta <- purrr::map_dfr(seq_len(nrow(gamma_sat_base) - 1), function(i) {
+  step_abs <- abs(gamma_sat_base[i + 1, r_metrics] - gamma_sat_base[i, r_metrics])
+  bind_cols(tibble(`γ-Step` = gamma_steps[i]),
+            mutate(step_abs, across(everything(), \(x) round(x, 4))))
+})
+
+colnames(gamma_sat_delta) <- c("γ-Step", all_metrics_lbl[r_metrics])
+
+kable(gamma_sat_delta,
+      caption = paste0("Absolute marginal effects per γ-step, averaged over all r levels and ",
+                       n_seeds_trust, " seeds per cell  (N = ", n_trust, ", k = 6, λ = ",
+                       lambda_conv, ")"),
+      align   = c("l", rep("r", length(r_metrics))))
+
+# Table 2: relative change %
+gamma_sat_rel <- purrr::map_dfr(seq_len(nrow(gamma_sat_base) - 1), function(i) {
+  prev <- unlist(gamma_sat_base[i,     r_metrics])
+  curr <- unlist(gamma_sat_base[i + 1, r_metrics])
+  rel  <- ifelse(abs(prev) < 1e-9, NA_real_, (curr - prev) / abs(prev) * 100)
+  as_tibble_row(c(
+    list(`γ-Step` = gamma_steps[i]),
+    setNames(as.list(fmt_pct(rel)), r_metrics)
+  ))
+})
+colnames(gamma_sat_rel) <- c("γ-Step", all_metrics_lbl[r_metrics])
+
+kable(gamma_sat_rel,
+      caption = paste0("Relative change (%) per γ-step, averaged over all r levels and ",
+                       n_seeds_trust, " seeds per cell  (N = ", n_trust, ", k = 6, λ = ",
+                       lambda_conv, ")"),
+      align   = c("l", rep("r", length(r_metrics))))
+```
+
+---
+
+# 6  Trust: Convergence over Time
+
+Convergence of delegation rate and drift for all $\gamma$ levels at r = `r min(r_trust[r_trust > 0])`.
+Mean over `r n_seeds_trust` seeds.
+
+```{r trust-ts, fig.width=13, fig.height=5}
+trust_ts_df <- df_trust |>
+  filter(r_val == min(r_trust[r_trust > 0])) |>
+  mutate(gamma_label = factor(paste0("γ = ", gamma),
+                              levels = paste0("γ = ", sort(unique(gamma))))) |>
+  select(gamma_label, seed, ts_delegation, ts_lost, ts_drift) |>
+  mutate(round = map(ts_delegation, seq_along)) |>
+  unnest(c(round, ts_delegation, ts_lost, ts_drift)) |>
+  rename(delegation_rate = ts_delegation,
+         lost_vote_rate  = ts_lost,
+         avg_ideo_drift  = ts_drift) |>
+  group_by(gamma_label, round) |>
+  summarise(across(c(delegation_rate, lost_vote_rate, avg_ideo_drift),
+                   \(x) mean(x, na.rm = TRUE)),
+            .groups = "drop")
+
+ts_trust_plots <- purrr::map(
+  c("delegation_rate", "lost_vote_rate", "avg_ideo_drift"),
+  function(y) {
+    lbl <- c(delegation_rate = "Delegation Rate",
+             lost_vote_rate  = "Lost Vote Rate",
+             avg_ideo_drift  = "Avg. Ideological Drift")[y]
+    ggplot(trust_ts_df, aes(round, .data[[y]],
+                            colour = gamma_label, group = gamma_label)) +
+      geom_line(linewidth = 0.8) +
+      scale_colour_viridis_d(name = expression(gamma)) +
+      scale_x_continuous(breaks = seq(0, T_conv, by = 5)) +
+      labs(title = lbl, x = "Round", y = NULL) +
+      theme(legend.position = "right")
+  })
+
+wrap_plots(ts_trust_plots, ncol = 3) +
+  plot_annotation(
+    title    = paste0("Trust convergence  (N = ", n_trust,
+                      ", k = 6, r = 1, λ = ", lambda_conv, ")"),
+    subtitle = paste0("Mean over ", n_seeds_trust, " seeds | Colour = γ level")
+  )
+```
+
+
