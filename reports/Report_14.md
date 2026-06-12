@@ -79,7 +79,7 @@ direct voter at the root with delegators below) is one component; and
 each delegation *cycle* — a closed loop where all members delegate and
 no one votes directly — also forms its own component.
 
-The sum $\text{delegation\_rate} + \text{components}/N \geq 1$ because
+The sum $\text{delegation rate} + \text{components}/N \geq 1$ because
 every direct voter anchors exactly one component, so components
 $\geq N \times (1 - \text{delegation rate})$. Values above 1 arise
 whenever delegation cycles are present: a cycle contributes one
@@ -99,7 +99,7 @@ quantifies cycle density.
 delegation chain eventually reaches a direct voter — cycle members are
 excluded:
 
-$$b := \text{eff delegation rate} = \frac{\#\{\text{Agents who reach a direct voter}\}}{N} = 1 - \frac{\text{components}}{N}$$
+$$b := \text{eff delegation rate} = \frac{\{\text{Agents who reach a direct voter}\}}{N} = 1 - \frac{\text{components}}{N}$$
 
 This definition restores a strict identity regardless of cycles:
 
