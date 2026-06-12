@@ -65,9 +65,6 @@ round-to-round variance across the time series decreases noticeably as
 $N$ increases. Rather than reflecting distinct convergence dynamics,
 this stabilization is driven by the law of large numbers: larger agent
 populations effectively average out individual binomial sampling noise.
-\## Variation over k (N = 400, r = 1)
-
-![](Report_14_files/figure-gfm/ts-k-check-1.png)<!-- -->
 
 ## Structural Identity Check: delegation_rate + components/N ≥ 1
 
@@ -84,7 +81,7 @@ no one votes directly — also forms its own component.
 
 The sum $\text{delegation\_rate} + \text{components}/N \geq 1$ because
 every direct voter anchors exactly one component, so components
-$\geq N \times (1 - \text{delegation\_rate})$. Values above 1 arise
+$\geq N \times (1 - \text{delegation rate})$. Values above 1 arise
 whenever delegation cycles are present: a cycle contributes one
 component without containing any direct voter, pushing the sum above 1
 by exactly $K/N$ where $K$ is the number of cycles.
@@ -92,7 +89,7 @@ by exactly $K/N$ where $K$ is the number of cycles.
 **Variante A** (standard delegation rate) yields the diagnostic
 identity:
 
-$$\text{delegation\_rate} + \frac{\text{components}}{N} = 1 + \frac{K}{N}$$
+$$\text{delegation rate} + \frac{\text{components}}{N} = 1 + \frac{K}{N}$$
 
 where $K \geq 0$ is the number of delegation cycles. In graphs without
 cycles ($K = 0$) the equality holds exactly; any deviation above 1
@@ -102,7 +99,7 @@ quantifies cycle density.
 delegation chain eventually reaches a direct voter — cycle members are
 excluded:
 
-$$b := \text{eff\_delegation\_rate} = \frac{\#\{\text{Agents who reach a direct voter}\}}{N} = 1 - \frac{\text{components}}{N}$$
+$$b := \text{eff delegation rate} = \frac{\#\{\text{Agents who reach a direct voter}\}}{N} = 1 - \frac{\text{components}}{N}$$
 
 This definition restores a strict identity regardless of cycles:
 
