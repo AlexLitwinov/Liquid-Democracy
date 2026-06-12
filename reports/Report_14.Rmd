@@ -458,7 +458,7 @@ wrap_plots(ts_plots, ncol = 4) +
 **`delegation_rate`** is the share of lay agents who have an outgoing edge in the delegation
 graph in a given round — i.e. they chose to delegate rather than vote directly.
 
-**`total_components`** counts the number of weakly connected components in the same
+**`total_components`** counts the number of components in the same
 delegation graph (active subgraph plus isolated nodes). Each isolated direct voter is its
 own component; each delegation tree (a direct voter at the root with delegators below) is
 one component; and each delegation *cycle* — a closed loop where all members delegate and
@@ -486,52 +486,46 @@ This definition restores a strict identity regardless of cycles:
 
 $$b + \frac{\text{components}}{N} = 1$$
 
-```{r identity-check, fig.width=9, fig.height=4}
+```{r identity-check, fig.width=10, fig.height=8}
+
 id_check <- df_main |>
-  mutate(identity_sum        = delegation_rate + total_components,
-         deviation           = identity_sum - 1,   # should be >= 0
-         has_cycles          = deviation > 1e-6,
-         eff_delegation_rate = 1 - total_components)
-
-id_summary <- id_check |>
-  summarise(
-    Mean        = round(mean(identity_sum,  na.rm = TRUE), 6),
-    SD          = round(sd(identity_sum,    na.rm = TRUE), 6),
-    Min         = round(min(identity_sum,   na.rm = TRUE), 6),
-    Max         = round(max(identity_sum,   na.rm = TRUE), 6),
-    `Pct >= 1`  = round(mean(identity_sum >= 1 - 1e-9, na.rm = TRUE) * 100, 2),
-    `Pct cycles`= round(mean(has_cycles,    na.rm = TRUE) * 100, 2)
+  mutate(
+    identity_sum        = delegation_rate + total_components,
+    deviation           = identity_sum - 1,
+    has_cycles          = deviation > 1e-6,
+    eff_delegation_rate = 1 - total_components,
+    identity_sum_b      = eff_delegation_rate + total_components
   )
 
-kable(id_summary,
-      caption = paste0(
-        "Variante A: delegation_rate + components/N (expected >= 1; excess = K/N = cycles/N). ",
-        "Both metrics averaged over snapshot rounds 5,10,15,20."))
+# --------------------------------------------------
+# Compact summary table
+# --------------------------------------------------
 
-# Variante B: eff_delegation_rate = 1 - components/N  →  b + components/N = 1 always
-id_summary_b <- id_check |>
-  summarise(
-    Mean        = round(mean(eff_delegation_rate,                        na.rm = TRUE), 4),
-    SD          = round(sd(eff_delegation_rate,                          na.rm = TRUE), 4),
-    Min         = round(min(eff_delegation_rate,                         na.rm = TRUE), 4),
-    Max         = round(max(eff_delegation_rate,                         na.rm = TRUE), 4),
-    `Mean (b + comp/N)` = round(mean(eff_delegation_rate + total_components, na.rm = TRUE), 8),
-    `Max |dev from 1|`  = round(max(abs(eff_delegation_rate + total_components - 1), na.rm = TRUE), 10)
+identity_summary <- tibble(
+  Variant = c(
+    "A: Standard delegation rate",
+    "B: Effective delegation rate"
+  ),
+  `Mean delegation rate` = c(
+    mean(id_check$delegation_rate, na.rm = TRUE),
+    mean(id_check$eff_delegation_rate, na.rm = TRUE)
+  ),
+  `Mean (delegation + components/N)` = c(
+    mean(id_check$identity_sum, na.rm = TRUE),
+    mean(id_check$identity_sum_b, na.rm = TRUE)
   )
+) |>
+  mutate(across(where(is.numeric), ~ round(.x, 6)))
 
-kable(id_summary_b,
-      caption = paste0(
-        "Variante B: eff_delegation_rate = 1 − components/N. ",
-        "The sum b + components/N = 1 by construction (last two columns verify floating-point precision). ",
-        "Metrics averaged over snapshot rounds 5,10,15,20."))
-
-ggplot(id_check, aes(deviation)) +
-  geom_histogram(bins = 60, fill = "steelblue", colour = "white", linewidth = 0.2) +
-  geom_vline(xintercept = 0, colour = "red", linetype = "dashed") +
-  labs(title = "Distribution of (delegation_rate + components/N) − 1",
-       subtitle = paste0("n = ", nrow(id_check),
-                         " simulations | red = min (0) | excess above 0 = cycles/N"),
-       x = "Excess above 1  (= cycles / N)", y = "Count")
+kable(
+  identity_summary,
+  caption = paste0(
+    "Mean delegation rates and mean identity sums. ",
+    "Variant A exceeds 1 whenever delegation cycles are present ",
+    "(excess = K/N). Variant B satisfies the identity exactly by construction. ",
+    "Means computed across all snapshot observations (rounds 5, 10, 15, 20)."
+  )
+)
 ```
 
 ---

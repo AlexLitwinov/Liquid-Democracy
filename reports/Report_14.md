@@ -72,12 +72,12 @@ populations effectively average out individual binomial sampling noise.
 edge in the delegation graph in a given round — i.e. they chose to
 delegate rather than vote directly.
 
-**`total_components`** counts the number of weakly connected components
-in the same delegation graph (active subgraph plus isolated nodes). Each
-isolated direct voter is its own component; each delegation tree (a
-direct voter at the root with delegators below) is one component; and
-each delegation *cycle* — a closed loop where all members delegate and
-no one votes directly — also forms its own component.
+**`total_components`** counts the number of components in the same
+delegation graph (active subgraph plus isolated nodes). Each isolated
+direct voter is its own component; each delegation tree (a direct voter
+at the root with delegators below) is one component; and each delegation
+*cycle* — a closed loop where all members delegate and no one votes
+directly — also forms its own component.
 
 The sum $\text{delegation rate} + \text{components}/N \geq 1$ because
 every direct voter anchors exactly one component, so components
@@ -105,22 +105,15 @@ This definition restores a strict identity regardless of cycles:
 
 $$b + \frac{\text{components}}{N} = 1$$
 
-|     Mean |      SD | Min | Max | Pct \>= 1 | Pct cycles |
-|---------:|--------:|----:|----:|----------:|-----------:|
-| 1.022635 | 0.02041 |   1 | 1.1 |       100 |      98.98 |
+| Variant | Mean delegation rate | Mean (delegation + components/N) |
+|:---|---:|---:|
+| A: Standard delegation rate | 0.625243 | 1.022635 |
+| B: Effective delegation rate | 0.602608 | 1.000000 |
 
-Variante A: delegation_rate + components/N (expected \>= 1; excess = K/N
-= cycles/N). Both metrics averaged over snapshot rounds 5,10,15,20.
-
-|   Mean |     SD |    Min |    Max | Mean (b + comp/N) | Max \|dev from 1\| |
-|-------:|-------:|-------:|-------:|------------------:|-------------------:|
-| 0.6026 | 0.1175 | 0.3975 | 0.7888 |                 1 |                  0 |
-
-Variante B: eff_delegation_rate = 1 − components/N. The sum b +
-components/N = 1 by construction (last two columns verify floating-point
-precision). Metrics averaged over snapshot rounds 5,10,15,20.
-
-![](Report_14_files/figure-gfm/identity-check-1.png)<!-- -->
+Mean delegation rates and mean identity sums. Variant A exceeds 1
+whenever delegation cycles are present (excess = K/N). Variant B
+satisfies the identity exactly by construction. Means computed across
+all snapshot observations (rounds 5, 10, 15, 20).
 
 ------------------------------------------------------------------------
 
