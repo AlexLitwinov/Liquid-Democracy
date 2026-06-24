@@ -624,7 +624,7 @@ peaks, and plateaus.
 
 For each metric $Y$ and each condition a separate GAM is fitted:
 
-$$\boxed{Y_i \;=\; f\!\bigl(\log_2 r_i\bigr) + \varepsilon_i,
+$$\boxed{Y_i = f\bigl(\log_2 r_i\bigr) + \varepsilon_i,
 \qquad \varepsilon_i \sim \mathcal{N}(0, \sigma^2)}$$
 
 - $Y_i$: metric value at parameter setting $r_i$, averaged over 50 seeds
@@ -642,7 +642,7 @@ specifications (1-D sweep, tensor-product interaction, trust moderation) are
 described in the respective sections.
 
 Both delegation rate and lost vote rate are monotonically increasing with r
-and bounded in [0, 1]. The GAM on log₂(r) identifies where the slope
+and bounded in [0, 1]. The GAM on log(r) identifies where the slope
 drops to near-zero — the practical saturation point r\* beyond which
 further increases in r add negligible additional delegation or vote loss.
 
@@ -836,7 +836,7 @@ the two metrics that directly reflect the quality of representation in the
 delegation network. For each metric and each experimental condition a GAM of
 the form
 
-$$Y_i \;=\; f(x_i) + \varepsilon_i, \qquad \varepsilon_i \sim \mathcal{N}(0,\sigma^2)$$
+$$Y_i = f(x_i) + \varepsilon_i, \qquad \varepsilon_i \sim \mathcal{N}(0,\sigma^2)$$
 
 is fitted, where $x$ is the log₂-transformed responsiveness parameter and
 $f(\cdot)$ is a flexible penalised spline (REML). The table reports edf
