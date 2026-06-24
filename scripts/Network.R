@@ -435,7 +435,8 @@ simulate_liquid_democracy <- function(
     cycle_fallback          = "none",  # "none" | "direct" | "redelegate"
     target_homophily        = NULL,    # target assortativity; NULL disables shuffle
     homophily_t             = 5,       # Metropolis temperature (higher = more greedy)
-    homophily_steps         = 100000   # safety cap on proposed swaps
+    homophily_steps         = 100000,  # safety cap on proposed swaps
+    snap_rounds             = NULL     # rounds to record full snapshots; NULL = last 5
 ) {
   st     <- setup_agents(n_per_community, n_communities,
                          n_experts_per_community, seed,
@@ -478,9 +479,12 @@ simulate_liquid_democracy <- function(
   prev_target   <- integer(n_all) # who each agent delegated to last round (0 = direct)
 
   # ---------------------------------------------------------
-  # Snapshot rounds: 25%, 50%, 75%, 100% of T
+  # Snapshot rounds: historical checkpoints + last 5 rounds
   # ---------------------------------------------------------
-  snapshot_rounds <- unique(round(c(0.25, 0.50, 0.75, 1.00) * T))
+  hist_rounds     <- unique(round(c(0.25, 0.50, 0.75, 1.00) * T))
+  last5_rounds    <- max(1L, T - 4L):T
+  snapshot_rounds <- if (!is.null(snap_rounds)) snap_rounds
+                     else sort(unique(c(hist_rounds, last5_rounds)))
 
   history_lost       <- numeric(T)
   history_drift      <- numeric(T)
@@ -503,6 +507,14 @@ simulate_liquid_democracy <- function(
   top5 <- function(x) {
     n_top <- max(1, floor(0.05 * length(x)))
     sum(sort(x, decreasing = TRUE)[1:n_top]) / sum(x)
+  }
+
+  # Helper: minimum fraction of agents (by power desc) to reach 50% of total
+  share_50pct_fn <- function(x) {
+    pv <- sort(x[x > 0], decreasing = TRUE)
+    if (!length(pv)) return(NA_real_)
+    k <- which(cumsum(pv) / sum(pv) >= 0.5)[1]
+    k / length(pv)
   }
 
   for (t in seq_len(T)) {
@@ -528,32 +540,68 @@ simulate_liquid_democracy <- function(
         }
       }
 
-      # Step 1: vote directly with fixed probability p_self (always direct if no neighbours)
-      if (!length(nb) || runif(1) < p_self) return(i)
+      # No neighbours → always vote directly
+      if (!length(nb)) return(i)
 
-      # Step 2: choose neighbour by attractiveness
+      # ── Mode A: fixed p_self (default, backward-compatible) ─────────────────
+      if (!is.null(p_self)) {
+        if (runif(1) < p_self) return(i)
+
+        op_nb  <- perceive_opinion(op[nb],  sigma_opinion)
+        pow_nb <- perceive_power(pow[nb], sigma_pow)
+
+        if (inertia > 0 && prev_target[i] != 0L && runif(1) < inertia)
+          return(prev_target[i])
+
+        w_nb <- attractiveness_fn(op[i], op_nb, pow[i], pow_nb, r_op, r_pw)
+
+        if (trust_active && gamma != 0) {
+          trust_mod <- 2 * .sig(gamma * tau[[i]][as.character(nb)])
+          w_nb <- w_nb * trust_mod
+        }
+        if (r_ingroup != 0) {
+          same_g <- as.integer(agents$group[nb] == agents$group[i]) * 2L - 1L
+          w_nb   <- w_nb * .sig(r_ingroup * same_g)
+        }
+        w <- pmax(w_nb, 0)
+        if (sum(w) == 0) w[] <- 1
+        return(nb[sample.int(length(w), 1L, prob = w)])
+      }
+
+      # ── Mode B: endogenous self-weight (p_self = NULL) ───────────────────────
+      # Compute neighbour attractiveness first (needed for best-neighbour j*)
       op_nb  <- perceive_opinion(op[nb],  sigma_opinion)
       pow_nb <- perceive_power(pow[nb], sigma_pow)
+      w_nb   <- attractiveness_fn(op[i], op_nb, pow[i], pow_nb, r_op, r_pw)
 
-      # Inertia: retain current delegate with probability `inertia`
-      if (inertia > 0 && prev_target[i] != 0L && runif(1) < inertia) return(prev_target[i])
-
-      w_nb <- attractiveness_fn(op[i], op_nb, pow[i], pow_nb, r_op, r_pw)
-
-      # Trust modifier: A_tilde = A * 2*sigma(gamma*tau); neutral at tau = 0
       if (trust_active && gamma != 0) {
         trust_mod <- 2 * .sig(gamma * tau[[i]][as.character(nb)])
         w_nb <- w_nb * trust_mod
       }
-
-      # Ingroup modifier: A_tilde *= sigma(r_ingroup * I(g_i == g_j)), I in {-1, +1}
       if (r_ingroup != 0) {
         same_g <- as.integer(agents$group[nb] == agents$group[i]) * 2L - 1L
         w_nb   <- w_nb * .sig(r_ingroup * same_g)
       }
-
       w <- pmax(w_nb, 0)
-      if (sum(w) == 0) w[] <- 1
+
+      # If no attractive neighbour exists, vote directly
+      if (sum(w) == 0) return(i)
+
+      # Best neighbour j* by attractiveness
+      j_idx <- which.max(w)
+
+      # Self-weight as probability:
+      #   high when best neighbour is ideologically far  → prefer own vote
+      #   high when own power exceeds j*'s power        → prefer own vote
+      w_self <- .sig(r_op * (2 * abs(op[i] - op_nb[j_idx]) - 1)) *
+                .sig(r_pw * log(max(pow[i], 1e-9) / max(pow_nb[j_idx], 1e-9)))
+
+      if (runif(1) < w_self) return(i)
+
+      # Delegate — inertia check before sampling
+      if (inertia > 0 && prev_target[i] != 0L && runif(1) < inertia)
+        return(prev_target[i])
+
       nb[sample.int(length(w), 1L, prob = w)]
     }, integer(1L))
 
@@ -688,6 +736,7 @@ simulate_liquid_democracy <- function(
         delegation_rate             = history_delegation[t],
         gini_power                  = gini(rep_power),
         top5_power_share            = top5(rep_power),
+        share_50pct                 = share_50pct_fn(rep_power),
         avg_chain_length_delegators = avg_chain_length_delegators,
         largest_voting_bloc_share   = largest_voting_bloc,
         total_components            = total_components,
