@@ -2,6 +2,16 @@ Weekly Report – Week 16: Research Questions + Hypotheses
 ================
 2026-05-24
 
+# Model Parameters:
+
+- Watts-Strogatz (Small-World) Network
+- N = 500
+- K = 14
+- T = 20
+- N_Seeds = 50
+
+------------------------------------------------------------------------
+
 # 1 Research Questions
 
 ## Part 1: Core Network dynamics
@@ -28,43 +38,44 @@ Weekly Report – Week 16: Research Questions + Hypotheses
 delegates?
 
 - H1b: Increasing resp. to opinion increases the average ideological
-  drift
+  drift.
 
-- H2b: Increasing resp. to power increases the average ideological drift
+- H2b: Increasing resp. to power increases the average ideological
+  drift.
 
 - H3b Increasing resp- to power and resp to opinion increases the
-  average ideological drift
+  average ideological drift.
 
 - H4b: Increasing resp. to trust reduces the influence of the effect of
-  resp. to opinion and power on the average ideological drift
+  resp. to opinion and power on the average ideological drift.
 
 **RQ3**: How much power do the most powerful 5% agent within a network
 have?
 
-- H1c: Increasing resp. to opinion increases the top 5% share
+- H1c: Increasing resp. to opinion increases the top 5% share.
 
-- H2c: Increasing resp. to power increases the top 5% share
+- H2c: Increasing resp. to power increases the top 5% share.
 
 - H3c: Increasing resp. to opinion and power increases the the top 5%
-  share
+  share.
 
 - H4c: Increasing resp. to trust has a reducing influence of the effect
-  of resp. to opinion and power
+  of resp. to opinion and power.
 
 **RQ4**: How many of the most influential agents do you need to get 50%
 of the votes?
 
-- H1d: Increasing resp. to opinion increases the share of agents you
-  need to get 50% of the vote
+- H1d: Increasing resp. to opinion decreases the share of agents you
+  need to get 50% of the vote.
 
 - H2d: Increasing resp. to power decreases the share of agents you need
-  to get 50% of the vote
+  to get 50% of the vote.
 
 - H3d: Increasing resp. to opinion and power decreases the share of
-  agents you need to get 50% votes
+  agents you need to get 50% votes.
 
 - H4d: Increasing resp. to trust has a reducing influence of the effect
-  of resp. to opinion and power
+  of resp. to opinion and power.
 
 ------------------------------------------------------------------------
 
@@ -94,17 +105,14 @@ regression with a flexible smooth curve $f(\cdot)$ estimated directly
 from the data, without assuming a specific shape such as linear or
 exponential. The smoothness of $f$ is controlled automatically by a
 penalty on curvature (REML), preventing overfitting while allowing the
-curve to capture rises, peaks, and plateaus. The effective degrees of
-freedom (edf) of the smooth summarise its complexity: edf $\approx 1$
-means the relationship is essentially linear; edf $> 2$ means it is
-clearly curved.
+curve to capture rises, peaks, and plateaus.
 
 For each metric $Y$ and each condition a separate GAM is fitted:
 
-$$\boxed{Y_i \;=\; f\!\bigl(\log_2 r_i\bigr) + \varepsilon_i,
+$$\boxed{Y_i = f\bigl(\log_2 r_i\bigr) + \varepsilon_i,
 \qquad \varepsilon_i \sim \mathcal{N}(0, \sigma^2)}$$
 
-- $Y_i$: metric value at parameter setting $r_i$, averaged over 25 seeds
+- $Y_i$: metric value at parameter setting $r_i$, averaged over 50 seeds
 - $f(\cdot)$: unknown smooth function — shape estimated from data, not
   assumed
 - $\log_2 r$: the predictor is **log₂-transformed** because the
@@ -121,7 +129,7 @@ model specifications (1-D sweep, tensor-product interaction, trust
 moderation) are described in the respective sections.
 
 Both delegation rate and lost vote rate are monotonically increasing
-with r and bounded in \[0, 1\]. The GAM on log₂(r) identifies where the
+with r and bounded in \[0, 1\]. The GAM on log(r) identifies where the
 slope drops to near-zero — the practical saturation point r\* beyond
 which further increases in r add negligible additional delegation or
 vote loss.
@@ -174,7 +182,7 @@ drift** — the two metrics that directly reflect the quality of
 representation in the delegation network. For each metric and each
 experimental condition a GAM of the form
 
-$$Y_i \;=\; f(x_i) + \varepsilon_i, \qquad \varepsilon_i \sim \mathcal{N}(0,\sigma^2)$$
+$$Y_i = f(x_i) + \varepsilon_i, \qquad \varepsilon_i \sim \mathcal{N}(0,\sigma^2)$$
 
 is fitted, where $x$ is the log₂-transformed responsiveness parameter
 and $f(\cdot)$ is a flexible penalised spline (REML). The table reports

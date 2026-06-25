@@ -89,11 +89,13 @@ output: github_document
 date: "2026-05-24"
 ---
 # Model Parameters:
+
 - Watts-Strogatz (Small-World) Network
-N = 500
-K = 14
-T = 20
-N_Seeds = 50
+- N = 500
+- K = 14
+- T = 20
+- N_Seeds = 50
+
 ---
 
 # 1  Research Questions
