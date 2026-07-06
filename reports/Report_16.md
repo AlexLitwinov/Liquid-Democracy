@@ -19,20 +19,19 @@ Weekly Report – Week 16: Research Questions + Hypotheses
 **RQ1**: When are the effects of responsiveness parameters saturating?
 
 - H1a: The relationship between opinion responsiveness (r_op) and
-  delegation network metrics is non-linear, exhibiting diminishing
-  returns beyond some moderate threshold.
+  delegation network metrics is non-linear and saturates at a certain
+  point.
 
 - H2a: The relationship between power responsiveness (r_pw) and
-  delegation network metrics is non-linear, exhibiting diminishing
-  returns beyond some moderate threshold.
+  delegation network metrics is non-linear and saturates at a certain
+  point.
 
 - H3a: When both r_op and r_pw increase jointly (r_op = r_pw), the
-  combined effect on delegation network metrics is non-linear,
-  exhibiting diminishing returns beyond some moderate threshold.
+  combined effect on delegation network metrics is non-linear and
+  saturates at a certain point.
 
 - H4a: The relationship between trust sensitivity (γ) and delegation
-  network metrics is non-linear, exhibiting diminishing returns beyond
-  some moderate threshold.
+  network metrics is non-linear and saturates at a certain point.
 
 **RQ2**: How far drifts the average opinion of an agent when he
 delegates?
