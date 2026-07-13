@@ -1,0 +1,366 @@
+---
+title: "Weekly Report -- Week 17: Testing the Confidence-Weighted Self-Weight"
+output: github_document
+date: "2026-07-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 6)
+library(tidyverse)
+library(here)
+library(furrr)
+library(patchwork)
+library(digest)
+library(knitr)
+
+theme_set(theme_minimal(base_size = 12))
+source(here::here("scripts/Network.R"))
+
+# ── Simulation constants (same as Report 15) ────────────────────────────────
+MINORITY_SHARE   <- 0.2
+OP_SIGMA         <- 0.1
+SIM_T            <- 20L
+N_SEEDS          <- 50L
+N_SIM            <- 500L
+K_SIM            <- 14L
+P_REWIRE         <- 0.05
+
+DELTA_VALS        <- c(0.2, 0.4)
+R_INGROUP_VALS    <- c(0, 1, 2, 4, 8)
+SELF_WEIGHT_MODES <- c("raw", "confidence")
+
+# ── Diagnostic-sweep constants ──────────────────────────────────────────────
+R_DIAG_VALS   <- c(0, 0.5, 1, 2, 4, 8, 16, 32, 64, 128)
+N_SEEDS_DIAG  <- 50L
+
+# ── Metrics actually implemented in Network.R's snapshot tibble ─────────────
+# NOTE: minority_capture and minority_vote_share (MVS) are documented in
+# Report 15 but not yet computed in Network.R, so they cannot be plotted here.
+minority_metrics <- c("RR_m", "minority_self_rep_rate")
+
+minority_lbl <- c(
+  RR_m                   = "Relative Representation (RR_m)",
+  minority_self_rep_rate = "Minority Self-Representation Rate (SR_m)"
+)
+
+# Metrics tracked in Section 2 (Testing the Self-Weight Fix)
+rq1_metrics <- c("delegation_rate", "lost_vote_rate", "avg_chain_length_delegators",
+                  "avg_drift", "top5_power_share", "share_50pct", "total_components")
+
+rq1_lbl <- c(
+  delegation_rate             = "Delegation Rate",
+  lost_vote_rate              = "Lost Vote Rate",
+  avg_chain_length_delegators = "Avg. Chain Length",
+  avg_drift                   = "Avg. Ideological Drift",
+  top5_power_share            = "Top-5% Power Share",
+  share_50pct                 = "Agents for 50% Votes",
+  total_components            = "Components"
+)
+
+# delegation_rate/lost_vote_rate always mean something; the rest are computed
+# from represented (non-lost) agents only and become unreliable once most
+# votes are lost -- masked to NA beyond LOST_THRESHOLD, mirroring Report 16.
+ALWAYS_VALID   <- c("delegation_rate", "lost_vote_rate")
+MASK_METRICS   <- setdiff(rq1_metrics, ALWAYS_VALID)
+LOST_THRESHOLD <- 0.90
+
+# delegation_rate/lost_vote_rate are shown over the full R_DIAG_VALS range
+# (up to 128); every other metric is only shown up to R_SHORT_MAX, since
+# beyond that they are already masked out by LOST_THRESHOLD for most of the
+# range anyway and just crowd the axis.
+R_SHORT_MAX <- 16
+```
+
+---
+
+# 1  Purpose
+
+The endogenous self-weight used throughout the model (`self_weight_mode = "raw"`)
+computes
+
+$$w_{self,raw}= \sigma\!\left(r_{op}(2|o_i-o_{j^*}|-1)\right) \cdot
+                   \sigma\!\left(r_{pw}\log\frac{p_i}{p_{j^*}}\right),$$
+
+where $j^*$ is agent $i$'s most attractive neighbour. At
+$r_{op}=r_{pw}=0$ both factors evaluate to $\sigma(0)=0.5$, so
+$w_{self}^{raw}=0.25$ regardless of how unresponsive agents are — the
+global delegation rate floors at roughly 75% and can never approach the
+Direct Democracy limit (delegation rate $\to 0$).
+
+New function:
+
+$$r_{tot} = r_{op} + r_{pw} + r_{ingroup}, \qquad
+  \text{conf} = \frac{r_{tot}}{1+r_{tot}}, \qquad
+  w_{self} = (1-\text{conf}) + \text{conf} \cdot w_{self}^{raw}.$$
+
+At $r_{tot}=0$: $\text{conf}=0 \Rightarrow w_{self}=1$ (Direct Democracy).
+As $r_{tot}\to\infty$: $\text{conf}\to1 \Rightarrow w_{self}\to w_{self}^{raw}$,
+recovering the original model exactly. `"raw"` remains the default
+everywhere else in the codebase (Report 16 and earlier reports are
+unaffected by this addition).
+
+---
+
+# 2  Testing the Self-Weight Fix
+
+Following Report 16's RQ1 structure: Condition A isolates $r_{op}$;
+Condition B isolates $r_{pw}$; Condition D varies trust sensitivity
+$\gamma$ at fixed background levels $r_{op}=r_{pw}\in\{1,2,4,8\}$;
+Condition C shows the full $r_{op}\times r_{pw}$ grid. $r_{ingroup}=0$
+throughout (no minority extension). Conditions A, B and D each overlay
+both `"raw"` and `"confidence"` in the same plot; Condition C instead
+places the two models side by side per metric, since a 2-D grid
+overlaid by colour would be unreadable.
+
+```{r rq1-constants, include=FALSE}
+GAMMA_VALS   <- c(0, 1, 2, 4, 8, 16)
+R_TRUST_DIAG <- c(1, 2, 4, 8)
+LAMBDA_DIAG  <- 0.5
+```
+
+```{r diag-run-one, include=FALSE}
+run_diag_one <- function(seed, r_op, r_pw, gamma, self_weight_mode, lambda_val = 0) {
+  res <- simulate_liquid_democracy(
+    seed              = seed,
+    n_per_community   = N_SIM,
+    n_communities     = 1,
+    node_degree       = K_SIM,
+    T                 = SIM_T,
+    r_op              = r_op,
+    r_pw              = r_pw,
+    p_rewire          = P_REWIRE,
+    gamma             = gamma,
+    lambda            = lambda_val,
+    self_weight_mode  = self_weight_mode
+  )
+  snaps <- res$snapshots |> dplyr::filter(round >= SIM_T - 4L)
+  tibble(
+    seed                        = seed,
+    r_op                        = r_op,
+    r_pw                        = r_pw,
+    gamma                       = gamma,
+    self_weight_mode            = self_weight_mode,
+    delegation_rate             = mean(res$history_delegation[(SIM_T - 4L):SIM_T], na.rm = TRUE),
+    lost_vote_rate               = mean(res$history_lost[(SIM_T - 4L):SIM_T],       na.rm = TRUE),
+    avg_chain_length_delegators = mean(snaps$avg_chain_length_delegators, na.rm = TRUE),
+    avg_drift                   = mean(snaps$avg_drift,                  na.rm = TRUE),
+    top5_power_share            = mean(snaps$top5_power_share,           na.rm = TRUE),
+    share_50pct                 = mean(snaps$share_50pct,                na.rm = TRUE),
+    total_components            = mean(snaps$total_components,           na.rm = TRUE)
+  )
+}
+```
+
+```{r diag-simulate, include=FALSE}
+seeds_diag <- seq_len(N_SEEDS_DIAG)
+
+grid_A <- expand_grid(r_op = R_DIAG_VALS, r_pw = 0, gamma = 0,
+                       self_weight_mode = SELF_WEIGHT_MODES, seed = seeds_diag) |>
+  mutate(condition = "A: r_op only")
+grid_B <- expand_grid(r_op = 0, r_pw = R_DIAG_VALS, gamma = 0,
+                       self_weight_mode = SELF_WEIGHT_MODES, seed = seeds_diag) |>
+  mutate(condition = "B: r_pw only")
+grid_C <- expand_grid(r_op = R_DIAG_VALS, r_pw = R_DIAG_VALS, gamma = 0,
+                       self_weight_mode = SELF_WEIGHT_MODES, seed = seeds_diag) |>
+  mutate(condition = "C: r_op x r_pw (grid)")
+grid_D <- purrr::map_dfr(R_TRUST_DIAG, function(rv)
+  expand_grid(r_op = rv, r_pw = rv, gamma = GAMMA_VALS,
+              self_weight_mode = SELF_WEIGHT_MODES, seed = seeds_diag) |>
+    mutate(condition = paste0("D: trust (r=", rv, ")"))
+)
+
+params_diag <- list(N = N_SIM, K = K_SIM, T = SIM_T, r_vals = R_DIAG_VALS,
+                     gamma_vals = GAMMA_VALS, r_trust = R_TRUST_DIAG, lambda = LAMBDA_DIAG,
+                     n_seeds = N_SEEDS_DIAG, modes = SELF_WEIGHT_MODES,
+                     metrics = rq1_metrics, version = 3L)
+hash_diag  <- digest::digest(params_diag)
+cache_diag <- here::here("data/sim_report17_diag_cache.rds")
+
+if (file.exists(cache_diag)) {
+  cd <- readRDS(cache_diag)
+  if (identical(cd$hash, hash_diag)) sim_diag <- cd$data else cd <- NULL
+} else cd <- NULL
+
+if (is.null(cd)) {
+  dir.create(here::here("data"), showWarnings = FALSE)
+  plan(multisession, workers = parallel::detectCores() - 1)
+
+  run_cond <- function(grid_df, lambda_val = 0) {
+    future_pmap_dfr(
+      list(seed = grid_df$seed, r_op = grid_df$r_op, r_pw = grid_df$r_pw,
+           gamma = grid_df$gamma, self_weight_mode = grid_df$self_weight_mode,
+           condition = grid_df$condition),
+      function(seed, r_op, r_pw, gamma, self_weight_mode, condition)
+        run_diag_one(seed, r_op, r_pw, gamma, self_weight_mode, lambda_val) |>
+          mutate(condition = condition),
+      .options = furrr_options(seed = NULL)
+    )
+  }
+
+  sim_diag <- bind_rows(
+    run_cond(grid_A),
+    run_cond(grid_B),
+    run_cond(grid_C),
+    run_cond(grid_D, lambda_val = LAMBDA_DIAG)
+  )
+  plan(sequential)
+  saveRDS(list(hash = hash_diag, data = sim_diag), cache_diag)
+}
+
+sim_diag_agg_raw <- sim_diag |>
+  group_by(condition, r_op, r_pw, gamma, self_weight_mode) |>
+  summarise(across(all_of(rq1_metrics), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
+
+# Mask concentration/chain-length/component metrics once too many votes are
+# lost to be meaningful; delegation_rate and lost_vote_rate stay untouched.
+sim_diag_agg <- sim_diag_agg_raw |>
+  mutate(across(all_of(MASK_METRICS), \(x) ifelse(lost_vote_rate > LOST_THRESHOLD, NA_real_, x))) |>
+  pivot_longer(all_of(rq1_metrics), names_to = "metric", values_to = "value") |>
+  mutate(metric_label = factor(rq1_lbl[metric], levels = unname(rq1_lbl)))
+
+# Unmasked counterpart -- identical to sim_diag_agg but without the
+# LOST_THRESHOLD cutoff, used to draw a dotted continuation past the point
+# where a metric gets masked out for being unreliable.
+sim_diag_unmasked <- sim_diag_agg_raw |>
+  pivot_longer(all_of(rq1_metrics), names_to = "metric", values_to = "value") |>
+  mutate(metric_label = factor(rq1_lbl[metric], levels = unname(rq1_lbl)))
+```
+
+## 2.1  Condition A: $r_{op}$ only
+
+```{r cond-a-plot, fig.width=10, fig.height=16}
+df_a_masked   <- sim_diag_agg      |> filter(condition == "A: r_op only", metric %in% ALWAYS_VALID | r_op <= R_SHORT_MAX)
+df_a_unmasked <- sim_diag_unmasked |> filter(condition == "A: r_op only", metric %in% ALWAYS_VALID | r_op <= R_SHORT_MAX)
+
+ggplot() +
+  geom_line(data = df_a_unmasked, aes(r_op, value, colour = self_weight_mode, group = self_weight_mode),
+            linetype = "dotted", linewidth = 1.1, alpha = 0.9, na.rm = TRUE) +
+  geom_point(data = df_a_unmasked, aes(r_op, value, colour = self_weight_mode),
+             size = 1.5, alpha = 0.9, na.rm = TRUE) +
+  geom_line(data = df_a_masked, aes(r_op, value, colour = self_weight_mode, fill = self_weight_mode),
+            linewidth = 0.9, na.rm = TRUE) +
+  geom_point(data = df_a_masked, aes(r_op, value, colour = self_weight_mode, fill = self_weight_mode),
+             shape = 21, size = 2.3, stroke = 0.5, na.rm = TRUE) +
+  geom_hline(yintercept = c(0, 1), linetype = "dotted", colour = "grey60") +
+  facet_wrap(~ metric_label, scales = "free", ncol = 2) +
+  scale_colour_manual(values = c(raw = "firebrick3", confidence = "steelblue4")) +
+  scale_fill_manual(values   = c(raw = "firebrick1", confidence = "steelblue2")) +
+  scale_x_continuous(breaks = R_DIAG_VALS, labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "A: r_op only  (r_pw = 0, gamma = 0)",
+       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds -- dotted = beyond %.0f%% lost-vote rate",
+                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG, LOST_THRESHOLD * 100),
+       x = "r_op", y = NULL, colour = "self_weight_mode", fill = "self_weight_mode") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+## 2.2  Condition B: $r_{pw}$ only
+
+```{r cond-b-plot, fig.width=10, fig.height=16}
+df_b_masked   <- sim_diag_agg      |> filter(condition == "B: r_pw only", metric %in% ALWAYS_VALID | r_pw <= R_SHORT_MAX)
+df_b_unmasked <- sim_diag_unmasked |> filter(condition == "B: r_pw only", metric %in% ALWAYS_VALID | r_pw <= R_SHORT_MAX)
+
+ggplot() +
+  geom_line(data = df_b_unmasked, aes(r_pw, value, colour = self_weight_mode, group = self_weight_mode),
+            linetype = "dotted", linewidth = 1.1, alpha = 0.9, na.rm = TRUE) +
+  geom_point(data = df_b_unmasked, aes(r_pw, value, colour = self_weight_mode),
+             size = 1.5, alpha = 0.9, na.rm = TRUE) +
+  geom_line(data = df_b_masked, aes(r_pw, value, colour = self_weight_mode, fill = self_weight_mode),
+            linewidth = 0.9, na.rm = TRUE) +
+  geom_point(data = df_b_masked, aes(r_pw, value, colour = self_weight_mode, fill = self_weight_mode),
+             shape = 21, size = 2.3, stroke = 0.5, na.rm = TRUE) +
+  geom_hline(yintercept = c(0, 1), linetype = "dotted", colour = "grey60") +
+  facet_wrap(~ metric_label, scales = "free", ncol = 2) +
+  scale_colour_manual(values = c(raw = "firebrick3", confidence = "steelblue4")) +
+  scale_fill_manual(values   = c(raw = "firebrick1", confidence = "steelblue2")) +
+  scale_x_continuous(breaks = R_DIAG_VALS, labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "B: r_pw only  (r_op = 0, gamma = 0)",
+       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds -- dotted = beyond %.0f%% lost-vote rate",
+                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG, LOST_THRESHOLD * 100),
+       x = "r_pw", y = NULL, colour = "self_weight_mode", fill = "self_weight_mode") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+## 2.3  Condition D: Trust ($\gamma$)
+
+```{r cond-d-plot, fig.width=13, fig.height=18}
+mk_r_level <- \(df) df |> mutate(r_level = factor(paste0("r=", r_op), levels = paste0("r=", R_TRUST_DIAG)))
+
+sim_diag_D          <- sim_diag_agg      |> filter(startsWith(condition, "D:")) |> mk_r_level()
+sim_diag_D_unmasked <- sim_diag_unmasked |> filter(startsWith(condition, "D:")) |> mk_r_level()
+
+ggplot() +
+  geom_line(data = sim_diag_D_unmasked, aes(gamma, value, colour = self_weight_mode, group = self_weight_mode),
+            linetype = "dotted", linewidth = 1.1, alpha = 0.9, na.rm = TRUE) +
+  geom_point(data = sim_diag_D_unmasked, aes(gamma, value, colour = self_weight_mode),
+             size = 1.5, alpha = 0.9, na.rm = TRUE) +
+  geom_line(data = sim_diag_D, aes(gamma, value, colour = self_weight_mode, fill = self_weight_mode),
+            linewidth = 0.9, na.rm = TRUE) +
+  geom_point(data = sim_diag_D, aes(gamma, value, colour = self_weight_mode, fill = self_weight_mode),
+             shape = 21, size = 2.3, stroke = 0.5, na.rm = TRUE) +
+  facet_grid(metric_label ~ r_level, scales = "free_y") +
+  scale_colour_manual(values = c(raw = "firebrick3", confidence = "steelblue4")) +
+  scale_fill_manual(values   = c(raw = "firebrick1", confidence = "steelblue2")) +
+  scale_x_continuous(breaks = GAMMA_VALS, labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "D: trust  (gamma, r_op = r_pw = background level, lambda = 0.5)",
+       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds -- dotted = beyond %.0f%% lost-vote rate",
+                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG, LOST_THRESHOLD * 100),
+       x = "gamma", y = NULL, colour = "self_weight_mode", fill = "self_weight_mode") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+## 2.4  Condition C: $r_{op} \times r_{pw}$ (grid) — models side by side
+
+Unlike A, B and D, the two models are **not** overlaid here — each row is
+one metric, each column is one `self_weight_mode`, so the same metric
+appears twice next to each other under the two models. $r_{op}$ is on the
+x-axis, $r_{pw}$ is shown as one coloured line per level (as in Report
+16's grid line plot); as in Conditions A/B, delegation_rate and
+lost_vote_rate are shown over the full $r$ range, every other metric only
+up to $r_{op}, r_{pw} \le$ `r R_SHORT_MAX`.
+
+```{r cond-c-plot, fig.width=11, fig.height=26}
+# facet_grid only draws x-axis labels on its bottom row, even with free
+# scales -- unusable here since rows have genuinely different ranges
+# (0-128 for delegation/lost-vote vs. 0-16 for everything else). Using
+# facet_wrap instead (which labels every panel), with metric and model
+# interleaved so the two models still land next to each other per metric.
+panel_levels <- as.vector(sapply(unname(rq1_lbl), function(m) paste(m, c("confidence", "raw"))))
+
+mk_panel <- \(df) df |>
+  filter(condition == "C: r_op x r_pw (grid)",
+         metric %in% ALWAYS_VALID | (r_op <= R_SHORT_MAX & r_pw <= R_SHORT_MAX)) |>
+  mutate(r_pw_fac    = factor(r_pw),
+         panel_label = factor(paste(metric_label, self_weight_mode), levels = panel_levels))
+
+sim_diag_C          <- sim_diag_agg      |> mk_panel()
+sim_diag_C_unmasked <- sim_diag_unmasked |> mk_panel()
+
+ggplot() +
+  geom_line(data = sim_diag_C_unmasked, aes(r_op, value, colour = r_pw_fac, group = r_pw_fac),
+            linetype = "dotted", linewidth = 1.0, alpha = 0.85, na.rm = TRUE) +
+  geom_point(data = sim_diag_C_unmasked, aes(r_op, value, colour = r_pw_fac, group = r_pw_fac),
+             size = 1.2, alpha = 0.85, na.rm = TRUE) +
+  geom_line(data = sim_diag_C, aes(r_op, value, colour = r_pw_fac, group = r_pw_fac),
+            linewidth = 0.8, na.rm = TRUE) +
+  geom_point(data = sim_diag_C, aes(r_op, value, colour = r_pw_fac, group = r_pw_fac),
+             size = 1.8, na.rm = TRUE) +
+  facet_wrap(~ panel_label, ncol = 2, scales = "free") +
+  scale_colour_viridis_d(name = "r_pw", end = 0.88) +
+  scale_x_continuous(breaks = R_DIAG_VALS, labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "C: r_op x r_pw -- raw vs. confidence, side by side",
+       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds -- dotted = beyond %.0f%% lost-vote rate",
+                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG, LOST_THRESHOLD * 100),
+       x = "r_op", y = NULL) +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "right")
+```
+
+---
