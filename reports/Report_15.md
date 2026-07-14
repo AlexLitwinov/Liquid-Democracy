@@ -70,9 +70,9 @@ $g_i \in \{\text{minority},\, \text{majority}\}$. The minority comprises
 The baseline attractiveness function is extended by a third
 multiplicative term that captures behavioural ingroup preference:
 
-$$\tilde{A}_{ij}(t) = \sigma\!\left(r_{op}(1-2|o_i-o_j|)\right) \cdot
-  \sigma\!\left(r_{pw}\log\frac{p_j}{p_i}\right) \cdot
-  \sigma\!\left(r_{ingroup} \cdot I(g_i=g_j)\right)$$
+$$\tilde{A}_{ij}(t) = \sigma\left(r_{op}(1-2|o_i-o_j|)\right) \cdot
+  \sigma\left(r_{pw}\log\frac{p_j}{p_i}\right) \cdot
+  \sigma\left(r_{ingroup} \cdot I(g_i=g_j)\right)$$
 
 where the indicator
 
@@ -98,7 +98,7 @@ representatives — the resolved agents who cast a vote directly, i.e. the
 roots of the delegation forest (no outgoing delegation edge):
 
 $$
-r_M = \#\{i \in R : i \in M\},\qquad r_{N \setminus M} = \#\{i \in R : i \in N \setminus M\}
+r_M = \{i \in R : i \in M\},\qquad r_{N \setminus M} = \{i \in R : i \in N \setminus M\}
 $$
 
 $$
@@ -142,8 +142,8 @@ delegate.
 
 $$
 \text{RC}_m =
-\frac{\#\{i \in M : \text{root}(i) \in N \setminus M\}}
-     {\#\{i \in M : \text{root}(i) \text{ is defined}\}}
+\frac{\{i \in M : \text{root}(i) \in N \setminus M\}}
+     {\{i \in M : \text{root}(i) \text{ is defined}\}}
 $$
 
 Fraction of resolved minority agents (by headcount) whose ultimate

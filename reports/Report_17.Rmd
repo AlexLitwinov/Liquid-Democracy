@@ -84,8 +84,7 @@ R_SHORT_MAX <- 16
 The endogenous self-weight used throughout the model (`self_weight_mode = "raw"`)
 computes
 
-$$w_{self,raw}= \sigma\!\left(r_{op}(2|o_i-o_{j^*}|-1)\right) \cdot
-                   \sigma\!\left(r_{pw}\log\frac{p_i}{p_{j^*}}\right),$$
+$$w_{\text{self}}(i) = \sigma\left(r_{op}(2|o_i-o_{j^\ast}|-1)\right)\cdot\sigma\left(r_{pw}\log\tfrac{p_i}{p_{j^\ast}}\right)$$
 
 where $j^*$ is agent $i$'s most attractive neighbour. At
 $r_{op}=r_{pw}=0$ both factors evaluate to $\sigma(0)=0.5$, so
