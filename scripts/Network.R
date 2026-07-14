@@ -6,25 +6,14 @@ source(here::here("scripts/FunctionVersions.R"))
 # =============================================================
 # PERCEPTION HELPERS
 #
-# When sigma = 0, perceived = true (backward compatible).
-#
-# perceive_opinion: logit-space Gaussian noise → output stays in [0, 1]
+# perceive_opinion: logit-space Gaussian noise on observed neighbour opinions.
 #   true_val: numeric vector of true opinions in [0, 1]
-#   sigma:    SD of noise in logit space (0 = no noise)
-#
-# perceive_power: log-space Gaussian noise → output stays positive
-#   true_val: numeric vector of true power values (>= 1)
-#   sigma:    SD of multiplicative noise in log space (0 = no noise)
+#   sigma:    SD of noise in logit space (0 = no noise, default)
 # =============================================================
 
 perceive_opinion <- function(true_val, sigma) {
   if (sigma == 0) return(true_val)
   plogis(qlogis(true_val) + rnorm(length(true_val), 0, sigma))
-}
-
-perceive_power <- function(true_val, sigma) {
-  if (sigma == 0) return(true_val)
-  true_val * exp(rnorm(length(true_val), 0, sigma))
 }
 
 # =============================================================
@@ -142,7 +131,8 @@ propagate_votes <- function(opinion, n, edge_from, edge_to) {
 compute_power_and_votes <- function(opinion, n, edge_from, edge_to) {
   power <- rep(1L, n)
   votes <- opinion
-  if (!length(edge_from)) return(list(power = power, votes = votes))
+  roots <- seq_len(n)  # no delegations: everyone is their own root
+  if (!length(edge_from)) return(list(power = power, votes = votes, roots = roots))
 
   delegate_of <- integer(n)
   delegate_of[edge_from] <- edge_to
@@ -156,38 +146,30 @@ compute_power_and_votes <- function(opinion, n, edge_from, edge_to) {
   votes[edge_from[ok]]  <- opinion[r[ok]]
   votes[edge_from[!ok]] <- NA_real_
 
-  list(power = power, votes = votes)
+  list(power = power, votes = votes, roots = roots)
 }
 
 # =============================================================
 # AGENT SETUP
 # =============================================================
 
-setup_agents <- function(n_per_community, n_communities,
-                         n_experts_per_community, seed = 1,
+setup_agents <- function(n_per_community, n_communities, seed = 1,
                          minority_share = 0) {
   set.seed(seed)
-  n_lay <- n_per_community * n_communities
-  n_exp <- n_experts_per_community * n_communities
-  n_all <- n_lay + n_exp
-
-  n_min   <- round(n_lay * minority_share)
-  grp_lay <- c(rep("minority", n_min), rep("majority", n_lay - n_min))
+  n_all <- n_per_community * n_communities
+  n_min <- round(n_all * minority_share)
 
   agents <- tibble(
     id        = 1:n_all,
-    type      = c(rep("lay", n_lay), rep("expert", n_exp)),
+    type      = rep("lay", n_all),
     opinion   = runif(n_all),
-    community = c(
-                  (0:(n_lay - 1)) %% n_communities,
-                  if (n_exp > 0) (0:(n_exp - 1)) %% n_communities else integer(0)
-                ),
-    group     = c(grp_lay, rep("majority", n_exp)),
+    community = (0:(n_all - 1)) %% n_communities,
+    group     = c(rep("minority", n_min), rep("majority", n_all - n_min)),
     power     = 1L,
     my_vote   = NA_real_,
     delegated = FALSE
   )
-  list(agents = agents, n_lay = n_lay, n_exp = n_exp, n_all = n_all)
+  list(agents = agents, n_lay = n_all, n_all = n_all)
 }
 
 # =============================================================
@@ -201,17 +183,10 @@ setup_agents <- function(n_per_community, n_communities,
 #      p_rewire = 0  : pure ring (high clustering, long paths)
 #      p_rewire ~ 0.05: small-world (high clustering, short paths)
 #      p_rewire = 1  : random graph
-#
-# Experts:
-#   Each expert is connected to ceil(expert_connectedness *
-#   n_per_community) random lay agents in their community.
-#   Direction: lay -> expert only.
-#   Experts never delegate, so no expert -> lay edge is needed.
 # =============================================================
 
 setup_friendship_network <- function(agents, n_communities, node_degree,
-                                     p_rewire = 0.05, seed = 1,
-                                     p_ingroup = 0) {
+                                     p_rewire = 0.05, seed = 1) {
   stopifnot(node_degree %% 2 == 0)
   set.seed(seed)
 
@@ -238,13 +213,7 @@ setup_friendship_network <- function(agents, n_communities, node_degree,
                       edge_list[edge_list[, 2] == u, 1], u)
         cands    <- lay_ids[!lay_ids %in% existing]
         if (length(cands)) {
-          if (p_ingroup != 0) {
-            same_g <- agents$group[cands] == agents$group[u]
-            wts    <- ifelse(same_g, exp(p_ingroup), 1)
-            edge_list[i, 2] <- sample(cands, 1, prob = wts / sum(wts))
-          } else {
-            edge_list[i, 2] <- sample(cands, 1)
-          }
+          edge_list[i, 2] <- sample(cands, 1)
         }
       }
     }
@@ -257,25 +226,6 @@ setup_friendship_network <- function(agents, n_communities, node_degree,
   gF
 }
 
-connect_experts <- function(gF, agents, n_per_community,
-                            expert_connectedness, seed = 1) {
-  set.seed(seed)
-  lay_ids <- which(agents$type == "lay")
-  exp_ids <- which(agents$type == "expert")
-
-  # if no experts exist, return the friendship graph unchanged
-  if (length(exp_ids) == 0) return(gF)
-
-  k <- ceiling(expert_connectedness * n_per_community)
-
-  new_edges <- do.call(rbind, lapply(exp_ids, function(e) {
-    lay_c  <- lay_ids[agents$community[lay_ids] == agents$community[e]]
-    chosen <- sample(lay_c, min(k, length(lay_c)))
-    cbind(chosen, e)
-  }))
-
-  add_edges(gF, as.vector(t(new_edges)))
-}
 
 # =============================================================
 # HOMOPHILY OPINION SHUFFLE (Metropolis)
@@ -388,22 +338,21 @@ compute_network_homophily <- function(gF, agents) {
 #
 # Each of the T rounds:
 #
-#   LAY AGENTS:
-#     Observe the power and opinion of all neighbours from t-1,
-#     subject to perception noise (sigma_opinion, sigma_pow).
-#     Setting both sigmas to 0 (default) reproduces the original
-#     model where perceived = true values.
+#   Each agent observes the opinion of all neighbours from t-1,
+#   subject to optional perception noise (sigma_opinion).
 #
-#     Two-step decision:
-#       Step 1: vote directly with fixed probability p_self;
-#               if no neighbours exist, always vote directly.
-#       Step 2: if delegating, choose neighbour j by
-#               attractiveness(i,j) = proximity x competence
-#               (trust and ingroup modifiers applied here)
-#
-#   EXPERTS:
-#     Always vote directly with their own opinion.
-#     Do not participate in delegation.
+#   Two-step decision (endogenous self-weight):
+#     Step 1: find the most attractive neighbour j* by
+#             attractiveness(i,j) = proximity x competence
+#             (trust and ingroup modifiers applied here);
+#             if no neighbours exist, always vote directly.
+#     Step 2: derive a self-weight from how j* compares to i
+#             (ideological distance, relative power) and vote
+#             directly with that probability; otherwise delegate
+#             to a neighbour sampled proportional to attractiveness.
+#             self_weight_mode = "raw" uses this self-weight as-is;
+#             "confidence" additionally blends it toward "always vote
+#             for yourself" at low total responsiveness (see below).
 #
 #   AFTER EACH ROUND:
 #     Power is computed transitively.
@@ -414,22 +363,19 @@ simulate_liquid_democracy <- function(
     n_per_community         = 250,
     n_communities           = 1,
     node_degree             = 6,
-    n_experts_per_community = 0,
-    expert_connectedness    = 0,
     p_rewire                = 0.05,
     r_op                    = 1,
     r_pw                    = 1,
-    inertia                 = 0,
     T                       = 200,
-    p_self                  = 0.5,
     attractiveness_fn       = attractiveness_dual_sigmoid,
     sigma_opinion           = 0,       # SD of logit-space noise on perceived opinion
-    sigma_pow               = 0,       # SD of log-space noise on perceived power
     minority_share          = 0,       # fraction of lay agents in minority group
     minority_opinion_mu     = NULL,    # if not NULL: minority opinions ~ N(mu, sigma_m)
     minority_opinion_sigma  = 0.1,     # SD for clustered minority opinions
+    majority_opinion_mu     = NULL,    # if not NULL: majority opinions ~ N(mu, sigma_M)
+    majority_opinion_sigma  = 0.1,     # SD for clustered majority opinions
     r_ingroup               = 0,       # ingroup responsiveness (0 = no preference)
-    p_ingroup               = 0,       # structural homophily in network rewiring
+    self_weight_mode        = "raw",   # "raw" | "confidence" — see delegation-decision block
     lambda                  = 0,       # trust decay/momentum  (0 = no trust)
     gamma                   = 0,       # trust sensitivity     (0 = trust disabled)
     cycle_fallback          = "none",  # "none" | "direct" | "redelegate"
@@ -438,27 +384,30 @@ simulate_liquid_democracy <- function(
     homophily_steps         = 100000,  # safety cap on proposed swaps
     snap_rounds             = NULL     # rounds to record full snapshots; NULL = last 5
 ) {
-  st     <- setup_agents(n_per_community, n_communities,
-                         n_experts_per_community, seed,
+  st     <- setup_agents(n_per_community, n_communities, seed,
                          minority_share = minority_share)
   agents <- st$agents
   n_all  <- st$n_all
 
   gF <- setup_friendship_network(agents, n_communities, node_degree,
-                                 p_rewire, seed, p_ingroup = p_ingroup)
-  gF <- connect_experts(gF, agents, n_per_community,
-                        expert_connectedness, seed)
+                                 p_rewire, seed)
 
   # Redistribute lay opinions on the fixed network so that connected
   # agents become more similar. No-op when target_homophily is NULL.
   agents <- shuffle_opinions_homophily(agents, gF, target_homophily,
                                        homophily_t, homophily_steps, seed)
 
-  # Condition B: clustered minority opinions (overrides uniform / shuffled opinions)
+  # Condition B: clustered minority/majority opinions (overrides uniform / shuffled opinions)
   if (!is.null(minority_opinion_mu)) {
     min_ids_init <- which(agents$group == "minority")
     agents$opinion[min_ids_init] <- pmin(pmax(
       rnorm(length(min_ids_init), minority_opinion_mu, minority_opinion_sigma),
+      0), 1)
+  }
+  if (!is.null(majority_opinion_mu)) {
+    maj_ids_init <- which(agents$group == "majority")
+    agents$opinion[maj_ids_init] <- pmin(pmax(
+      rnorm(length(maj_ids_init), majority_opinion_mu, majority_opinion_sigma),
       0), 1)
   }
 
@@ -543,35 +492,10 @@ simulate_liquid_democracy <- function(
       # No neighbours → always vote directly
       if (!length(nb)) return(i)
 
-      # ── Mode A: fixed p_self (default, backward-compatible) ─────────────────
-      if (!is.null(p_self)) {
-        if (runif(1) < p_self) return(i)
-
-        op_nb  <- perceive_opinion(op[nb],  sigma_opinion)
-        pow_nb <- perceive_power(pow[nb], sigma_pow)
-
-        if (inertia > 0 && prev_target[i] != 0L && runif(1) < inertia)
-          return(prev_target[i])
-
-        w_nb <- attractiveness_fn(op[i], op_nb, pow[i], pow_nb, r_op, r_pw)
-
-        if (trust_active && gamma != 0) {
-          trust_mod <- 2 * .sig(gamma * tau[[i]][as.character(nb)])
-          w_nb <- w_nb * trust_mod
-        }
-        if (r_ingroup != 0) {
-          same_g <- as.integer(agents$group[nb] == agents$group[i]) * 2L - 1L
-          w_nb   <- w_nb * .sig(r_ingroup * same_g)
-        }
-        w <- pmax(w_nb, 0)
-        if (sum(w) == 0) w[] <- 1
-        return(nb[sample.int(length(w), 1L, prob = w)])
-      }
-
-      # ── Mode B: endogenous self-weight (p_self = NULL) ───────────────────────
+      # ── Endogenous self-weight ────────────────────────────────────────────
       # Compute neighbour attractiveness first (needed for best-neighbour j*)
       op_nb  <- perceive_opinion(op[nb],  sigma_opinion)
-      pow_nb <- perceive_power(pow[nb], sigma_pow)
+      pow_nb <- pow[nb]
       w_nb   <- attractiveness_fn(op[i], op_nb, pow[i], pow_nb, r_op, r_pw)
 
       if (trust_active && gamma != 0) {
@@ -593,14 +517,24 @@ simulate_liquid_democracy <- function(
       # Self-weight as probability:
       #   high when best neighbour is ideologically far  → prefer own vote
       #   high when own power exceeds j*'s power        → prefer own vote
-      w_self <- .sig(r_op * (2 * abs(op[i] - op_nb[j_idx]) - 1)) *
-                .sig(r_pw * log(max(pow[i], 1e-9) / max(pow_nb[j_idx], 1e-9)))
+      w_self_raw <- .sig(r_op * (2 * abs(op[i] - op_nb[j_idx]) - 1)) *
+                    .sig(r_pw * log(max(pow[i], 1e-9) / max(pow_nb[j_idx], 1e-9)))
+
+      # "confidence" mode: blends w_self_raw with "always vote for yourself"
+      # using a weight that saturates from 0 (r_tot = 0) to 1 (r_tot -> inf),
+      # so the global delegation rate can span the full 0-1 range instead of
+      # floor-ing at w_self_raw's r=0 value (sig(0)*sig(0) = 0.25). r_ingroup
+      # is included in r_tot so ingroup preference alone can still induce
+      # delegation when r_op = r_pw = 0.
+      w_self <- if (self_weight_mode == "confidence") {
+        r_tot <- r_op + r_pw + r_ingroup
+        conf  <- r_tot / (1 + r_tot)
+        (1 - conf) + conf * w_self_raw
+      } else {
+        w_self_raw
+      }
 
       if (runif(1) < w_self) return(i)
-
-      # Delegate — inertia check before sampling
-      if (inertia > 0 && prev_target[i] != 0L && runif(1) < inertia)
-        return(prev_target[i])
 
       nb[sample.int(length(w), 1L, prob = w)]
     }, integer(1L))
@@ -711,6 +645,19 @@ simulate_liquid_democracy <- function(
         mean(agents$group[edge_from] != agents$group[edge_to])
       else 0
 
+      # Minority Voter Self-Representation (VSR_m): share of resolved
+      # minority agents (by headcount) whose delegation chain root is
+      # itself minority. Agents stuck in a cycle have no defined root and
+      # are excluded from both numerator and denominator -- matching
+      # Minority Power Capture (PC_m)'s resolved-only convention, so the
+      # two are directly comparable (headcount vs. power-weighted versions
+      # of the same resolved-only question).
+      root_group_s   <- ifelse(is.na(pv$roots), NA_character_, agents$group[pv$roots])
+      min_repr_ids_s <- min_ids_s[!is.na(root_group_s[min_ids_s])]
+      min_self_rep_rate <- if (length(min_repr_ids_s) > 0)
+        mean(root_group_s[min_repr_ids_s] == "minority")
+      else NA_real_
+
       min_vtr <- min_ids_s[!is.na(agents$my_vote[min_ids_s])]
       min_enp <- if (length(min_vtr) > 0) {
         pm <- agents$power[min_vtr]
@@ -743,6 +690,7 @@ simulate_liquid_democracy <- function(
         delegation_stability        = stab,
         minority_power_share        = min_pwr_shr,
         RR_m                        = RR_m,
+        minority_self_rep_rate      = min_self_rep_rate,
         cross_group_dlg_rate        = cross_grp_rate,
         minority_enp                = min_enp,
         minority_chain_len          = min_chain,

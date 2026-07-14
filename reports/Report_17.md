@@ -46,26 +46,50 @@ by colour would be unreadable.
 
 ## 2.1 Condition A: $r_{op}$ only
 
+Delegation rate and lost-vote rate, shown over the full $r_{op}$ range
+(0-128, thinned to 0, 2, 4, 8, 16, 32, 64, 128), with a zoom to
+$r_{op} \in [0, 16]$ directly underneath. The remaining metrics follow
+further below, capped at $r_{op} \le$ 16.
+
 ![](Report_17_files/figure-gfm/cond-a-plot-1.png)<!-- -->
+
+![](Report_17_files/figure-gfm/cond-a-plot-zoom-1.png)<!-- -->
+
+![](Report_17_files/figure-gfm/cond-a-plot-other-1.png)<!-- -->
 
 ## 2.2 Condition B: $r_{pw}$ only
 
+Delegation rate and lost-vote rate, shown over the full $r_{pw}$ range
+(0-128, thinned to 0, 2, 4, 8, 16, 32, 64, 128), with a zoom to
+$r_{pw} \in [0, 16]$ directly underneath. The remaining metrics follow
+further below, capped at $r_{pw} \le$ 16.
+
 ![](Report_17_files/figure-gfm/cond-b-plot-1.png)<!-- -->
 
-## 2.3 Condition D: Trust ($\gamma$)
+![](Report_17_files/figure-gfm/cond-b-plot-zoom-1.png)<!-- -->
 
-![](Report_17_files/figure-gfm/cond-d-plot-1.png)<!-- -->
+![](Report_17_files/figure-gfm/cond-b-plot-other-1.png)<!-- -->
 
-## 2.4 Condition C: $r_{op} \times r_{pw}$ (grid) — models side by side
+## 2.3 Condition C: $r_{op} \times r_{pw}$ (grid) — models side by side
 
 Unlike A, B and D, the two models are **not** overlaid here — each row
 is one metric, each column is one `self_weight_mode`, so the same metric
 appears twice next to each other under the two models. $r_{op}$ is on
 the x-axis, $r_{pw}$ is shown as one coloured line per level (as in
-Report 16’s grid line plot); as in Conditions A/B, delegation_rate and
-lost_vote_rate are shown over the full $r$ range, every other metric
-only up to $r_{op}, r_{pw} \le$ 16.
+Report 16’s grid line plot). Delegation_rate and lost_vote_rate are
+shown first, over the full $r$ range (thinned to 0, 2, 4, 8, 16, 32, 64,
+128 on both axes), with a zoom to $r_{op}, r_{pw} \in [0, 16]$ directly
+underneath; every other metric follows further below, capped at
+$r_{op}, r_{pw} \le$ 16.
 
 ![](Report_17_files/figure-gfm/cond-c-plot-1.png)<!-- -->
+
+![](Report_17_files/figure-gfm/cond-c-plot-zoom-1.png)<!-- -->
+
+![](Report_17_files/figure-gfm/cond-c-plot-other-1.png)<!-- -->
+
+## 2.4 Condition D: Trust ($\gamma$)
+
+![](Report_17_files/figure-gfm/cond-d-plot-1.png)<!-- -->
 
 ------------------------------------------------------------------------

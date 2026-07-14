@@ -156,3 +156,119 @@ selfweight_dual_sigmoid <- function(i, nb, op, pow, r_op, r_pw) {
   .sig(r_op * (2 * abs(op[i] - op[j_star]) - 1)) *
   .sig(r_pw * log(pow[i] / pow[j_star]))
 }
+
+
+# =============================================================
+# ARCHIVED NETWORK FEATURES
+#
+# Removed from Network.R to keep the active model lean.
+# Each block is self-contained and documents exactly where
+# and how to re-insert the feature.
+# =============================================================
+
+# ── perceive_power ────────────────────────────────────────────
+# Log-space Gaussian noise on observed neighbour power.
+# Parameter: sigma_pow (SD >= 0; 0 = perfect observation).
+#
+# To re-enable: add sigma_pow = 0 to simulate_liquid_democracy()
+# and replace `pow_nb <- pow[nb]` (in both Mode A and Mode B)
+# with: pow_nb <- perceive_power(pow[nb], sigma_pow)
+perceive_power <- function(true_val, sigma) {
+  if (sigma == 0) return(true_val)
+  true_val * exp(rnorm(length(true_val), 0, sigma))
+}
+
+
+# ── connect_experts ───────────────────────────────────────────
+# Adds directed lay -> expert edges to the friendship graph.
+# Parameters:
+#   expert_connectedness — fraction of community lay agents
+#                          connected to each expert
+#
+# To re-enable: add n_experts_per_community = 0 and
+# expert_connectedness = 0 to simulate_liquid_democracy(), add
+# n_experts_per_community to setup_agents() (see below), and
+# call after setup_friendship_network():
+#   gF <- connect_experts(gF, agents, n_per_community,
+#                         expert_connectedness, seed)
+connect_experts <- function(gF, agents, n_per_community,
+                            expert_connectedness, seed = 1) {
+  set.seed(seed)
+  lay_ids <- which(agents$type == "lay")
+  exp_ids <- which(agents$type == "expert")
+  if (length(exp_ids) == 0) return(gF)
+  k <- ceiling(expert_connectedness * n_per_community)
+  new_edges <- do.call(rbind, lapply(exp_ids, function(e) {
+    lay_c  <- lay_ids[agents$community[lay_ids] == agents$community[e]]
+    chosen <- sample(lay_c, min(k, length(lay_c)))
+    cbind(chosen, e)
+  }))
+  add_edges(gF, as.vector(t(new_edges)))
+}
+
+
+# ── Expert agents — setup_agents version with experts ─────────
+# Replace the current setup_agents() with this version to
+# re-enable expert agents.  Also pass n_experts_per_community
+# to simulate_liquid_democracy() and call connect_experts()
+# after setup_friendship_network() (see above).
+# Experts always vote directly; exclude from lay_ids loop.
+#
+# setup_agents <- function(n_per_community, n_communities,
+#                          n_experts_per_community, seed = 1,
+#                          minority_share = 0) {
+#   set.seed(seed)
+#   n_lay <- n_per_community * n_communities
+#   n_exp <- n_experts_per_community * n_communities
+#   n_all <- n_lay + n_exp
+#   n_min   <- round(n_lay * minority_share)
+#   grp_lay <- c(rep("minority", n_min), rep("majority", n_lay - n_min))
+#   agents <- tibble(
+#     id        = 1:n_all,
+#     type      = c(rep("lay", n_lay), rep("expert", n_exp)),
+#     opinion   = runif(n_all),
+#     community = c((0:(n_lay - 1)) %% n_communities,
+#                   if (n_exp > 0) (0:(n_exp - 1)) %% n_communities
+#                   else integer(0)),
+#     group     = c(grp_lay, rep("majority", n_exp)),
+#     power     = 1L, my_vote = NA_real_, delegated = FALSE
+#   )
+#   list(agents = agents, n_lay = n_lay, n_exp = n_exp, n_all = n_all)
+# }
+
+
+# ── p_ingroup — structural homophily in WS rewiring ───────────
+# Rewires edges preferentially toward same-group agents.
+# Parameter: p_ingroup (log-odds weight; 0 = uniform rewiring).
+#
+# To re-enable: add p_ingroup = 0 to setup_friendship_network()
+# and simulate_liquid_democracy(), then replace the plain
+# sample() line in the WS rewiring loop with:
+#
+#   if (p_ingroup != 0) {
+#     same_g <- agents$group[cands] == agents$group[u]
+#     wts    <- ifelse(same_g, exp(p_ingroup), 1)
+#     edge_list[i, 2] <- sample(cands, 1, prob = wts / sum(wts))
+#   } else {
+#     edge_list[i, 2] <- sample(cands, 1)
+#   }
+
+
+# ── inertia — delegation persistence across rounds ────────────
+# With probability `inertia` an agent skips re-evaluation and
+# re-delegates to their previous target.
+# Parameter: inertia in [0, 1].
+#
+# To re-enable: add inertia = 0 to simulate_liquid_democracy().
+#
+# Mode A (fixed p_self) — insert after the p_self self-vote check,
+# before the attractiveness computation:
+#
+#   if (inertia > 0 && prev_target[i] != 0L && runif(1) < inertia)
+#     return(prev_target[i])
+#
+# Mode B (endogenous self-weight) — insert before final sampling,
+# after the w_self < runif(1) self-vote check:
+#
+#   if (inertia > 0 && prev_target[i] != 0L && runif(1) < inertia)
+#     return(prev_target[i])

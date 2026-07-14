@@ -34,6 +34,11 @@ SELF_WEIGHT_MODES <- c("raw", "confidence")
 R_DIAG_VALS   <- c(0, 0.5, 1, 2, 4, 8, 16, 32, 64, 128)
 N_SEEDS_DIAG  <- 50L
 
+# The full 0-128 sweep is dense near 0 (0, 0.5, 1) for resolution elsewhere,
+# but that crowds the axis on delegation_rate/lost_vote_rate plots, which
+# span the whole range -- those use this sparser subset of points instead.
+R_SPARSE_VALS <- c(0, 2, 4, 8, 16, 32, 64, 128)
+
 # ── Metrics actually implemented in Network.R's snapshot tibble ─────────────
 # NOTE: minority_capture and minority_vote_share (MVS) are documented in
 # Report 15 but not yet computed in Network.R, so they cannot be plotted here.
@@ -229,25 +234,72 @@ sim_diag_unmasked <- sim_diag_agg_raw |>
 
 ## 2.1  Condition A: $r_{op}$ only
 
-```{r cond-a-plot, fig.width=10, fig.height=16}
-df_a_masked   <- sim_diag_agg      |> filter(condition == "A: r_op only", metric %in% ALWAYS_VALID | r_op <= R_SHORT_MAX)
-df_a_unmasked <- sim_diag_unmasked |> filter(condition == "A: r_op only", metric %in% ALWAYS_VALID | r_op <= R_SHORT_MAX)
+Delegation rate and lost-vote rate, shown over the full $r_{op}$ range
+(0-128, thinned to `r paste(R_SPARSE_VALS, collapse = ", ")`), with a
+zoom to $r_{op} \in [0, 16]$ directly underneath. The remaining metrics
+follow further below, capped at $r_{op} \le$ `r R_SHORT_MAX`.
+
+```{r cond-a-plot, fig.width=10, fig.height=5}
+df_a_primary <- sim_diag_agg |>
+  filter(condition == "A: r_op only", metric %in% ALWAYS_VALID, r_op %in% R_SPARSE_VALS)
+
+ggplot(df_a_primary, aes(r_op, value, colour = self_weight_mode, fill = self_weight_mode)) +
+  geom_line(linewidth = 0.9, na.rm = TRUE) +
+  geom_point(shape = 21, size = 2.3, stroke = 0.5, na.rm = TRUE) +
+  geom_hline(yintercept = c(0, 1), linetype = "dotted", colour = "grey60") +
+  facet_wrap(~ metric_label, scales = "free", ncol = 2) +
+  scale_colour_manual(values = c(raw = "firebrick3", confidence = "steelblue4")) +
+  scale_fill_manual(values   = c(raw = "firebrick1", confidence = "steelblue2")) +
+  scale_x_continuous(breaks = R_SPARSE_VALS, labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "A: r_op only -- delegation_rate & lost_vote_rate (full range)",
+       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds",
+                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG),
+       x = "r_op", y = NULL, colour = "self_weight_mode", fill = "self_weight_mode") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+```{r cond-a-plot-zoom, fig.width=10, fig.height=5}
+df_a_zoom <- sim_diag_agg |>
+  filter(condition == "A: r_op only", metric %in% ALWAYS_VALID, r_op <= R_SHORT_MAX)
+
+ggplot(df_a_zoom, aes(r_op, value, colour = self_weight_mode, fill = self_weight_mode)) +
+  geom_line(linewidth = 0.9, na.rm = TRUE) +
+  geom_point(shape = 21, size = 2.3, stroke = 0.5, na.rm = TRUE) +
+  geom_hline(yintercept = c(0, 1), linetype = "dotted", colour = "grey60") +
+  facet_wrap(~ metric_label, scales = "free", ncol = 2) +
+  scale_colour_manual(values = c(raw = "firebrick3", confidence = "steelblue4")) +
+  scale_fill_manual(values   = c(raw = "firebrick1", confidence = "steelblue2")) +
+  scale_x_continuous(breaks = R_DIAG_VALS[R_DIAG_VALS <= R_SHORT_MAX], labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "A: r_op only -- zoom to r_op in [0, 16]",
+       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds",
+                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG),
+       x = "r_op", y = NULL, colour = "self_weight_mode", fill = "self_weight_mode") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+```{r cond-a-plot-other, fig.width=10, fig.height=12}
+df_a_other_masked   <- sim_diag_agg      |> filter(condition == "A: r_op only", !metric %in% ALWAYS_VALID, r_op <= R_SHORT_MAX)
+df_a_other_unmasked <- sim_diag_unmasked |> filter(condition == "A: r_op only", !metric %in% ALWAYS_VALID, r_op <= R_SHORT_MAX)
 
 ggplot() +
-  geom_line(data = df_a_unmasked, aes(r_op, value, colour = self_weight_mode, group = self_weight_mode),
+  geom_line(data = df_a_other_unmasked, aes(r_op, value, colour = self_weight_mode, group = self_weight_mode),
             linetype = "dotted", linewidth = 1.1, alpha = 0.9, na.rm = TRUE) +
-  geom_point(data = df_a_unmasked, aes(r_op, value, colour = self_weight_mode),
+  geom_point(data = df_a_other_unmasked, aes(r_op, value, colour = self_weight_mode),
              size = 1.5, alpha = 0.9, na.rm = TRUE) +
-  geom_line(data = df_a_masked, aes(r_op, value, colour = self_weight_mode, fill = self_weight_mode),
+  geom_line(data = df_a_other_masked, aes(r_op, value, colour = self_weight_mode, fill = self_weight_mode),
             linewidth = 0.9, na.rm = TRUE) +
-  geom_point(data = df_a_masked, aes(r_op, value, colour = self_weight_mode, fill = self_weight_mode),
+  geom_point(data = df_a_other_masked, aes(r_op, value, colour = self_weight_mode, fill = self_weight_mode),
              shape = 21, size = 2.3, stroke = 0.5, na.rm = TRUE) +
   geom_hline(yintercept = c(0, 1), linetype = "dotted", colour = "grey60") +
   facet_wrap(~ metric_label, scales = "free", ncol = 2) +
   scale_colour_manual(values = c(raw = "firebrick3", confidence = "steelblue4")) +
   scale_fill_manual(values   = c(raw = "firebrick1", confidence = "steelblue2")) +
-  scale_x_continuous(breaks = R_DIAG_VALS, labels = scales::label_number(drop0trailing = TRUE)) +
-  labs(title = "A: r_op only  (r_pw = 0, gamma = 0)",
+  scale_x_continuous(breaks = R_DIAG_VALS[R_DIAG_VALS <= R_SHORT_MAX], labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "A: r_op only -- other metrics",
        subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds -- dotted = beyond %.0f%% lost-vote rate",
                           N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG, LOST_THRESHOLD * 100),
        x = "r_op", y = NULL, colour = "self_weight_mode", fill = "self_weight_mode") +
@@ -258,25 +310,72 @@ ggplot() +
 
 ## 2.2  Condition B: $r_{pw}$ only
 
-```{r cond-b-plot, fig.width=10, fig.height=16}
-df_b_masked   <- sim_diag_agg      |> filter(condition == "B: r_pw only", metric %in% ALWAYS_VALID | r_pw <= R_SHORT_MAX)
-df_b_unmasked <- sim_diag_unmasked |> filter(condition == "B: r_pw only", metric %in% ALWAYS_VALID | r_pw <= R_SHORT_MAX)
+Delegation rate and lost-vote rate, shown over the full $r_{pw}$ range
+(0-128, thinned to `r paste(R_SPARSE_VALS, collapse = ", ")`), with a
+zoom to $r_{pw} \in [0, 16]$ directly underneath. The remaining metrics
+follow further below, capped at $r_{pw} \le$ `r R_SHORT_MAX`.
+
+```{r cond-b-plot, fig.width=10, fig.height=5}
+df_b_primary <- sim_diag_agg |>
+  filter(condition == "B: r_pw only", metric %in% ALWAYS_VALID, r_pw %in% R_SPARSE_VALS)
+
+ggplot(df_b_primary, aes(r_pw, value, colour = self_weight_mode, fill = self_weight_mode)) +
+  geom_line(linewidth = 0.9, na.rm = TRUE) +
+  geom_point(shape = 21, size = 2.3, stroke = 0.5, na.rm = TRUE) +
+  geom_hline(yintercept = c(0, 1), linetype = "dotted", colour = "grey60") +
+  facet_wrap(~ metric_label, scales = "free", ncol = 2) +
+  scale_colour_manual(values = c(raw = "firebrick3", confidence = "steelblue4")) +
+  scale_fill_manual(values   = c(raw = "firebrick1", confidence = "steelblue2")) +
+  scale_x_continuous(breaks = R_SPARSE_VALS, labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "B: r_pw only -- delegation_rate & lost_vote_rate (full range)",
+       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds",
+                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG),
+       x = "r_pw", y = NULL, colour = "self_weight_mode", fill = "self_weight_mode") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+```{r cond-b-plot-zoom, fig.width=10, fig.height=5}
+df_b_zoom <- sim_diag_agg |>
+  filter(condition == "B: r_pw only", metric %in% ALWAYS_VALID, r_pw <= R_SHORT_MAX)
+
+ggplot(df_b_zoom, aes(r_pw, value, colour = self_weight_mode, fill = self_weight_mode)) +
+  geom_line(linewidth = 0.9, na.rm = TRUE) +
+  geom_point(shape = 21, size = 2.3, stroke = 0.5, na.rm = TRUE) +
+  geom_hline(yintercept = c(0, 1), linetype = "dotted", colour = "grey60") +
+  facet_wrap(~ metric_label, scales = "free", ncol = 2) +
+  scale_colour_manual(values = c(raw = "firebrick3", confidence = "steelblue4")) +
+  scale_fill_manual(values   = c(raw = "firebrick1", confidence = "steelblue2")) +
+  scale_x_continuous(breaks = R_DIAG_VALS[R_DIAG_VALS <= R_SHORT_MAX], labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "B: r_pw only -- zoom to r_pw in [0, 16]",
+       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds",
+                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG),
+       x = "r_pw", y = NULL, colour = "self_weight_mode", fill = "self_weight_mode") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+```{r cond-b-plot-other, fig.width=10, fig.height=12}
+df_b_other_masked   <- sim_diag_agg      |> filter(condition == "B: r_pw only", !metric %in% ALWAYS_VALID, r_pw <= R_SHORT_MAX)
+df_b_other_unmasked <- sim_diag_unmasked |> filter(condition == "B: r_pw only", !metric %in% ALWAYS_VALID, r_pw <= R_SHORT_MAX)
 
 ggplot() +
-  geom_line(data = df_b_unmasked, aes(r_pw, value, colour = self_weight_mode, group = self_weight_mode),
+  geom_line(data = df_b_other_unmasked, aes(r_pw, value, colour = self_weight_mode, group = self_weight_mode),
             linetype = "dotted", linewidth = 1.1, alpha = 0.9, na.rm = TRUE) +
-  geom_point(data = df_b_unmasked, aes(r_pw, value, colour = self_weight_mode),
+  geom_point(data = df_b_other_unmasked, aes(r_pw, value, colour = self_weight_mode),
              size = 1.5, alpha = 0.9, na.rm = TRUE) +
-  geom_line(data = df_b_masked, aes(r_pw, value, colour = self_weight_mode, fill = self_weight_mode),
+  geom_line(data = df_b_other_masked, aes(r_pw, value, colour = self_weight_mode, fill = self_weight_mode),
             linewidth = 0.9, na.rm = TRUE) +
-  geom_point(data = df_b_masked, aes(r_pw, value, colour = self_weight_mode, fill = self_weight_mode),
+  geom_point(data = df_b_other_masked, aes(r_pw, value, colour = self_weight_mode, fill = self_weight_mode),
              shape = 21, size = 2.3, stroke = 0.5, na.rm = TRUE) +
   geom_hline(yintercept = c(0, 1), linetype = "dotted", colour = "grey60") +
   facet_wrap(~ metric_label, scales = "free", ncol = 2) +
   scale_colour_manual(values = c(raw = "firebrick3", confidence = "steelblue4")) +
   scale_fill_manual(values   = c(raw = "firebrick1", confidence = "steelblue2")) +
-  scale_x_continuous(breaks = R_DIAG_VALS, labels = scales::label_number(drop0trailing = TRUE)) +
-  labs(title = "B: r_pw only  (r_op = 0, gamma = 0)",
+  scale_x_continuous(breaks = R_DIAG_VALS[R_DIAG_VALS <= R_SHORT_MAX], labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "B: r_pw only -- other metrics",
        subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds -- dotted = beyond %.0f%% lost-vote rate",
                           N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG, LOST_THRESHOLD * 100),
        x = "r_pw", y = NULL, colour = "self_weight_mode", fill = "self_weight_mode") +
@@ -285,7 +384,105 @@ ggplot() +
         legend.position  = "bottom")
 ```
 
-## 2.3  Condition D: Trust ($\gamma$)
+## 2.3  Condition C: $r_{op} \times r_{pw}$ (grid) — models side by side
+
+Unlike A, B and D, the two models are **not** overlaid here — each row is
+one metric, each column is one `self_weight_mode`, so the same metric
+appears twice next to each other under the two models. $r_{op}$ is on the
+x-axis, $r_{pw}$ is shown as one coloured line per level (as in Report
+16's grid line plot). Delegation_rate and lost_vote_rate are shown first,
+over the full $r$ range (thinned to `r paste(R_SPARSE_VALS, collapse = ", ")`
+on both axes), with a zoom to $r_{op}, r_{pw} \in [0, 16]$ directly
+underneath; every other metric follows further below, capped at
+$r_{op}, r_{pw} \le$ `r R_SHORT_MAX`.
+
+```{r cond-c-plot, fig.width=11, fig.height=8}
+# facet_grid only draws x-axis labels on its bottom row, even with free
+# scales -- unusable here since rows have genuinely different ranges
+# (0-128 for delegation/lost-vote vs. 0-16 for everything else). Using
+# facet_wrap instead (which labels every panel), with metric and model
+# interleaved so the two models still land next to each other per metric.
+panel_levels <- as.vector(sapply(unname(rq1_lbl), function(m) paste(m, c("confidence", "raw"))))
+
+mk_panel_primary <- \(df) df |>
+  filter(condition == "C: r_op x r_pw (grid)", metric %in% ALWAYS_VALID,
+         r_op %in% R_SPARSE_VALS, r_pw %in% R_SPARSE_VALS) |>
+  mutate(r_pw_fac    = factor(r_pw),
+         panel_label = factor(paste(metric_label, self_weight_mode), levels = panel_levels))
+
+sim_diag_C_primary <- sim_diag_agg |> mk_panel_primary()
+
+ggplot(sim_diag_C_primary, aes(r_op, value, colour = r_pw_fac, group = r_pw_fac)) +
+  geom_line(linewidth = 0.8, na.rm = TRUE) +
+  geom_point(size = 1.8, na.rm = TRUE) +
+  facet_wrap(~ panel_label, ncol = 2, scales = "free") +
+  scale_colour_viridis_d(name = "r_pw", end = 0.88) +
+  scale_x_continuous(breaks = R_SPARSE_VALS, labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "C: r_op x r_pw -- delegation_rate & lost_vote_rate (full range)",
+       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds",
+                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG),
+       x = "r_op", y = NULL) +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "right")
+```
+
+```{r cond-c-plot-zoom, fig.width=11, fig.height=9}
+mk_panel_zoom <- \(df) df |>
+  filter(condition == "C: r_op x r_pw (grid)", metric %in% ALWAYS_VALID,
+         r_op <= R_SHORT_MAX, r_pw <= R_SHORT_MAX) |>
+  mutate(r_pw_fac    = factor(r_pw),
+         panel_label = factor(paste(metric_label, self_weight_mode), levels = panel_levels))
+
+sim_diag_C_zoom <- sim_diag_agg |> mk_panel_zoom()
+
+ggplot(sim_diag_C_zoom, aes(r_op, value, colour = r_pw_fac, group = r_pw_fac)) +
+  geom_line(linewidth = 0.8, na.rm = TRUE) +
+  geom_point(size = 1.8, na.rm = TRUE) +
+  facet_wrap(~ panel_label, ncol = 2, scales = "free") +
+  scale_colour_viridis_d(name = "r_pw", end = 0.88) +
+  scale_x_continuous(breaks = R_DIAG_VALS[R_DIAG_VALS <= R_SHORT_MAX], labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "C: r_op x r_pw -- zoom to [0, 16], raw vs. confidence, side by side",
+       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds",
+                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG),
+       x = "r_op", y = NULL) +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "right")
+```
+
+```{r cond-c-plot-other, fig.width=11, fig.height=19}
+mk_panel_other <- \(df) df |>
+  filter(condition == "C: r_op x r_pw (grid)", !metric %in% ALWAYS_VALID,
+         r_op <= R_SHORT_MAX, r_pw <= R_SHORT_MAX) |>
+  mutate(r_pw_fac    = factor(r_pw),
+         panel_label = factor(paste(metric_label, self_weight_mode), levels = panel_levels))
+
+sim_diag_C_other          <- sim_diag_agg      |> mk_panel_other()
+sim_diag_C_other_unmasked <- sim_diag_unmasked |> mk_panel_other()
+
+ggplot() +
+  geom_line(data = sim_diag_C_other_unmasked, aes(r_op, value, colour = r_pw_fac, group = r_pw_fac),
+            linetype = "dotted", linewidth = 1.0, alpha = 0.85, na.rm = TRUE) +
+  geom_point(data = sim_diag_C_other_unmasked, aes(r_op, value, colour = r_pw_fac, group = r_pw_fac),
+             size = 1.2, alpha = 0.85, na.rm = TRUE) +
+  geom_line(data = sim_diag_C_other, aes(r_op, value, colour = r_pw_fac, group = r_pw_fac),
+            linewidth = 0.8, na.rm = TRUE) +
+  geom_point(data = sim_diag_C_other, aes(r_op, value, colour = r_pw_fac, group = r_pw_fac),
+             size = 1.8, na.rm = TRUE) +
+  facet_wrap(~ panel_label, ncol = 2, scales = "free") +
+  scale_colour_viridis_d(name = "r_pw", end = 0.88) +
+  scale_x_continuous(breaks = R_DIAG_VALS[R_DIAG_VALS <= R_SHORT_MAX], labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "C: r_op x r_pw -- other metrics",
+       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds -- dotted = beyond %.0f%% lost-vote rate",
+                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG, LOST_THRESHOLD * 100),
+       x = "r_op", y = NULL) +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "right")
+```
+
+## 2.4  Condition D: Trust ($\gamma$)
 
 ```{r cond-d-plot, fig.width=13, fig.height=18}
 mk_r_level <- \(df) df |> mutate(r_level = factor(paste0("r=", r_op), levels = paste0("r=", R_TRUST_DIAG)))
@@ -313,54 +510,6 @@ ggplot() +
   theme(strip.background = element_rect(fill = "grey93", colour = NA),
         strip.text       = element_text(face = "bold", size = 9),
         legend.position  = "bottom")
-```
-
-## 2.4  Condition C: $r_{op} \times r_{pw}$ (grid) — models side by side
-
-Unlike A, B and D, the two models are **not** overlaid here — each row is
-one metric, each column is one `self_weight_mode`, so the same metric
-appears twice next to each other under the two models. $r_{op}$ is on the
-x-axis, $r_{pw}$ is shown as one coloured line per level (as in Report
-16's grid line plot); as in Conditions A/B, delegation_rate and
-lost_vote_rate are shown over the full $r$ range, every other metric only
-up to $r_{op}, r_{pw} \le$ `r R_SHORT_MAX`.
-
-```{r cond-c-plot, fig.width=11, fig.height=26}
-# facet_grid only draws x-axis labels on its bottom row, even with free
-# scales -- unusable here since rows have genuinely different ranges
-# (0-128 for delegation/lost-vote vs. 0-16 for everything else). Using
-# facet_wrap instead (which labels every panel), with metric and model
-# interleaved so the two models still land next to each other per metric.
-panel_levels <- as.vector(sapply(unname(rq1_lbl), function(m) paste(m, c("confidence", "raw"))))
-
-mk_panel <- \(df) df |>
-  filter(condition == "C: r_op x r_pw (grid)",
-         metric %in% ALWAYS_VALID | (r_op <= R_SHORT_MAX & r_pw <= R_SHORT_MAX)) |>
-  mutate(r_pw_fac    = factor(r_pw),
-         panel_label = factor(paste(metric_label, self_weight_mode), levels = panel_levels))
-
-sim_diag_C          <- sim_diag_agg      |> mk_panel()
-sim_diag_C_unmasked <- sim_diag_unmasked |> mk_panel()
-
-ggplot() +
-  geom_line(data = sim_diag_C_unmasked, aes(r_op, value, colour = r_pw_fac, group = r_pw_fac),
-            linetype = "dotted", linewidth = 1.0, alpha = 0.85, na.rm = TRUE) +
-  geom_point(data = sim_diag_C_unmasked, aes(r_op, value, colour = r_pw_fac, group = r_pw_fac),
-             size = 1.2, alpha = 0.85, na.rm = TRUE) +
-  geom_line(data = sim_diag_C, aes(r_op, value, colour = r_pw_fac, group = r_pw_fac),
-            linewidth = 0.8, na.rm = TRUE) +
-  geom_point(data = sim_diag_C, aes(r_op, value, colour = r_pw_fac, group = r_pw_fac),
-             size = 1.8, na.rm = TRUE) +
-  facet_wrap(~ panel_label, ncol = 2, scales = "free") +
-  scale_colour_viridis_d(name = "r_pw", end = 0.88) +
-  scale_x_continuous(breaks = R_DIAG_VALS, labels = scales::label_number(drop0trailing = TRUE)) +
-  labs(title = "C: r_op x r_pw -- raw vs. confidence, side by side",
-       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds -- dotted = beyond %.0f%% lost-vote rate",
-                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG, LOST_THRESHOLD * 100),
-       x = "r_op", y = NULL) +
-  theme(strip.background = element_rect(fill = "grey93", colour = NA),
-        strip.text       = element_text(face = "bold", size = 9),
-        legend.position  = "right")
 ```
 
 ---
