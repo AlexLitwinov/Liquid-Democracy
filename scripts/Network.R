@@ -368,7 +368,7 @@ simulate_liquid_democracy <- function(
     r_pw                    = 1,
     T                       = 200,
     attractiveness_fn       = attractiveness_dual_sigmoid,
-    sigma_opinion           = 0,       # SD of logit-space noise on perceived opinion
+    sigma_opinion           = 0,       # SD of logit-space noise on perceived opinion; 0 = exact, "auto" = sd(agents$opinion) for this run
     minority_share          = 0,       # fraction of lay agents in minority group
     minority_opinion_mu     = NULL,    # if not NULL: minority opinions ~ N(mu, sigma_m)
     minority_opinion_sigma  = 0.1,     # SD for clustered minority opinions
@@ -376,8 +376,11 @@ simulate_liquid_democracy <- function(
     majority_opinion_sigma  = 0.1,     # SD for clustered majority opinions
     r_ingroup               = 0,       # ingroup responsiveness (0 = no preference)
     self_weight_mode        = "raw",   # "raw" | "confidence" — see delegation-decision block
+    confidence_agg          = "sum",   # "sum" | "mean" — how "confidence" combines r_op/r_pw/r_ingroup (Report 18)
     lambda                  = 0,       # trust decay/momentum  (0 = no trust)
     gamma                   = 0,       # trust sensitivity     (0 = trust disabled)
+    trust_mode              = "punish_only", # "punish_only" | "reward_punish" — see trust-update block
+    cycle_penalty           = 1,       # kappa_cyc: penalty for a non-delivering (cyclic) neighbour, "reward_punish" only
     cycle_fallback          = "none",  # "none" | "direct" | "redelegate"
     target_homophily        = NULL,    # target assortativity; NULL disables shuffle
     homophily_t             = 5,       # Metropolis temperature (higher = more greedy)
@@ -392,12 +395,12 @@ simulate_liquid_democracy <- function(
   gF <- setup_friendship_network(agents, n_communities, node_degree,
                                  p_rewire, seed)
 
-  # Redistribute lay opinions on the fixed network so that connected
-  # agents become more similar. No-op when target_homophily is NULL.
-  agents <- shuffle_opinions_homophily(agents, gF, target_homophily,
-                                       homophily_t, homophily_steps, seed)
-
-  # Condition B: clustered minority/majority opinions (overrides uniform / shuffled opinions)
+  # Condition B: clustered minority/majority opinions -- applied BEFORE the
+  # homophily shuffle below (not after), so the shuffle rearranges these
+  # group-differentiated opinions across the network instead of being
+  # overwritten by them. With target_homophily also set, this is what lets
+  # opinion-based network clustering indirectly cluster by group too,
+  # since group and opinion are correlated once this block runs.
   if (!is.null(minority_opinion_mu)) {
     min_ids_init <- which(agents$group == "minority")
     agents$opinion[min_ids_init] <- pmin(pmax(
@@ -411,6 +414,19 @@ simulate_liquid_democracy <- function(
       0), 1)
   }
 
+  # Redistribute lay opinions on the fixed network so that connected
+  # agents become more similar. No-op when target_homophily is NULL.
+  agents <- shuffle_opinions_homophily(agents, gF, target_homophily,
+                                       homophily_t, homophily_steps, seed)
+
+  # sigma_opinion = "auto": derive the perception-noise SD from this run's
+  # own opinion population (empirical SD of agents$opinion around its
+  # mean) instead of a hand-picked constant -- computed once here, since
+  # opinions are fixed at initialisation and never change over T.
+  if (identical(sigma_opinion, "auto")) {
+    sigma_opinion <- sd(agents$opinion)
+  }
+
   adj     <- lapply(seq_len(n_all),
                     \(v) as.integer(neighbors(gF, v, mode = "out")))
   lay_ids <- which(agents$type == "lay")
@@ -419,8 +435,12 @@ simulate_liquid_democracy <- function(
   # Trust state — only allocated when trust is active (gamma > 0 or lambda > 0)
   trust_active <- (lambda != 0 || gamma != 0)
   prev_my_vote <- rep(NA_real_, n_all)
+  # tau[[i]][k] tracks trust toward adj[[i]][k] -- positional, not keyed by
+  # neighbour id, since adj (and therefore each agent's neighbour order) is
+  # fixed for the whole simulation. Avoids character-vector hash lookups in
+  # the hot loop below.
   tau <- if (trust_active)
-    lapply(adj, function(nb) setNames(rep(0.0, length(nb)), as.character(nb)))
+    lapply(adj, function(nb) rep(0.0, length(nb)))
   else NULL
 
   prev_lost_ids <- integer(0L)   # lay agents whose vote was NA last round
@@ -474,17 +494,22 @@ simulate_liquid_democracy <- function(
     # Delegation decision
     # --------------------------------------------------
     targets <- vapply(lay_ids, function(i) {
-      nb <- adj[[i]]
+      nb    <- adj[[i]]
+      tau_i <- tau[[i]]  # positionally aligned with adj[[i]]; kept in sync with nb below
 
       # Between-round fallback: if vote was lost last round, adjust choice
       if (cycle_fallback != "none" && prev_lost_set[i]) {
         if (cycle_fallback == "direct") return(i)
         if (cycle_fallback == "redelegate") {
           # exclude the specific delegate that caused the cycle last round
-          nb <- nb[nb != prev_target[i]]
+          keep <- nb != prev_target[i]
+          nb   <- nb[keep]
+          if (trust_active) tau_i <- tau_i[keep]
         } else if (cycle_fallback == "informed") {
           # only consider neighbours whose vote was represented last round
-          nb <- nb[!is.na(prev_my_vote[nb])]
+          keep <- !is.na(prev_my_vote[nb])
+          nb   <- nb[keep]
+          if (trust_active) tau_i <- tau_i[keep]
           if (!length(nb)) return(i)
         }
       }
@@ -499,7 +524,7 @@ simulate_liquid_democracy <- function(
       w_nb   <- attractiveness_fn(op[i], op_nb, pow[i], pow_nb, r_op, r_pw)
 
       if (trust_active && gamma != 0) {
-        trust_mod <- 2 * .sig(gamma * tau[[i]][as.character(nb)])
+        trust_mod <- 2 * .sig(gamma * tau_i)
         w_nb <- w_nb * trust_mod
       }
       if (r_ingroup != 0) {
@@ -526,8 +551,22 @@ simulate_liquid_democracy <- function(
       # floor-ing at w_self_raw's r=0 value (sig(0)*sig(0) = 0.25). r_ingroup
       # is included in r_tot so ingroup preference alone can still induce
       # delegation when r_op = r_pw = 0.
+      #   confidence_agg = "sum"  (default, Report 17): r_tot = r_op+r_pw+r_ingroup
+      #     -- confidence rises with the *number* of active dimensions, not
+      #     just their strength (e.g. two dimensions at 0.5 give more
+      #     confidence than one at 0.5, even if nothing individually changed).
+      #   confidence_agg = "mean" (Report 18): r_tot = average of the
+      #     *active* (non-zero) dimensions -- fixes the artefact above by
+      #     dividing by the count of active dimensions rather than a fixed 3,
+      #     so a permanently-zero dimension (e.g. r_ingroup in Report 17/18's
+      #     diagnostic sweeps) doesn't dilute confidence for no reason.
       w_self <- if (self_weight_mode == "confidence") {
-        r_tot <- r_op + r_pw + r_ingroup
+        active_r <- c(r_op, r_pw, r_ingroup)
+        r_tot <- if (confidence_agg == "mean") {
+          sum(active_r) / max(1, sum(active_r > 0))
+        } else {
+          sum(active_r)
+        }
         conf  <- r_tot / (1 + r_tot)
         (1 - conf) + conf * w_self_raw
       } else {
@@ -558,17 +597,39 @@ simulate_liquid_democracy <- function(
     agents$delegated <- delegated_vec
 
     # --------------------------------------------------
-    # Trust update: tau_ij(t) = lambda*tau_ij(t-1) - (1-lambda)*|o_i - v_j(t-1)|
+    # Trust update.
+    #   "punish_only" (default, Report 17/18 Sec 2.4): tau_ij(t) =
+    #     lambda*tau_ij(t-1) - (1-lambda)*|o_i - v_j(t-1)|, only when
+    #     neighbour j delivered a vote last round. A neighbour whose vote
+    #     was lost (stuck in a cycle) is skipped entirely -- tau simply
+    #     doesn't update for that pair, so cycling carries no trust penalty
+    #     at all and tau <= 0 always (trust can only ever shrink
+    #     attractiveness, never boost it).
+    #   "reward_punish" (Report 18 Sec 3): tau_ij(t) = lambda*tau_ij(t-1) +
+    #     (1-lambda)*s, with s = 1-2|o_i-v_j(t-1)| when j delivered a vote
+    #     (positive for agreement, negative for disagreement -- same
+    #     2|.|-1 convention as the attractiveness formula) and s =
+    #     -cycle_penalty when j's vote was lost. tau can now be positive,
+    #     so trust_mod = 2*sigmoid(gamma*tau) can exceed 1 for a
+    #     consistently well-agreeing neighbour, and cycling is punished
+    #     explicitly rather than passed over.
     if (trust_active) {
       for (i in lay_ids) {
-        nb <- adj[[i]]
+        nb    <- adj[[i]]
         if (!length(nb)) next
         vj    <- prev_my_vote[nb]
         valid <- !is.na(vj)
-        if (!any(valid)) next
-        nb_ch <- as.character(nb)
-        tau[[i]][nb_ch[valid]] <- lambda * tau[[i]][nb_ch[valid]] -
-          (1 - lambda) * abs(op[i] - vj[valid])
+
+        if (trust_mode == "reward_punish") {
+          s          <- numeric(length(nb))
+          s[valid]   <- 1 - 2 * abs(op[i] - vj[valid])
+          s[!valid]  <- -cycle_penalty
+          tau[[i]] <- lambda * tau[[i]] + (1 - lambda) * s
+        } else {
+          if (!any(valid)) next
+          tau[[i]][valid] <- lambda * tau[[i]][valid] -
+            (1 - lambda) * abs(op[i] - vj[valid])
+        }
       }
     }
     prev_my_vote <- agents$my_vote  # always update: used by trust and informed fallback
@@ -632,10 +693,26 @@ simulate_liquid_democracy <- function(
 
       # ---- Minority metrics ------------------------------------------------
       min_ids_s   <- which(agents$group == "minority")
+      maj_ids_s   <- which(agents$group == "majority")
       min_pop_shr <- length(min_ids_s) / n_all
 
-      if (min_pop_shr > 0 && sum(agents$power) > 0) {
-        min_pwr_shr <- sum(agents$power[min_ids_s]) / sum(agents$power)
+      # Descriptive voting power (P_M, P_Maj, Report 19 item 1) -- power
+      # actually cast after votes are resolved. compute_power() gives every
+      # agent a baseline power=1 that is NEVER zeroed out for delegators, so
+      # summing agents$power over a group double-counts: a delegator's own
+      # baseline entry counts once directly, and again inside whichever
+      # root's accumulated power they contributed to. Only roots (no
+      # outgoing delegation edge) actually cast a vote, so restrict to
+      # roots_snap -- a delegator's "final voting power" is correctly 0,
+      # not 1, since their vote is cast by their root, not by them.
+      root_power <- numeric(n_all)
+      if (length(roots_snap) > 0) root_power[roots_snap] <- agents$power[roots_snap]
+
+      minority_power <- sum(root_power[min_ids_s])
+      majority_power <- sum(root_power[maj_ids_s])
+
+      if (min_pop_shr > 0 && sum(root_power) > 0) {
+        min_pwr_shr <- minority_power / sum(root_power)
         RR_m        <- min_pwr_shr / min_pop_shr
       } else {
         min_pwr_shr <- 0; RR_m <- NA_real_
@@ -644,6 +721,34 @@ simulate_liquid_democracy <- function(
       cross_grp_rate <- if (length(edge_from) > 0)
         mean(agents$group[edge_from] != agents$group[edge_to])
       else 0
+
+      # Symmetric, directional cross-group delegation rates (Report 19 item
+      # 4): share of each group's OWN outgoing delegation edges that cross
+      # into the other group. Replaces the population-wide cross_grp_rate
+      # above (kept for backward compatibility with earlier reports) with
+      # two group-restricted rates that don't get dominated by whichever
+      # group is larger.
+      from_is_min <- agents$group[edge_from] == "minority"
+      from_is_maj <- agents$group[edge_from] == "majority"
+      cdr_min_to_maj <- if (any(from_is_min))
+        mean(agents$group[edge_to[from_is_min]] != "minority") else NA_real_
+      cdr_maj_to_min <- if (any(from_is_maj))
+        mean(agents$group[edge_to[from_is_maj]] == "minority") else NA_real_
+
+      # Group-specific delegation_rate / lost_vote_rate (Report 19): same
+      # definitions as the population-wide history_delegation/history_lost,
+      # restricted to each group's own agents.
+      minority_delegation_rate <- mean(agents$delegated[min_ids_s])
+      majority_delegation_rate <- mean(agents$delegated[maj_ids_s])
+      minority_lost_vote_rate  <- mean(is.na(agents$my_vote[min_ids_s]))
+      majority_lost_vote_rate  <- mean(is.na(agents$my_vote[maj_ids_s]))
+
+      # Number of distinct representatives (roots) contributed by each group
+      # -- Report 19's group-specific stand-in for total_components, and the
+      # same r_M / r_Maj quantity introduced as "descriptive counts" in
+      # Report 15 Section 3.
+      minority_n_reps <- if (length(roots_snap) > 0) sum(agents$group[roots_snap] == "minority") else 0L
+      majority_n_reps <- if (length(roots_snap) > 0) sum(agents$group[roots_snap] == "majority") else 0L
 
       # Minority Voter Self-Representation (VSR_m): share of resolved
       # minority agents (by headcount) whose delegation chain root is
@@ -654,8 +759,29 @@ simulate_liquid_democracy <- function(
       # of the same resolved-only question).
       root_group_s   <- ifelse(is.na(pv$roots), NA_character_, agents$group[pv$roots])
       min_repr_ids_s <- min_ids_s[!is.na(root_group_s[min_ids_s])]
+      maj_repr_ids_s <- maj_ids_s[!is.na(root_group_s[maj_ids_s])]
       min_self_rep_rate <- if (length(min_repr_ids_s) > 0)
         mean(root_group_s[min_repr_ids_s] == "minority")
+      else NA_real_
+
+      # Minority Power Capture (PC_m, Report 19 item 3): fraction of the
+      # minority's total voting power ultimately represented by a majority
+      # delegate. NOTE: every agent contributes exactly 1 unit of power to
+      # wherever their chain terminates (compute_power() has no heterogeneous
+      # weighting), so under the current model this is numerically identical
+      # to 1 - minority_self_rep_rate -- kept as its own named column per
+      # Report 15's definition, and would diverge from the headcount version
+      # if the model is ever extended with non-uniform starting power.
+      minority_capture <- if (length(min_repr_ids_s) > 0)
+        mean(root_group_s[min_repr_ids_s] == "majority")
+      else NA_real_
+
+      # Majority Power Capture (PC_Maj, symmetric counterpart requested for
+      # Report 19): fraction of the majority's resolved agents ultimately
+      # represented by a MINORITY delegate -- same headcount-equals-power
+      # caveat as PC_m above.
+      majority_capture <- if (length(maj_repr_ids_s) > 0)
+        mean(root_group_s[maj_repr_ids_s] == "minority")
       else NA_real_
 
       min_vtr <- min_ids_s[!is.na(agents$my_vote[min_ids_s])]
@@ -675,6 +801,20 @@ simulate_liquid_democracy <- function(
       min_drift <- if (nrow(min_rep) > 0)
         mean(abs(min_rep$opinion - min_rep$my_vote)) else NA_real_
 
+      # Majority-side mirrors of min_chain/min_drift (Report 19: chain
+      # length and drift, group-specific).
+      maj_vtr <- maj_ids_s[!is.na(agents$my_vote[maj_ids_s])]
+      maj_dlg <- maj_ids_s[agents$delegated[maj_ids_s]]
+      maj_chain <- if (length(maj_dlg) > 0 && length(roots_snap) > 0 && ecount(gD) > 0) {
+        dm  <- distances(gD, v = maj_dlg, to = roots_snap, mode = "out")
+        cls <- apply(dm, 1, function(d) { fd <- d[is.finite(d)]; if (length(fd)) min(fd) else NA_real_ })
+        mean(cls, na.rm = TRUE)
+      } else 0
+
+      maj_rep   <- agents[maj_vtr, ]
+      maj_drift <- if (nrow(maj_rep) > 0)
+        mean(abs(maj_rep$opinion - maj_rep$my_vote)) else NA_real_
+
       snapshot_list[[as.character(t)]] <- tibble(
         round                       = t,
         pct_T                       = t / T,
@@ -688,13 +828,26 @@ simulate_liquid_democracy <- function(
         largest_voting_bloc_share   = largest_voting_bloc,
         total_components            = total_components,
         delegation_stability        = stab,
+        minority_power              = minority_power,
+        majority_power              = majority_power,
         minority_power_share        = min_pwr_shr,
         RR_m                        = RR_m,
+        minority_capture            = minority_capture,
         minority_self_rep_rate      = min_self_rep_rate,
         cross_group_dlg_rate        = cross_grp_rate,
+        cdr_min_to_maj              = cdr_min_to_maj,
+        cdr_maj_to_min              = cdr_maj_to_min,
+        minority_delegation_rate    = minority_delegation_rate,
+        majority_delegation_rate    = majority_delegation_rate,
+        minority_lost_vote_rate     = minority_lost_vote_rate,
+        majority_lost_vote_rate     = majority_lost_vote_rate,
+        minority_n_reps             = minority_n_reps,
+        majority_n_reps             = majority_n_reps,
         minority_enp                = min_enp,
         minority_chain_len          = min_chain,
         minority_drift              = min_drift,
+        majority_chain_len          = maj_chain,
+        majority_drift              = maj_drift,
         direct_yes                  = sum(agents$opinion >= 0.5),
         direct_no                   = sum(agents$opinion  < 0.5),
         direct_margin               = sum(agents$opinion >= 0.5) -

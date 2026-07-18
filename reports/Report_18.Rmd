@@ -1,0 +1,1195 @@
+---
+title: "Weekly Report -- Weeks 18-19: Confidence Aggregation & Minority Representation"
+output: github_document
+date: "2026-07-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 6)
+library(tidyverse)
+library(here)
+library(furrr)
+library(patchwork)
+library(digest)
+library(knitr)
+
+theme_set(theme_minimal(base_size = 12))
+source(here::here("scripts/Network.R"))
+
+# ── Simulation constants (shared across this report) ────────────────────────
+MINORITY_SHARE   <- 0.2
+OP_SIGMA         <- 0.1
+SIM_T            <- 20L
+N_SIM            <- 500L
+K_SIM            <- 14L
+P_REWIRE         <- 0.05
+
+DELTA_VALS           <- c(0.2, 0.4)
+R_INGROUP_VALS       <- c(0, 1, 2, 4, 8)
+CONFIDENCE_AGG_MODES <- c("sum", "mean")
+
+# ── Diagnostic-sweep constants (Part I) ──────────────────────────────────────
+R_DIAG_VALS   <- c(0, 0.5, 1, 2, 4, 8, 16, 32, 64, 128)
+N_SEEDS_DIAG  <- 25L
+
+# The full 0-128 sweep is dense near 0 (0, 0.5, 1) for resolution elsewhere,
+# but that crowds the axis on delegation_rate/lost_vote_rate plots, which
+# span the whole range -- those use this sparser subset of points instead.
+R_SPARSE_VALS <- c(0, 2, 4, 8, 16, 32, 64, 128)
+
+# ── Metrics actually implemented in Network.R's snapshot tibble ─────────────
+# NOTE: minority_capture and minority_vote_share (MVS) are documented in
+# Report 15 but not yet computed in Network.R, so they cannot be plotted here.
+minority_metrics <- c("RR_m", "minority_self_rep_rate")
+
+minority_lbl <- c(
+  RR_m                   = "Relative Representation (RR_m)",
+  minority_self_rep_rate = "Minority Self-Representation Rate (SR_m)"
+)
+
+# Metrics tracked in Section 3 (Sum vs. Average Confidence Aggregation)
+rq1_metrics <- c("delegation_rate", "lost_vote_rate", "avg_chain_length_delegators",
+                  "avg_drift", "top5_power_share", "share_50pct", "total_components")
+
+rq1_lbl <- c(
+  delegation_rate             = "Delegation Rate",
+  lost_vote_rate              = "Lost Vote Rate",
+  avg_chain_length_delegators = "Avg. Chain Length",
+  avg_drift                   = "Avg. Ideological Drift",
+  top5_power_share            = "Top-5% Power Share",
+  share_50pct                 = "Agents for 50% Votes",
+  total_components            = "Components"
+)
+
+# delegation_rate/lost_vote_rate always mean something; the rest are computed
+# from represented (non-lost) agents only and become unreliable once most
+# votes are lost -- masked to NA beyond LOST_THRESHOLD, mirroring Report 16/17.
+ALWAYS_VALID   <- c("delegation_rate", "lost_vote_rate")
+MASK_METRICS   <- setdiff(rq1_metrics, ALWAYS_VALID)
+LOST_THRESHOLD <- 0.90
+
+# delegation_rate/lost_vote_rate are shown over the full R_DIAG_VALS range
+# (up to 128); every other metric is only shown up to R_SHORT_MAX, since
+# beyond that they are already masked out by LOST_THRESHOLD for most of the
+# range anyway and just crowd the axis.
+R_SHORT_MAX <- 16
+
+# ── Minority-representation constants (Part II) ─────────────────────────────
+N_SEEDS_MINORITY <- 25L
+
+# r_op = r_pw = r_trust ("background responsiveness") is swept as a
+# robustness check: does the r_ingroup/condition story hold up at low (1),
+# medium (4) and high (8) background responsiveness, or is it specific to
+# one regime? Deliberately NOT averaged across these -- see discussion in
+# Section 5.2.
+R_BACKGROUND_VALS <- c(1, 4, 8)
+
+# "homophily" (Report 15 called this "clustered") reuses the existing
+# opinion-based network shuffle (shuffle_opinions_homophily(), Report 9)
+# instead of building a new group-based shuffle from scratch: it runs on
+# top of "polarised" opinions, so making the network assortative on
+# opinion indirectly clusters it by group too, since the two are
+# correlated once minority/majority opinion means differ. Fixed at
+# delta=0.4 only (strongest opinion-group correlation, clearest effect)
+# so the grid gives exactly 4 conditions, not 5.
+HOMOPHILY_TARGET_R <- 0.9   # same target as Report 15's CLUSTER_TARGET_R
+HOMOPHILY_DELTA    <- 0.4
+
+# Trust uses the reward+punish update (Section 4) rather than the flawed
+# punish_only default. Self-weight uses confidence_agg = "sum" (Section 1)
+# rather than "mean": the sum treats corroborating dimensions as cumulative
+# evidence and stays monotonic in each r, unlike the average -- see Section
+# 1's discussion. lambda and kappa_cyc reuse Section 3/4's LAMBDA_DIAG and
+# CYCLE_PENALTY, already defined by the time Part II runs.
+TRUST_MODE       <- "reward_punish"
+SELF_WEIGHT_MODE <- "confidence"
+CONFIDENCE_AGG   <- "sum"
+
+# Colour convention used throughout Part II: majority = blue, minority =
+# red, population-wide/"all" = grey.
+GROUP_COLOURS <- c(all = "grey40", minority = "firebrick3", majority = "steelblue4")
+```
+
+---
+
+# Part I: Delegation Dynamics in Liquid Democracy
+
+## RQ1: Which ranges of the responsiveness parameters produce meaningful changes in delegation dynamics?
+
+- **H1a.** The relationship between opinion responsiveness ($r_{op}$) and
+  delegation dynamics is non-linear and exhibits a saturation point.
+- **H2a.** The relationship between power responsiveness ($r_{pw}$) and
+  delegation dynamics is non-linear and exhibits a saturation point.
+- **H3a.** The joint effect of opinion and power responsiveness
+  ($r_{op}=r_{pw}$) on delegation dynamics is non-linear and exhibits a
+  saturation point.
+- **H4a.** The relationship between trust responsiveness ($r_{trust}$)
+  and delegation dynamics is non-linear and exhibits a saturation point.
+
+*Operationalized by:* delegation rate, representative share, average
+delegation chain length, cycle rate, lost-vote rate, etc.
+
+## RQ2: How do responsiveness parameters affect the quality of political representation?
+
+- **H1b.** Increasing opinion responsiveness improves the quality of
+  political representation by reducing ideological drift.
+- **H2b.** Increasing power responsiveness reduces the quality of
+  political representation by increasing ideological drift.
+- **H3b.** Joint increases in opinion and power responsiveness increase
+  ideological drift, with the centralizing effect of power responsiveness
+  outweighing gains in ideological proximity.
+- **H4b.** Increasing trust responsiveness moderates the effects of
+  opinion and power responsiveness on ideological drift.
+
+*Operationalized by:* average ideological drift.
+
+## RQ3: How do responsiveness parameters affect the concentration of voting power?
+
+- **H1c.** Increasing opinion responsiveness increases the concentration
+  of voting power.
+- **H2c.** Increasing power responsiveness increases the concentration
+  of voting power.
+- **H3c.** Joint increases in opinion and power responsiveness further
+  increase the concentration of voting power.
+- **H4c.** Increasing trust responsiveness moderates the concentration
+  effects of opinion and power responsiveness.
+
+*Operationalized by:* Top 5% voting-power share, share of agents
+required to accumulate 50% of the total voting power.
+
+---
+
+# 1  Purpose
+
+Report 17 introduced a confidence-weighted self-weight to remove the
+$w_{self}^{raw}=0.25$ floor at $r_{op}=r_{pw}=0$. The active responsiveness
+dimensions can be aggregated into a single confidence signal either by
+their **sum** or by their **average**:
+
+$$\text{(sum)}\quad r_{tot} = r_{op} + r_{pw} + r_{ingroup}, \qquad
+  \text{(average)}\quad \bar r = \frac{r_{op} + r_{pw} + r_{ingroup}}{d}, \quad
+  d = \max(1,\ \#\{r > 0\}),$$
+
+$$\text{conf} = \frac{r_{agg}}{1+r_{agg}}, \qquad
+  w_{self} = (1-\text{conf}) + \text{conf}\, w_{self}^{raw}, \qquad
+  r_{agg} \in \{r_{tot}, \bar r\}.$$
+
+An earlier version of this report replaced the sum with the average
+outright, on the grounds that summing conflates the *number* of active
+dimensions with their *strength*. On reflection that critique does not
+clearly favour one formulation over the other: the sum treats
+corroborating signals across dimensions as cumulative evidence -- a
+defensible modelling choice, not an artefact -- while the average is
+*not* monotonic in each individual $r$: activating a new, weaker
+dimension can lower $\bar r$, and therefore lower confidence, which is
+itself an odd property for a model where every active dimension is
+supposed to make delegation more informed, not less.
+
+Using only active dimensions in the average avoids artificially reducing
+confidence when a responsiveness mechanism is disabled (here
+$r_{ingroup}=0$ throughout). The boundary cases coincide for both
+aggregators: $r_{agg} = 0$ gives Direct Democracy ($w_{self}=1$), while
+$r_{agg} \to \infty$ recovers the original model
+($w_{self} \to w_{self}^{raw}$); they differ only once two or more
+dimensions are simultaneously active.
+
+**Perception uncertainty.** All simulations below also
+enable `sigma_opinion = "auto"`. Instead of assuming perfect knowledge
+(`sigma_opinion = 0`), each simulation derives a perception-noise scale
+from the standard deviation of the initial opinion distribution,
+
+$$\sigma = \text{sd}\big(\{o_i\}_{i \in N}\big),$$
+
+and transforms every neighbour observation in logit space,
+
+$$\widehat{o_j} = \text{logit}^{-1}\big(\text{logit}(o_j) + \varepsilon\big),
+  \qquad \varepsilon \sim \mathcal{N}(0, \sigma^2).$$
+
+$\sigma$ itself is a plain probability-space quantity (the SD of the
+opinions, in $[0,1]$), reused unscaled as the SD of $\varepsilon$ --
+only the transformation is applied in logit space, not the SD's
+derivation. This report-wide change applies to all conditions equally
+and models delegation decisions under imperfect rather than perfect
+perception.
+
+*Note:* the logit-space SD ($\text{sd}(\text{logit}(o_i))$) would be the
+"correct" alternative -- for this report's `runif(0,1)` opinions it is
+exactly $2\pi\times$ larger ($1.81$ vs. $0.29$). $\sigma$ is kept in
+probability space deliberately, as a scaling constant, not an estimate.
+
+---
+
+# 2  Sum vs. Average: Testing the Confidence Aggregator
+
+```{r rq1-constants, include=FALSE}
+R_TRUST_VALS   <- c(0, 1, 2, 4, 8, 16)
+R_TRUST_DIAG   <- c(1, 2, 4, 8)
+LAMBDA_DIAG    <- 0.5   # not yet derived -- see half-life note below
+CYCLE_PENALTY  <- 1   # kappa_cyc for the "reward_punish" trust update, Section 4
+```
+
+*Note on r_trust` (not applied -- for later justification):*
+Rather than choosing the trust decay parameter $\lambda$ arbitrarily, it
+can be linked to an intuitive memory horizon. In
+$\tau(t)=\lambda\tau(t-1)+(1-\lambda)s$, a signal from $k$ rounds ago
+still carries weight $\lambda^k$, giving a trust half-life of
+$h=\ln(0.5)/\ln(\lambda)$, or equivalently
+$\lambda=0.5^{1/h}$. Thus $\lambda=0.5$ corresponds to a half-life of
+just one round -- trust is already half-forgotten after a single
+interaction. Since all metrics in this report are averaged over the
+**last 5 rounds** (`round >= T-4`), a more natural choice would be to
+align the trust memory with the same time horizon, giving
+$\lambda=0.5^{1/5}\approx0.871$.
+
+```{r diag-run-one, include=FALSE}
+# NOTE: Network.R's simulate_liquid_democracy() still names this parameter
+# `gamma`; renamed to `r_trust` everywhere in this report for consistency
+# with r_op/r_pw/r_ingroup, and mapped back to `gamma =` only at the call
+# site below.
+run_diag_one <- function(seed, r_op, r_pw, r_trust, confidence_agg, lambda_val = 0,
+                          trust_mode = "punish_only", cycle_penalty_val = 1) {
+  res <- simulate_liquid_democracy(
+    seed              = seed,
+    n_per_community   = N_SIM,
+    n_communities     = 1,
+    node_degree       = K_SIM,
+    T                 = SIM_T,
+    r_op              = r_op,
+    r_pw              = r_pw,
+    p_rewire          = P_REWIRE,
+    gamma             = r_trust,
+    lambda            = lambda_val,
+    self_weight_mode  = "confidence",
+    confidence_agg    = confidence_agg,
+    trust_mode        = trust_mode,
+    cycle_penalty     = cycle_penalty_val,
+    sigma_opinion     = "auto"
+  )
+  snaps <- res$snapshots |> dplyr::filter(round >= SIM_T - 4L)
+  tibble(
+    seed                        = seed,
+    r_op                        = r_op,
+    r_pw                        = r_pw,
+    r_trust                     = r_trust,
+    confidence_agg              = confidence_agg,
+    delegation_rate             = mean(res$history_delegation[(SIM_T - 4L):SIM_T], na.rm = TRUE),
+    lost_vote_rate               = mean(res$history_lost[(SIM_T - 4L):SIM_T],       na.rm = TRUE),
+    avg_chain_length_delegators = mean(snaps$avg_chain_length_delegators, na.rm = TRUE),
+    avg_drift                   = mean(snaps$avg_drift,                  na.rm = TRUE),
+    top5_power_share            = mean(snaps$top5_power_share,           na.rm = TRUE),
+    share_50pct                 = mean(snaps$share_50pct,                na.rm = TRUE),
+    total_components            = mean(snaps$total_components,           na.rm = TRUE)
+  )
+}
+```
+
+```{r diag-simulate, include=FALSE}
+seeds_diag <- seq_len(N_SEEDS_DIAG)
+
+grid_A <- expand_grid(r_op = R_DIAG_VALS, r_pw = 0, r_trust = 0,
+                       confidence_agg = CONFIDENCE_AGG_MODES, seed = seeds_diag) |>
+  mutate(condition = "A: r_op only")
+grid_B <- expand_grid(r_op = 0, r_pw = R_DIAG_VALS, r_trust = 0,
+                       confidence_agg = CONFIDENCE_AGG_MODES, seed = seeds_diag) |>
+  mutate(condition = "B: r_pw only")
+# Simulated grid trimmed to exactly what the Condition C plots below use:
+# the zoom/other-metrics plots need every R_DIAG_VALS pair up to
+# R_SHORT_MAX, and the full-range delegation/lost-vote plot needs the
+# R_SPARSE_VALS x R_SPARSE_VALS pairs out to 128 -- their union (88 of the
+# 100 combos in the full R_DIAG_VALS x R_DIAG_VALS cross) is all that's
+# ever plotted, so the other 12 combos are never simulated.
+grid_C_short <- R_DIAG_VALS[R_DIAG_VALS <= R_SHORT_MAX]
+grid_C_pairs <- bind_rows(
+  expand_grid(r_op = grid_C_short,  r_pw = grid_C_short),
+  expand_grid(r_op = R_SPARSE_VALS, r_pw = R_SPARSE_VALS)
+) |> distinct()
+grid_C <- grid_C_pairs |>
+  tidyr::crossing(r_trust = 0, confidence_agg = CONFIDENCE_AGG_MODES, seed = seeds_diag) |>
+  mutate(condition = "C: r_op x r_pw (grid)")
+grid_D <- purrr::map_dfr(R_TRUST_DIAG, function(rv)
+  expand_grid(r_op = rv, r_pw = rv, r_trust = R_TRUST_VALS,
+              confidence_agg = CONFIDENCE_AGG_MODES, seed = seeds_diag) |>
+    mutate(condition = paste0("D: trust (r=", rv, ")"))
+)
+# Same shape as grid_D, but using the new "reward_punish" trust update
+# (Section 4) instead of the default "punish_only" -- everything else
+# (r_op/r_pw background levels, r_trust sweep, lambda) identical, so the
+# only thing that differs between D and D2 is the trust-update formula.
+grid_D2 <- purrr::map_dfr(R_TRUST_DIAG, function(rv)
+  expand_grid(r_op = rv, r_pw = rv, r_trust = R_TRUST_VALS,
+              confidence_agg = CONFIDENCE_AGG_MODES, seed = seeds_diag) |>
+    mutate(condition = paste0("D2: trust, reward+punish (r=", rv, ")"))
+)
+
+run_cond <- function(grid_df, lambda_val = 0, trust_mode = "punish_only", cycle_penalty_val = 1) {
+  future_pmap_dfr(
+    list(seed = grid_df$seed, r_op = grid_df$r_op, r_pw = grid_df$r_pw,
+         r_trust = grid_df$r_trust, confidence_agg = grid_df$confidence_agg,
+         condition = grid_df$condition),
+    function(seed, r_op, r_pw, r_trust, confidence_agg, condition)
+      run_diag_one(seed, r_op, r_pw, r_trust, confidence_agg, lambda_val,
+                   trust_mode, cycle_penalty_val) |>
+        mutate(condition = condition),
+    .options = furrr_options(seed = NULL)
+  )
+}
+
+# Each condition (A/B/C/D/D2) gets its own cache file/hash instead of one
+# all-or-nothing cache for the combined sweep -- changing a constant that
+# only affects e.g. D/D2 (like R_TRUST_VALS) no longer forces A/B/C to
+# recompute too.
+stage_cond <- function(name, params) {
+  hash <- digest::digest(params)
+  file <- here::here(sprintf("data/sim_report18_diag_%s_cache.rds", name))
+  if (file.exists(file)) {
+    cc <- readRDS(file)
+    if (identical(cc$hash, hash)) return(list(name = name, file = file, hash = hash, data = cc$data, stale = FALSE))
+  }
+  list(name = name, file = file, hash = hash, data = NULL, stale = TRUE)
+}
+
+base_params_diag <- list(N = N_SIM, K = K_SIM, T = SIM_T, n_seeds = N_SEEDS_DIAG,
+                          self_weight_mode = "confidence", agg_modes = CONFIDENCE_AGG_MODES,
+                          sigma_opinion = "auto", metrics = rq1_metrics)
+
+st_A  <- stage_cond("A",  c(base_params_diag, list(r_vals = R_DIAG_VALS, version = 1L)))
+st_B  <- stage_cond("B",  c(base_params_diag, list(r_vals = R_DIAG_VALS, version = 1L)))
+st_C  <- stage_cond("C",  c(base_params_diag, list(pairs = grid_C_pairs, version = 1L)))
+st_D  <- stage_cond("D",  c(base_params_diag, list(r_trust_vals = R_TRUST_VALS, r_trust_bg = R_TRUST_DIAG,
+                                                     lambda = LAMBDA_DIAG, version = 1L)))
+st_D2 <- stage_cond("D2", c(base_params_diag, list(r_trust_vals = R_TRUST_VALS, r_trust_bg = R_TRUST_DIAG,
+                                                     lambda = LAMBDA_DIAG, cycle_penalty = CYCLE_PENALTY, version = 1L)))
+
+if (st_A$stale || st_B$stale || st_C$stale || st_D$stale || st_D2$stale) {
+  dir.create(here::here("data"), showWarnings = FALSE)
+  plan(multisession, workers = parallel::detectCores() - 1)
+
+  if (st_A$stale)  st_A$data  <- run_cond(grid_A)
+  if (st_B$stale)  st_B$data  <- run_cond(grid_B)
+  if (st_C$stale)  st_C$data  <- run_cond(grid_C)
+  if (st_D$stale)  st_D$data  <- run_cond(grid_D,  lambda_val = LAMBDA_DIAG)
+  if (st_D2$stale) st_D2$data <- run_cond(grid_D2, lambda_val = LAMBDA_DIAG,
+                                           trust_mode = "reward_punish", cycle_penalty_val = CYCLE_PENALTY)
+
+  plan(sequential)
+
+  for (st in list(st_A, st_B, st_C, st_D, st_D2))
+    if (st$stale) saveRDS(list(hash = st$hash, data = st$data), st$file)
+}
+
+sim_diag <- bind_rows(st_A$data, st_B$data, st_C$data, st_D$data, st_D2$data)
+
+sim_diag_agg_raw <- sim_diag |>
+  group_by(condition, r_op, r_pw, r_trust, confidence_agg) |>
+  summarise(across(all_of(rq1_metrics), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
+
+# Mask concentration/chain-length/component metrics once too many votes are
+# lost to be meaningful; delegation_rate and lost_vote_rate stay untouched.
+sim_diag_agg <- sim_diag_agg_raw |>
+  mutate(across(all_of(MASK_METRICS), \(x) ifelse(lost_vote_rate > LOST_THRESHOLD, NA_real_, x))) |>
+  pivot_longer(all_of(rq1_metrics), names_to = "metric", values_to = "value") |>
+  mutate(metric_label = factor(rq1_lbl[metric], levels = unname(rq1_lbl)))
+
+# Unmasked counterpart -- identical to sim_diag_agg but without the
+# LOST_THRESHOLD cutoff, used to draw a dotted continuation past the point
+# where a metric gets masked out for being unreliable.
+sim_diag_unmasked <- sim_diag_agg_raw |>
+  pivot_longer(all_of(rq1_metrics), names_to = "metric", values_to = "value") |>
+  mutate(metric_label = factor(rq1_lbl[metric], levels = unname(rq1_lbl)))
+```
+
+## 3.1  Condition A: $r_{op}$ only
+
+
+```{r cond-a-plot, fig.width=10, fig.height=5}
+df_a_primary <- sim_diag_agg |>
+  filter(condition == "A: r_op only", metric %in% ALWAYS_VALID, r_op %in% R_SPARSE_VALS)
+
+ggplot(df_a_primary, aes(r_op, value, colour = confidence_agg, fill = confidence_agg)) +
+  geom_line(linewidth = 0.9, na.rm = TRUE) +
+  geom_point(shape = 21, size = 2.3, stroke = 0.5, na.rm = TRUE) +
+  geom_hline(yintercept = c(0, 1), linetype = "dotted", colour = "grey60") +
+  facet_wrap(~ metric_label, scales = "free", ncol = 2) +
+  scale_colour_manual(values = c(sum = "firebrick3", mean = "steelblue4")) +
+  scale_fill_manual(values   = c(sum = "firebrick1", mean = "steelblue2")) +
+  scale_x_continuous(breaks = R_SPARSE_VALS, labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "A: r_op only -- delegation_rate & lost_vote_rate (full range)",
+       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds",
+                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG),
+       x = "r_op", y = NULL, colour = "confidence_agg", fill = "confidence_agg") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+```{r cond-a-plot-zoom, fig.width=10, fig.height=5}
+df_a_zoom <- sim_diag_agg |>
+  filter(condition == "A: r_op only", metric %in% ALWAYS_VALID, r_op <= R_SHORT_MAX)
+
+ggplot(df_a_zoom, aes(r_op, value, colour = confidence_agg, fill = confidence_agg)) +
+  geom_line(linewidth = 0.9, na.rm = TRUE) +
+  geom_point(shape = 21, size = 2.3, stroke = 0.5, na.rm = TRUE) +
+  geom_hline(yintercept = c(0, 1), linetype = "dotted", colour = "grey60") +
+  facet_wrap(~ metric_label, scales = "free", ncol = 2) +
+  scale_colour_manual(values = c(sum = "firebrick3", mean = "steelblue4")) +
+  scale_fill_manual(values   = c(sum = "firebrick1", mean = "steelblue2")) +
+  scale_x_continuous(breaks = R_DIAG_VALS[R_DIAG_VALS <= R_SHORT_MAX], labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "A: r_op only -- zoom to r_op in [0, 16]",
+       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds",
+                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG),
+       x = "r_op", y = NULL, colour = "confidence_agg", fill = "confidence_agg") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+```{r cond-a-plot-other, fig.width=10, fig.height=12}
+df_a_other_masked   <- sim_diag_agg      |> filter(condition == "A: r_op only", !metric %in% ALWAYS_VALID, r_op <= R_SHORT_MAX)
+df_a_other_unmasked <- sim_diag_unmasked |> filter(condition == "A: r_op only", !metric %in% ALWAYS_VALID, r_op <= R_SHORT_MAX)
+
+ggplot() +
+  geom_line(data = df_a_other_unmasked, aes(r_op, value, colour = confidence_agg, group = confidence_agg),
+            linetype = "dotted", linewidth = 1.1, alpha = 0.9, na.rm = TRUE) +
+  geom_point(data = df_a_other_unmasked, aes(r_op, value, colour = confidence_agg),
+             size = 1.5, alpha = 0.9, na.rm = TRUE) +
+  geom_line(data = df_a_other_masked, aes(r_op, value, colour = confidence_agg, fill = confidence_agg),
+            linewidth = 0.9, na.rm = TRUE) +
+  geom_point(data = df_a_other_masked, aes(r_op, value, colour = confidence_agg, fill = confidence_agg),
+             shape = 21, size = 2.3, stroke = 0.5, na.rm = TRUE) +
+  geom_hline(yintercept = c(0, 1), linetype = "dotted", colour = "grey60") +
+  facet_wrap(~ metric_label, scales = "free", ncol = 2) +
+  scale_colour_manual(values = c(sum = "firebrick3", mean = "steelblue4")) +
+  scale_fill_manual(values   = c(sum = "firebrick1", mean = "steelblue2")) +
+  scale_x_continuous(breaks = R_DIAG_VALS[R_DIAG_VALS <= R_SHORT_MAX], labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "A: r_op only -- other metrics",
+       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds -- dotted = beyond %.0f%% lost-vote rate",
+                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG, LOST_THRESHOLD * 100),
+       x = "r_op", y = NULL, colour = "confidence_agg", fill = "confidence_agg") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+## 3.2  Condition B: $r_{pw}$ only
+
+```{r cond-b-plot, fig.width=10, fig.height=5}
+df_b_primary <- sim_diag_agg |>
+  filter(condition == "B: r_pw only", metric %in% ALWAYS_VALID, r_pw %in% R_SPARSE_VALS)
+
+ggplot(df_b_primary, aes(r_pw, value, colour = confidence_agg, fill = confidence_agg)) +
+  geom_line(linewidth = 0.9, na.rm = TRUE) +
+  geom_point(shape = 21, size = 2.3, stroke = 0.5, na.rm = TRUE) +
+  geom_hline(yintercept = c(0, 1), linetype = "dotted", colour = "grey60") +
+  facet_wrap(~ metric_label, scales = "free", ncol = 2) +
+  scale_colour_manual(values = c(sum = "firebrick3", mean = "steelblue4")) +
+  scale_fill_manual(values   = c(sum = "firebrick1", mean = "steelblue2")) +
+  scale_x_continuous(breaks = R_SPARSE_VALS, labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "B: r_pw only -- delegation_rate & lost_vote_rate (full range)",
+       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds",
+                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG),
+       x = "r_pw", y = NULL, colour = "confidence_agg", fill = "confidence_agg") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+```{r cond-b-plot-zoom, fig.width=10, fig.height=5}
+df_b_zoom <- sim_diag_agg |>
+  filter(condition == "B: r_pw only", metric %in% ALWAYS_VALID, r_pw <= R_SHORT_MAX)
+
+ggplot(df_b_zoom, aes(r_pw, value, colour = confidence_agg, fill = confidence_agg)) +
+  geom_line(linewidth = 0.9, na.rm = TRUE) +
+  geom_point(shape = 21, size = 2.3, stroke = 0.5, na.rm = TRUE) +
+  geom_hline(yintercept = c(0, 1), linetype = "dotted", colour = "grey60") +
+  facet_wrap(~ metric_label, scales = "free", ncol = 2) +
+  scale_colour_manual(values = c(sum = "firebrick3", mean = "steelblue4")) +
+  scale_fill_manual(values   = c(sum = "firebrick1", mean = "steelblue2")) +
+  scale_x_continuous(breaks = R_DIAG_VALS[R_DIAG_VALS <= R_SHORT_MAX], labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "B: r_pw only -- zoom to r_pw in [0, 16]",
+       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds",
+                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG),
+       x = "r_pw", y = NULL, colour = "confidence_agg", fill = "confidence_agg") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+```{r cond-b-plot-other, fig.width=10, fig.height=12}
+df_b_other_masked   <- sim_diag_agg      |> filter(condition == "B: r_pw only", !metric %in% ALWAYS_VALID, r_pw <= R_SHORT_MAX)
+df_b_other_unmasked <- sim_diag_unmasked |> filter(condition == "B: r_pw only", !metric %in% ALWAYS_VALID, r_pw <= R_SHORT_MAX)
+
+ggplot() +
+  geom_line(data = df_b_other_unmasked, aes(r_pw, value, colour = confidence_agg, group = confidence_agg),
+            linetype = "dotted", linewidth = 1.1, alpha = 0.9, na.rm = TRUE) +
+  geom_point(data = df_b_other_unmasked, aes(r_pw, value, colour = confidence_agg),
+             size = 1.5, alpha = 0.9, na.rm = TRUE) +
+  geom_line(data = df_b_other_masked, aes(r_pw, value, colour = confidence_agg, fill = confidence_agg),
+            linewidth = 0.9, na.rm = TRUE) +
+  geom_point(data = df_b_other_masked, aes(r_pw, value, colour = confidence_agg, fill = confidence_agg),
+             shape = 21, size = 2.3, stroke = 0.5, na.rm = TRUE) +
+  geom_hline(yintercept = c(0, 1), linetype = "dotted", colour = "grey60") +
+  facet_wrap(~ metric_label, scales = "free", ncol = 2) +
+  scale_colour_manual(values = c(sum = "firebrick3", mean = "steelblue4")) +
+  scale_fill_manual(values   = c(sum = "firebrick1", mean = "steelblue2")) +
+  scale_x_continuous(breaks = R_DIAG_VALS[R_DIAG_VALS <= R_SHORT_MAX], labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "B: r_pw only -- other metrics",
+       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds -- dotted = beyond %.0f%% lost-vote rate",
+                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG, LOST_THRESHOLD * 100),
+       x = "r_pw", y = NULL, colour = "confidence_agg", fill = "confidence_agg") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+## 3.3  Condition C: $r_{op} \times r_{pw}$ (grid) — aggregators side by side
+
+Unlike A, B and D, the two aggregators are **not** identical here since we are having more than one dimension.
+
+```{r cond-c-plot, fig.width=11, fig.height=8}
+# facet_grid only draws x-axis labels on its bottom row, even with free
+# scales -- unusable here since rows have genuinely different ranges
+# (0-128 for delegation/lost-vote vs. 0-16 for everything else). Using
+# facet_wrap instead (which labels every panel), with metric and model
+# interleaved so the two models still land next to each other per metric.
+panel_levels <- as.vector(sapply(unname(rq1_lbl), function(m) paste(m, c("mean", "sum"))))
+
+mk_panel_primary <- \(df) df |>
+  filter(condition == "C: r_op x r_pw (grid)", metric %in% ALWAYS_VALID,
+         r_op %in% R_SPARSE_VALS, r_pw %in% R_SPARSE_VALS) |>
+  mutate(r_pw_fac    = factor(r_pw),
+         panel_label = factor(paste(metric_label, confidence_agg), levels = panel_levels))
+
+sim_diag_C_primary <- sim_diag_agg |> mk_panel_primary()
+
+ggplot(sim_diag_C_primary, aes(r_op, value, colour = r_pw_fac, group = r_pw_fac)) +
+  geom_line(linewidth = 0.8, na.rm = TRUE) +
+  geom_point(size = 1.8, na.rm = TRUE) +
+  facet_wrap(~ panel_label, ncol = 2, scales = "free") +
+  scale_colour_viridis_d(name = "r_pw", end = 0.88) +
+  scale_x_continuous(breaks = R_SPARSE_VALS, labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "C: r_op x r_pw -- delegation_rate & lost_vote_rate (full range)",
+       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds",
+                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG),
+       x = "r_op", y = NULL) +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "right")
+```
+
+```{r cond-c-plot-zoom, fig.width=11, fig.height=9}
+mk_panel_zoom <- \(df) df |>
+  filter(condition == "C: r_op x r_pw (grid)", metric %in% ALWAYS_VALID,
+         r_op <= R_SHORT_MAX, r_pw <= R_SHORT_MAX) |>
+  mutate(r_pw_fac    = factor(r_pw),
+         panel_label = factor(paste(metric_label, confidence_agg), levels = panel_levels))
+
+sim_diag_C_zoom <- sim_diag_agg |> mk_panel_zoom()
+
+ggplot(sim_diag_C_zoom, aes(r_op, value, colour = r_pw_fac, group = r_pw_fac)) +
+  geom_line(linewidth = 0.8, na.rm = TRUE) +
+  geom_point(size = 1.8, na.rm = TRUE) +
+  facet_wrap(~ panel_label, ncol = 2, scales = "free") +
+  scale_colour_viridis_d(name = "r_pw", end = 0.88) +
+  scale_x_continuous(breaks = R_DIAG_VALS[R_DIAG_VALS <= R_SHORT_MAX], labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "C: r_op x r_pw -- zoom to [0, 16], sum vs. average, side by side",
+       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds",
+                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG),
+       x = "r_op", y = NULL) +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "right")
+```
+
+```{r cond-c-plot-other, fig.width=11, fig.height=19}
+mk_panel_other <- \(df) df |>
+  filter(condition == "C: r_op x r_pw (grid)", !metric %in% ALWAYS_VALID,
+         r_op <= R_SHORT_MAX, r_pw <= R_SHORT_MAX) |>
+  mutate(r_pw_fac    = factor(r_pw),
+         panel_label = factor(paste(metric_label, confidence_agg), levels = panel_levels))
+
+sim_diag_C_other          <- sim_diag_agg      |> mk_panel_other()
+sim_diag_C_other_unmasked <- sim_diag_unmasked |> mk_panel_other()
+
+ggplot() +
+  geom_line(data = sim_diag_C_other_unmasked, aes(r_op, value, colour = r_pw_fac, group = r_pw_fac),
+            linetype = "dotted", linewidth = 1.0, alpha = 0.85, na.rm = TRUE) +
+  geom_point(data = sim_diag_C_other_unmasked, aes(r_op, value, colour = r_pw_fac, group = r_pw_fac),
+             size = 1.2, alpha = 0.85, na.rm = TRUE) +
+  geom_line(data = sim_diag_C_other, aes(r_op, value, colour = r_pw_fac, group = r_pw_fac),
+            linewidth = 0.8, na.rm = TRUE) +
+  geom_point(data = sim_diag_C_other, aes(r_op, value, colour = r_pw_fac, group = r_pw_fac),
+             size = 1.8, na.rm = TRUE) +
+  facet_wrap(~ panel_label, ncol = 2, scales = "free") +
+  scale_colour_viridis_d(name = "r_pw", end = 0.88) +
+  scale_x_continuous(breaks = R_DIAG_VALS[R_DIAG_VALS <= R_SHORT_MAX], labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "C: r_op x r_pw -- other metrics",
+       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds -- dotted = beyond %.0f%% lost-vote rate",
+                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG, LOST_THRESHOLD * 100),
+       x = "r_op", y = NULL) +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "right")
+```
+
+## 3.4  Condition D: Trust ($r_{trust}$)
+
+```{r cond-d-plot, fig.width=13, fig.height=18}
+mk_r_level <- \(df) df |> mutate(r_level = factor(paste0("r=", r_op), levels = paste0("r=", R_TRUST_DIAG)))
+
+sim_diag_D          <- sim_diag_agg      |> filter(startsWith(condition, "D:")) |> mk_r_level()
+sim_diag_D_unmasked <- sim_diag_unmasked |> filter(startsWith(condition, "D:")) |> mk_r_level()
+
+ggplot() +
+  geom_line(data = sim_diag_D_unmasked, aes(r_trust, value, colour = confidence_agg, group = confidence_agg),
+            linetype = "dotted", linewidth = 1.1, alpha = 0.9, na.rm = TRUE) +
+  geom_point(data = sim_diag_D_unmasked, aes(r_trust, value, colour = confidence_agg),
+             size = 1.5, alpha = 0.9, na.rm = TRUE) +
+  geom_line(data = sim_diag_D, aes(r_trust, value, colour = confidence_agg, fill = confidence_agg),
+            linewidth = 0.9, na.rm = TRUE) +
+  geom_point(data = sim_diag_D, aes(r_trust, value, colour = confidence_agg, fill = confidence_agg),
+             shape = 21, size = 2.3, stroke = 0.5, na.rm = TRUE) +
+  facet_grid(metric_label ~ r_level, scales = "free_y") +
+  scale_colour_manual(values = c(sum = "firebrick3", mean = "steelblue4")) +
+  scale_fill_manual(values   = c(sum = "firebrick1", mean = "steelblue2")) +
+  scale_x_continuous(breaks = R_TRUST_VALS, labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = "D: trust  (r_trust, r_op = r_pw = background level, lambda = 0.5)",
+       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds -- dotted = beyond %.0f%% lost-vote rate",
+                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG, LOST_THRESHOLD * 100),
+       x = "r_trust", y = NULL, colour = "confidence_agg", fill = "confidence_agg") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+Although delegation decreases slightly, lost votes increase because the trust mechanism penalizes only delegates who previously cast a disagreeing vote. Cyclic agents cast no vote and therefore receive no trust penalty, making them relatively more attractive delegation targets as trust responsiveness increases.
+
+---
+
+# 4  An Improved Trust Update: Reward and Punish
+
+The trust update used above (`trust_mode = "punish_only"`, the only mode
+that existed before this report) has two structural issues, both visible
+in Condition D:
+
+$$\tau_{ij}(t) = \lambda\tau_{ij}(t-1) - (1-\lambda)\,|o_i - v_j(t-1)|,
+  \qquad \text{only if } v_j(t-1) \text{ is defined}.$$
+
+**First**, a neighbour whose vote was lost last round (stuck in a cycle)
+is skipped entirely -- $\tau_{ij}$ simply isn't updated for that pair, so
+cycling carries *no* trust penalty at all, while a neighbour who actually
+voted and disagreed with you does get penalized. As `r_trust` grows, this
+increasingly steers delegation *away* from honest-but-disagreeing
+neighbours and, by omission, relatively *toward* neighbours already stuck
+in cycles -- exactly the mechanism behind the lost-vote increase in
+Section 3.4.
+
+**Second**, $\tau_{ij} \le 0$ always, since every update either subtracts
+a non-negative disagreement term or does nothing. That means
+$\text{trust\_mod} = 2\sigma(r_{trust}\cdot\tau_{ij}) \le 1$ always: trust
+can only ever shrink a neighbour's attractiveness, never boost it. A
+neighbour who has represented you perfectly for 19 rounds is no more
+attractive than one you've never interacted with.
+
+**New trust update (`trust_mode = "reward_punish"`):**
+
+$$\tau_{ij}(t) = \lambda\tau_{ij}(t-1) + (1-\lambda)\cdot s, \qquad
+  s = \begin{cases}
+    1 - 2\,|o_i - v_j(t-1)| & \text{$j$ delivered a vote} \\
+    -\kappa_{cyc} & \text{$j$'s vote was lost}
+  \end{cases}$$
+
+$s$ uses the same $2|\cdot|-1$ convention already used elsewhere in the
+model's attractiveness formula: perfect agreement gives $s=1$ (reward),
+disagreement beyond the halfway point gives $s<0$ (penalty), and a
+non-delivering neighbour is penalized by a fixed, separately-tunable
+$\kappa_{cyc}$ regardless of what they might have voted. Two consequences
+worth flagging explicitly:
+
+- $\tau_{ij}$ can now be positive, so $\text{trust\_mod}$ can exceed 1 --
+  a consistently well-agreeing delegate becomes *more* attractive than an
+  untested one (at $\tau=0$, e.g. round 1), not merely "less suppressed."
+  This is closer to how trust intuitively works, but it also means a
+  good representative can now accumulate delegators faster than under
+  `"punish_only"`, which may show up as increased power concentration
+  (`top5_power_share`, `gini_power`) alongside whatever happens to
+  delegation/lost-vote rate below.
+- $\kappa_{cyc}$ is fixed at `r CYCLE_PENALTY` here (cycling penalized as
+  harshly as maximal disagreement) rather than swept, for the same
+  reason `lambda` is fixed rather than swept (too many tunable Parameters).
+
+## 4.1  Condition D2: Trust, reward + punish ($r_{trust}$)
+
+Identical setup to Condition D (same `r_op = r_pw` background levels,
+same `r_trust` sweep, same `lambda = 0.5`) -- only the trust-update
+formula differs.
+
+```{r cond-d2-plot, fig.width=13, fig.height=18}
+sim_diag_D2          <- sim_diag_agg      |> filter(startsWith(condition, "D2:")) |> mk_r_level()
+sim_diag_D2_unmasked <- sim_diag_unmasked |> filter(startsWith(condition, "D2:")) |> mk_r_level()
+
+ggplot() +
+  geom_line(data = sim_diag_D2_unmasked, aes(r_trust, value, colour = confidence_agg, group = confidence_agg),
+            linetype = "dotted", linewidth = 1.1, alpha = 0.9, na.rm = TRUE) +
+  geom_point(data = sim_diag_D2_unmasked, aes(r_trust, value, colour = confidence_agg),
+             size = 1.5, alpha = 0.9, na.rm = TRUE) +
+  geom_line(data = sim_diag_D2, aes(r_trust, value, colour = confidence_agg, fill = confidence_agg),
+            linewidth = 0.9, na.rm = TRUE) +
+  geom_point(data = sim_diag_D2, aes(r_trust, value, colour = confidence_agg, fill = confidence_agg),
+             shape = 21, size = 2.3, stroke = 0.5, na.rm = TRUE) +
+  facet_grid(metric_label ~ r_level, scales = "free_y") +
+  scale_colour_manual(values = c(sum = "firebrick3", mean = "steelblue4")) +
+  scale_fill_manual(values   = c(sum = "firebrick1", mean = "steelblue2")) +
+  scale_x_continuous(breaks = R_TRUST_VALS, labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(title = sprintf("D2: trust, reward+punish  (r_trust, r_op = r_pw = background level, lambda = 0.5, kappa_cyc = %g)", CYCLE_PENALTY),
+       subtitle = sprintf("N = %d | k = %d | T = %d | %d seeds -- dotted = beyond %.0f%% lost-vote rate",
+                          N_SIM, K_SIM, SIM_T, N_SEEDS_DIAG, LOST_THRESHOLD * 100),
+       x = "r_trust", y = NULL, colour = "confidence_agg", fill = "confidence_agg") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+---
+
+# Part II: Minority Representation in Liquid Democracy
+
+## RQ1: Which ranges of the ingroup responsiveness parameter produce meaningful changes in minority delegation behaviour?
+
+- **H1a.** The relationship between behavioural ingroup responsiveness
+  ($r_{ingroup}$) and minority delegation behaviour is non-linear and
+  exhibits a saturation point.
+  
+*Operationalized by:* $RR_m$, $PC_m$, $RC_m$, $CDR$, delegation rate,
+representative share, average delegation chain length.
+
+## RQ2: How does behavioural ingroup preference affect minority representation in liquid democracy?
+
+- **H1b.** At $r_{ingroup}=0$ under random opinion distributions,
+  minority representation is proportional to the minority's population
+  share.
+- **H2b.** Increasing behavioural ingroup responsiveness improves
+  minority representation.
+- **H3b.** Increasing behavioural ingroup responsiveness reduces
+  minority power capture and minority representation capture.
+- **H4b.** The effects of behavioural ingroup responsiveness on minority
+  representation become stronger as opinion polarisation increases.
+
+*Operationalized by:* $RR_m$, $PC_m$, $RC_m$.
+
+## RQ3: Through which delegation mechanisms does behavioural ingroup preference influence minority representation?
+
+- **H1c.** Increasing behavioural ingroup responsiveness reduces
+  cross-group delegation.
+- **H2c.** The reduction in cross-group delegation is stronger under
+  greater opinion polarisation.
+- **H3c.** Increasing behavioural ingroup responsiveness shortens
+  delegation chains.
+- **H4c.** Increasing behavioural ingroup responsiveness reduces
+  ideological drift within both minority and majority groups.
+
+*Operationalized by:* $CDR$, average delegation chain length, average
+ideological drift.
+
+---
+
+# 5  Purpose
+
+Minority-representation simulation, using Section 1's
+sum-aggregated confidence self-weight and Section 4's reward+punish trust update.
+
+## 5.0  The Full Model
+
+Extends Section 1's attractiveness formula with an ingroup term:
+
+$$\tilde{A}_{ij}(t) = \sigma\big(r_{op}(1-2|o_i-o_j|)\big) \cdot
+  \sigma\!\left(r_{pw}\log\frac{p_j}{p_i}\right) \cdot
+  2\sigma\big(r_{trust}\,\tau_{ij}(t)\big) \cdot
+  \sigma\big(r_{ingroup}\, I(g_i=g_j)\big)$$
+
+$$I(g_i=g_j)=\begin{cases}+1 & g_i=g_j \\ -1 & g_i\neq g_j\end{cases}$$
+
+Self-weight and trust update are as in Sections 1 and 4, with
+$r_{agg}=r_{tot}=r_{op}+r_{pw}+r_{ingroup}$ (`confidence_agg = "sum"`);
+perception noise as in Section 1 (`sigma_opinion = "auto"`).
+$r_{op}=r_{pw}=r_{trust} \in \{$ `r paste(R_BACKGROUND_VALS, collapse=", ")` $\}$
+(swept, not averaged -- see 5.2), $\lambda=$ `r LAMBDA_DIAG`,
+$\kappa_{cyc}=$ `r CYCLE_PENALTY` (Section 3/4 values, reused).
+
+## 5.1  Metrics
+
+Averaged over the last 5 rounds (`round >= T-4`), then over
+`r N_SEEDS_MINORITY` seeds.
+
+**1. Voting power / share.**
+$$P_M = \sum_{i \in M} p_i, \quad P_{Maj} = \sum_{i \in N\setminus M} p_i,
+\quad \text{share}_M = \frac{P_M}{P_M+P_{Maj}}$$
+Total power actually cast by each group's roots ($p_i$ = root power if
+$i$ is a root, else 0), and each group's share of the total.
+
+**2. Relative Representation.**
+$$RR_m = \frac{\big(\sum_{i\in M} p_i \,/\, \sum_{i\in N} p_i\big)}{m},
+\qquad m = |M|/|N|$$
+Minority's power share divided by its population share; $1$ =
+proportional representation.
+
+**3. Power Capture.**
+$$PC_m = \frac{\#\{i\in M : \text{root}(i)\in N\setminus M\}}{\#\{i\in M : \text{root}(i) \text{ defined}\}},
+\qquad PC_{Maj} \text{ analogous with } M \leftrightarrow N\setminus M$$
+Fraction of one group's agents whose delegation chain terminates at a representative from the other group.
+
+**4. Cross-group delegation, both directions.**
+$$CDR_{M\to Maj} = \frac{\#\{(i,j)\in E : i\in M,\, j\notin M\}}{\#\{(i,j)\in E: i \in M\}},
+\qquad
+CDR_{Maj\to M} = \frac{\#\{(i,j)\in E : i\notin M,\, j\in M\}}{\#\{(i,j)\in E: i \notin M\}}$$
+Share of each group's own outgoing delegation edges that cross into the
+other group.
+
+**5. Group-specific rates.**
+$$\text{DelRate}_G = \frac{\#\{i\in G : \text{delegated}(i)\}}{|G|}$$
+Delegation rate within group $G$ ($G\in\{N, M, N\setminus M\}$);
+lost-vote rate, chain length and ideological drift use the same
+all/minority/majority split, restricted to each group's own agents.
+
+**6. Representatives per group.**
+$$n_G = \#\{i\in G : \text{root}(i)=i\}$$
+Headcount of group $G$'s direct voters (roots), regardless of how many
+others delegate to them.
+
+## 5.2  Experimental Design
+
+| Factor | Values |
+|---|---|
+| Condition | `random`, `polarised`, `homophily` |
+| Polarisation $\delta$ | $\{0.2, 0.4\}$ under `polarised`; fixed at `r HOMOPHILY_DELTA` under `homophily` |
+| Ingroup preference $r_{ingroup}$ | $\{0, 1, 2, 4, 8\}$ |
+| Background responsiveness $r_{op}=r_{pw}=r_{trust}$ | $\{$ `r paste(R_BACKGROUND_VALS, collapse=", ")` $\}$ |
+
+`random`: $\mathcal{N}(0.5,0.1^2)$ for both groups. `polarised`:
+$\mathcal{N}(0.5\mp\delta/2,0.1^2)$. `homophily`: `polarised` at
+$\delta=$ `r HOMOPHILY_DELTA` + network reshuffle to opinion assortativity
+$\ge$ `r HOMOPHILY_TARGET_R`. Every plot below repeats across all 3
+background-responsiveness levels (separate rows) rather than averaging
+across them, since averaging would blend potentially different regimes
+(e.g. saturation effects, Section 3) into a number that matches none of
+them.
+
+---
+
+# 6  Simulation
+
+```{r sim-run-one, include=FALSE}
+run_cell <- function(seed, condition, delta, r_ingroup, r_background) {
+  if (condition == "random") {
+    min_mu <- 0.5
+    maj_mu <- 0.5
+    th     <- NULL
+  } else if (condition == "polarised") {
+    min_mu <- 0.5 - delta / 2
+    maj_mu <- 0.5 + delta / 2
+    th     <- NULL
+  } else {  # homophily
+    min_mu <- 0.5 - delta / 2
+    maj_mu <- 0.5 + delta / 2
+    th     <- HOMOPHILY_TARGET_R
+  }
+
+  res <- simulate_liquid_democracy(
+    seed                    = seed,
+    n_per_community         = N_SIM,
+    n_communities           = 1,
+    node_degree             = K_SIM,
+    T                       = SIM_T,
+    r_op                    = r_background,
+    r_pw                    = r_background,
+    p_rewire                = P_REWIRE,
+    r_ingroup               = r_ingroup,
+    minority_share          = MINORITY_SHARE,
+    minority_opinion_mu     = min_mu,
+    minority_opinion_sigma  = OP_SIGMA,
+    majority_opinion_mu     = maj_mu,
+    majority_opinion_sigma  = OP_SIGMA,
+    self_weight_mode        = SELF_WEIGHT_MODE,
+    confidence_agg          = CONFIDENCE_AGG,
+    sigma_opinion           = "auto",
+    target_homophily        = th,
+    gamma                   = r_background,
+    lambda                  = LAMBDA_DIAG,
+    trust_mode              = TRUST_MODE,
+    cycle_penalty           = CYCLE_PENALTY
+  )
+
+  snaps <- res$snapshots |> dplyr::filter(round >= SIM_T - 4L)
+
+  tibble(
+    seed                         = seed,
+    condition                    = condition,
+    delta                        = delta,
+    r_ingroup                    = r_ingroup,
+    r_background                 = r_background,
+    delegation_rate              = mean(snaps$delegation_rate, na.rm = TRUE),
+    lost_vote_rate                = mean(snaps$lost_vote_rate,  na.rm = TRUE),
+    avg_chain_length_delegators  = mean(snaps$avg_chain_length_delegators, na.rm = TRUE),
+    avg_drift                    = mean(snaps$avg_drift,        na.rm = TRUE),
+    minority_delegation_rate     = mean(snaps$minority_delegation_rate, na.rm = TRUE),
+    majority_delegation_rate     = mean(snaps$majority_delegation_rate, na.rm = TRUE),
+    minority_lost_vote_rate      = mean(snaps$minority_lost_vote_rate,  na.rm = TRUE),
+    majority_lost_vote_rate      = mean(snaps$majority_lost_vote_rate,  na.rm = TRUE),
+    minority_chain_len           = mean(snaps$minority_chain_len, na.rm = TRUE),
+    majority_chain_len           = mean(snaps$majority_chain_len, na.rm = TRUE),
+    minority_drift                = mean(snaps$minority_drift,    na.rm = TRUE),
+    majority_drift                = mean(snaps$majority_drift,    na.rm = TRUE),
+    minority_power                = mean(snaps$minority_power,    na.rm = TRUE),
+    majority_power                = mean(snaps$majority_power,    na.rm = TRUE),
+    RR_m                          = mean(snaps$RR_m,              na.rm = TRUE),
+    minority_capture               = mean(snaps$minority_capture, na.rm = TRUE),
+    majority_capture               = mean(snaps$majority_capture, na.rm = TRUE),
+    cross_group_dlg_rate          = mean(snaps$cross_group_dlg_rate, na.rm = TRUE),
+    cdr_min_to_maj                = mean(snaps$cdr_min_to_maj,    na.rm = TRUE),
+    cdr_maj_to_min                = mean(snaps$cdr_maj_to_min,    na.rm = TRUE),
+    minority_n_reps                = mean(snaps$minority_n_reps,  na.rm = TRUE),
+    majority_n_reps                = mean(snaps$majority_n_reps,  na.rm = TRUE)
+  )
+}
+```
+
+```{r sim-grid, include=FALSE}
+seeds_sim <- seq_len(N_SEEDS_MINORITY)
+
+grid_random    <- expand_grid(condition = "random", delta = NA_real_,
+                               r_ingroup = R_INGROUP_VALS, r_background = R_BACKGROUND_VALS, seed = seeds_sim)
+grid_polarised <- expand_grid(condition = "polarised", delta = DELTA_VALS,
+                               r_ingroup = R_INGROUP_VALS, r_background = R_BACKGROUND_VALS, seed = seeds_sim)
+grid_homophily <- expand_grid(condition = "homophily", delta = HOMOPHILY_DELTA,
+                               r_ingroup = R_INGROUP_VALS, r_background = R_BACKGROUND_VALS, seed = seeds_sim)
+grid_sim <- bind_rows(grid_random, grid_polarised, grid_homophily)
+
+params_sim <- list(N = N_SIM, K = K_SIM, T = SIM_T, r_background_vals = R_BACKGROUND_VALS,
+                    lambda = LAMBDA_DIAG, trust_mode = TRUST_MODE,
+                    cycle_penalty = CYCLE_PENALTY,
+                    delta_vals = DELTA_VALS, r_ingroup_vals = R_INGROUP_VALS,
+                    homophily_target = HOMOPHILY_TARGET_R, homophily_delta = HOMOPHILY_DELTA,
+                    minority_share = MINORITY_SHARE,
+                    self_weight_mode = SELF_WEIGHT_MODE, confidence_agg = CONFIDENCE_AGG,
+                    sigma_opinion = "auto", n_seeds = N_SEEDS_MINORITY, version = 7L)
+hash_sim  <- digest::digest(params_sim)
+cache_sim <- here::here("data/sim_report19_cache.rds")
+
+if (file.exists(cache_sim)) {
+  cs <- readRDS(cache_sim)
+  if (identical(cs$hash, hash_sim)) sim_raw <- cs$data else cs <- NULL
+} else cs <- NULL
+
+if (is.null(cs)) {
+  dir.create(here::here("data"), showWarnings = FALSE)
+  plan(multisession, workers = parallel::detectCores() - 1)
+
+  sim_raw <- future_pmap_dfr(
+    list(seed = grid_sim$seed, condition = grid_sim$condition,
+         delta = grid_sim$delta, r_ingroup = grid_sim$r_ingroup,
+         r_background = grid_sim$r_background),
+    run_cell,
+    .options = furrr_options(seed = NULL)
+  )
+  plan(sequential)
+  saveRDS(list(hash = hash_sim, data = sim_raw), cache_sim)
+}
+
+# Average over seeds; build "condition_label"/"r_background_label" factors
+# for plotting, plus derived group-share, deviation and
+# total-representatives columns used below.
+sim_agg <- sim_raw |>
+  group_by(condition, delta, r_ingroup, r_background) |>
+  summarise(across(where(is.numeric) & !any_of("seed"), \(x) mean(x, na.rm = TRUE)),
+            .groups = "drop") |>
+  mutate(
+    condition_label = case_when(
+      condition == "random"    ~ "random",
+      condition == "polarised" ~ sprintf("polarised (delta=%.1f)", delta),
+      condition == "homophily" ~ sprintf("homophily (delta=%.1f)", delta)
+    ),
+    condition_label = factor(condition_label, levels = c(
+      "random", "polarised (delta=0.2)", "polarised (delta=0.4)",
+      sprintf("homophily (delta=%.1f)", HOMOPHILY_DELTA))),
+    r_background_label = factor(paste0("r=", r_background), levels = paste0("r=", R_BACKGROUND_VALS)),
+    minority_power_share_pct = 100 * minority_power / (minority_power + majority_power),
+    majority_power_share_pct = 100 - minority_power_share_pct,
+    # Deviation from proportional share (in percentage points) -- lets
+    # minority and majority sit in ONE panel on a shared, tight y-axis
+    # instead of needing separate rows for a ~60pp baseline gap.
+    minority_power_dev_pct   = minority_power_share_pct - 100 * MINORITY_SHARE,
+    majority_power_dev_pct   = majority_power_share_pct - 100 * (1 - MINORITY_SHARE),
+    all_n_reps                = minority_n_reps + majority_n_reps,
+    # RR_maj: majority's power share over majority's population share --
+    # the same formula as RR_m, just for the other group. Not independent
+    # of RR_m with only two groups, but shown alongside it so both
+    # group-specific lines are visible rather than only the minority one.
+    RR_maj                    = (majority_power_share_pct / 100) / (1 - MINORITY_SHARE)
+  )
+
+SUBTITLE <- sprintf("N = %d | k = %d | T = %d | %d seeds | confidence (sum) | trust: reward+punish",
+                    N_SIM, K_SIM, SIM_T, N_SEEDS_MINORITY)
+```
+
+---
+
+# 7  Representation Overview
+
+```{r plot-part1-rates, fig.width=13, fig.height=16}
+rates_map <- tribble(
+  ~metric,           ~scope,     ~column,
+  "Delegation Rate", "all",      "delegation_rate",
+  "Delegation Rate", "minority", "minority_delegation_rate",
+  "Delegation Rate", "majority", "majority_delegation_rate",
+  "Lost Vote Rate",  "all",      "lost_vote_rate",
+  "Lost Vote Rate",  "minority", "minority_lost_vote_rate",
+  "Lost Vote Rate",  "majority", "majority_lost_vote_rate"
+)
+
+df_part1_rates <- rates_map |>
+  pmap_dfr(function(metric, scope, column)
+    sim_agg |> transmute(condition_label, r_background_label, r_ingroup, value = .data[[column]], metric, scope)) |>
+  mutate(metric = factor(metric, levels = unique(rates_map$metric)),
+         scope  = factor(scope, levels = c("all", "minority", "majority")))
+
+ggplot(df_part1_rates, aes(r_ingroup, value, colour = scope)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.8) +
+  facet_grid(r_background_label + metric ~ condition_label, scales = "free_y") +
+  scale_colour_manual(values = GROUP_COLOURS) +
+  scale_x_continuous(breaks = R_INGROUP_VALS) +
+  labs(title = "Delegation rate & lost-vote rate -- all vs. minority vs. majority, by background r",
+       subtitle = SUBTITLE, x = "r_ingroup", y = NULL, colour = "scope") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+```{r plot-part1-power, fig.width=13, fig.height=9}
+# Plotting deviation from proportional share (percentage points) instead
+# of the raw share puts minority and majority in ONE panel on a shared,
+# tight y-axis -- they're mirror images (minority_dev = -majority_dev),
+# so a small real effect stays visible without needing separate rows for
+# a ~60pp baseline gap between the two groups.
+df_power_dev <- sim_agg |>
+  select(condition_label, r_background_label, r_ingroup,
+         minority = minority_power_dev_pct, majority = majority_power_dev_pct) |>
+  pivot_longer(c(minority, majority), names_to = "scope", values_to = "value") |>
+  mutate(scope = factor(scope, levels = c("minority", "majority")))
+
+ggplot(df_power_dev, aes(r_ingroup, value, colour = scope)) +
+  geom_hline(yintercept = 0, linetype = "dotted", colour = "grey50") +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  facet_grid(r_background_label ~ condition_label, scales = "free_y") +
+  scale_colour_manual(values = GROUP_COLOURS) +
+  scale_x_continuous(breaks = R_INGROUP_VALS) +
+  labs(title = "Relative voting power -- deviation from proportional share (pp)",
+       subtitle = paste0(SUBTITLE, " -- dotted line = proportional (0 pp)"),
+       x = "r_ingroup", y = "deviation from proportional share (percentage points)", colour = "group") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+```{r plot-part1-rr-pc, fig.width=13, fig.height=16}
+# RR_maj and PC_Maj are not independent of RR_m/PC_m (only two groups), but
+# shown as their own red/blue lines so both groups are visible directly,
+# matching the minority=red/majority=blue convention used everywhere else.
+df_rr_pc <- sim_agg |>
+  select(condition_label, r_background_label, r_ingroup,
+         RR_m, RR_maj, PC_m = minority_capture, PC_Maj = majority_capture) |>
+  pivot_longer(c(RR_m, RR_maj, PC_m, PC_Maj), names_to = "series", values_to = "value") |>
+  mutate(metric = factor(if_else(series %in% c("RR_m", "RR_maj"), "RR", "PC"),
+                          levels = c("RR", "PC")),
+         scope  = factor(if_else(series %in% c("RR_m", "PC_m"), "minority", "majority"),
+                          levels = c("minority", "majority")))
+
+ggplot(df_rr_pc, aes(r_ingroup, value, colour = scope)) +
+  geom_hline(data = tibble(metric = factor("RR", levels = c("RR", "PC")), value = 1),
+             aes(yintercept = value), linetype = "dotted", colour = "grey50") +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  facet_grid(r_background_label + metric ~ condition_label, scales = "free_y") +
+  scale_colour_manual(values = GROUP_COLOURS) +
+  scale_x_continuous(breaks = R_INGROUP_VALS) +
+  labs(title = "RR_m / RR_maj and PC_m / PC_Maj, by background r",
+       subtitle = SUBTITLE, x = "r_ingroup", y = NULL, colour = "scope") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+```{r plot-part1-reps, fig.width=13, fig.height=9}
+df_reps <- sim_agg |>
+  select(condition_label, r_background_label, r_ingroup, all = all_n_reps,
+         minority = minority_n_reps, majority = majority_n_reps) |>
+  pivot_longer(c(all, minority, majority), names_to = "scope", values_to = "n_reps") |>
+  mutate(scope = factor(scope, levels = c("all", "minority", "majority")))
+
+ggplot(df_reps, aes(r_ingroup, n_reps, colour = scope)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  facet_grid(r_background_label ~ condition_label, scales = "free_y") +
+  scale_colour_manual(values = GROUP_COLOURS) +
+  scale_x_continuous(breaks = R_INGROUP_VALS) +
+  labs(title = "Representatives per group (distinct roots), by background r",
+       subtitle = SUBTITLE, x = "r_ingroup", y = "# distinct roots", colour = "scope") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+---
+
+# 8  Delegation Mechanisms
+
+```{r plot-part2-cdr, fig.width=13, fig.height=9}
+df_cdr <- sim_agg |>
+  select(condition_label, r_background_label, r_ingroup, all = cross_group_dlg_rate,
+         minority = cdr_min_to_maj, majority = cdr_maj_to_min) |>
+  pivot_longer(c(all, minority, majority), names_to = "scope", values_to = "value") |>
+  mutate(scope = factor(scope, levels = c("all", "minority", "majority")))
+
+ggplot(df_cdr, aes(r_ingroup, value, colour = scope)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  facet_grid(r_background_label ~ condition_label, scales = "free_y") +
+  scale_colour_manual(values = GROUP_COLOURS) +
+  scale_x_continuous(breaks = R_INGROUP_VALS) +
+  labs(title = "Cross-group delegation rate (all = population-wide; minority = M->Maj; majority = Maj->M), by background r",
+       subtitle = SUBTITLE, x = "r_ingroup", y = "share of own edges crossing group", colour = "scope") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+```{r plot-part2-chain-drift, fig.width=13, fig.height=16}
+mech_map <- tribble(
+  ~metric,             ~scope,     ~column,
+  "Chain Length",      "all",      "avg_chain_length_delegators",
+  "Chain Length",      "minority", "minority_chain_len",
+  "Chain Length",      "majority", "majority_chain_len",
+  "Ideological Drift", "all",      "avg_drift",
+  "Ideological Drift", "minority", "minority_drift",
+  "Ideological Drift", "majority", "majority_drift"
+)
+
+df_mech <- mech_map |>
+  pmap_dfr(function(metric, scope, column)
+    sim_agg |> transmute(condition_label, r_background_label, r_ingroup, value = .data[[column]], metric, scope)) |>
+  mutate(metric = factor(metric, levels = unique(mech_map$metric)),
+         scope  = factor(scope, levels = c("all", "minority", "majority")))
+
+ggplot(df_mech, aes(r_ingroup, value, colour = scope)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.8) +
+  facet_grid(r_background_label + metric ~ condition_label, scales = "free_y") +
+  scale_colour_manual(values = GROUP_COLOURS) +
+  scale_x_continuous(breaks = R_INGROUP_VALS) +
+  labs(title = "Chain length & ideological drift -- all vs. minority vs. majority, by background r",
+       subtitle = SUBTITLE, x = "r_ingroup", y = NULL, colour = "scope") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
