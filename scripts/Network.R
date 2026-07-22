@@ -159,12 +159,19 @@ setup_agents <- function(n_per_community, n_communities, seed = 1,
   n_all <- n_per_community * n_communities
   n_min <- round(n_all * minority_share)
 
+  # Group is assigned to a RANDOM subset of ids, not a contiguous id block --
+  # the friendship network below connects agents by id-adjacency (a ring), so
+  # a contiguous id block would make group membership almost perfectly
+  # predictable from network position (near-total structural in-group
+  # clustering under every condition, not just "homophily"). Randomising the
+  # id<->group mapping keeps network structure independent of group for
+  # "random"/"polarised", as intended (see Report 15 Sec 1.2 / Report 19).
   agents <- tibble(
     id        = 1:n_all,
     type      = rep("lay", n_all),
     opinion   = runif(n_all),
     community = (0:(n_all - 1)) %% n_communities,
-    group     = c(rep("minority", n_min), rep("majority", n_all - n_min)),
+    group     = sample(c(rep("minority", n_min), rep("majority", n_all - n_min))),
     power     = 1L,
     my_vote   = NA_real_,
     delegated = FALSE
@@ -265,6 +272,7 @@ shuffle_opinions_homophily <- function(agents, gF,
   lay_ids <- which(agents$type == "lay")
   n_lay   <- length(lay_ids)
   op      <- agents$opinion
+  grp     <- agents$group   # moved together with op below -- see note
   gF_lay  <- induced_subgraph(gF, lay_ids)   # lay-only subgraph for assortativity
 
   for (step in seq_len(homophily_steps)) {
@@ -288,11 +296,25 @@ shuffle_opinions_homophily <- function(agents, gF,
     delta_E  <- E_after - E_before
 
     if (delta_E < 0 || runif(1) < exp(-delta_E * homophily_t)) {
-      op[c(i, j)] <- op[c(j, i)]
+      # Swap the WHOLE agent (opinion + group), not just the opinion value --
+      # this is a re-seating of agents onto fixed network positions, so every
+      # per-agent attribute has to move together. Swapping op alone would
+      # leave group behind at the old position, decoupling the (moved)
+      # opinion from the group it was drawn for -- silently breaking the
+      # opinion-correlation-implies-group-clustering mechanism this
+      # condition relies on (see Report 19 Sec 5).
+      op[c(i, j)]  <- op[c(j, i)]
+      grp[c(i, j)] <- grp[c(j, i)]
     }
   }
 
   agents$opinion <- op
+  agents$group   <- grp
+  if (assortativity(gF_lay, op[lay_ids], directed = FALSE) < target_homophily)
+    message(sprintf(
+      "shuffle_opinions_homophily(): did not reach target r=%.3f within %d steps (achieved r=%.3f)",
+      target_homophily, homophily_steps,
+      assortativity(gF_lay, op[lay_ids], directed = FALSE)))
   agents
 }
 
@@ -370,10 +392,15 @@ simulate_liquid_democracy <- function(
     attractiveness_fn       = attractiveness_dual_sigmoid,
     sigma_opinion           = 0,       # SD of logit-space noise on perceived opinion; 0 = exact, "auto" = sd(agents$opinion) for this run
     minority_share          = 0,       # fraction of lay agents in minority group
-    minority_opinion_mu     = NULL,    # if not NULL: minority opinions ~ N(mu, sigma_m)
-    minority_opinion_sigma  = 0.1,     # SD for clustered minority opinions
-    majority_opinion_mu     = NULL,    # if not NULL: majority opinions ~ N(mu, sigma_M)
-    majority_opinion_sigma  = 0.1,     # SD for clustered majority opinions
+    opinion_dist            = "normal", # "normal" | "uniform" -- distribution family for clustered group opinions below
+    minority_opinion_mu     = NULL,    # if not NULL: minority opinions are clustered. "normal": ~ N(mu, sigma_m). "uniform": mu is cosmetic (midpoint); actual draw uses minority_opinion_min/max
+    minority_opinion_sigma  = 0.1,     # SD for clustered minority opinions ("normal" only)
+    minority_opinion_min    = 0,       # lower bound for clustered minority opinions ("uniform" only)
+    minority_opinion_max    = 1,       # upper bound for clustered minority opinions ("uniform" only)
+    majority_opinion_mu     = NULL,    # if not NULL: majority opinions are clustered. "normal": ~ N(mu, sigma_M). "uniform": mu is cosmetic (midpoint); actual draw uses majority_opinion_min/max
+    majority_opinion_sigma  = 0.1,     # SD for clustered majority opinions ("normal" only)
+    majority_opinion_min    = 0,       # lower bound for clustered majority opinions ("uniform" only)
+    majority_opinion_max    = 1,       # upper bound for clustered majority opinions ("uniform" only)
     r_ingroup               = 0,       # ingroup responsiveness (0 = no preference)
     self_weight_mode        = "raw",   # "raw" | "confidence" — see delegation-decision block
     confidence_agg          = "sum",   # "sum" | "mean" — how "confidence" combines r_op/r_pw/r_ingroup (Report 18)
@@ -403,13 +430,17 @@ simulate_liquid_democracy <- function(
   # since group and opinion are correlated once this block runs.
   if (!is.null(minority_opinion_mu)) {
     min_ids_init <- which(agents$group == "minority")
-    agents$opinion[min_ids_init] <- pmin(pmax(
+    agents$opinion[min_ids_init] <- if (opinion_dist == "uniform") {
+      runif(length(min_ids_init), minority_opinion_min, minority_opinion_max)
+    } else pmin(pmax(
       rnorm(length(min_ids_init), minority_opinion_mu, minority_opinion_sigma),
       0), 1)
   }
   if (!is.null(majority_opinion_mu)) {
     maj_ids_init <- which(agents$group == "majority")
-    agents$opinion[maj_ids_init] <- pmin(pmax(
+    agents$opinion[maj_ids_init] <- if (opinion_dist == "uniform") {
+      runif(length(maj_ids_init), majority_opinion_min, majority_opinion_max)
+    } else pmin(pmax(
       rnorm(length(maj_ids_init), majority_opinion_mu, majority_opinion_sigma),
       0), 1)
   }
@@ -764,6 +795,21 @@ simulate_liquid_democracy <- function(
         mean(root_group_s[min_repr_ids_s] == "minority")
       else NA_real_
 
+      # RR_m computed against the RESOLVED population share instead of the
+      # total population share (n_min/n_all). RR_m (above) folds two
+      # channels into one number: majority capturing minority power, and
+      # minority votes lost to cycles (which shrink minority_power but not
+      # the fixed population-share denominator). RR_m_resolved isolates just
+      # the capture channel by dividing the same resolved-power numerator by
+      # the resolved *population* share instead -- directly comparable to
+      # PC_m, which is also resolved-only by construction.
+      n_resolved_min   <- length(min_repr_ids_s)
+      n_resolved_maj   <- length(maj_repr_ids_s)
+      n_resolved_total <- n_resolved_min + n_resolved_maj
+      RR_m_resolved <- if (n_resolved_total > 0 && sum(root_power) > 0)
+        min_pwr_shr / (n_resolved_min / n_resolved_total)
+      else NA_real_
+
       # Minority Power Capture (PC_m, Report 19 item 3): fraction of the
       # minority's total voting power ultimately represented by a majority
       # delegate. NOTE: every agent contributes exactly 1 unit of power to
@@ -832,7 +878,11 @@ simulate_liquid_democracy <- function(
         majority_power              = majority_power,
         minority_power_share        = min_pwr_shr,
         RR_m                        = RR_m,
+        RR_m_resolved               = RR_m_resolved,
+        minority_n_resolved         = n_resolved_min,
+        majority_n_resolved         = n_resolved_maj,
         minority_capture            = minority_capture,
+        majority_capture            = majority_capture,
         minority_self_rep_rate      = min_self_rep_rate,
         cross_group_dlg_rate        = cross_grp_rate,
         cdr_min_to_maj              = cdr_min_to_maj,

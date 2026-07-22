@@ -1,0 +1,870 @@
+---
+title: "Weekly Report -- Week 19: Minority Representation in Liquid Democracy"
+output: github_document
+date: "2026-07-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 6)
+library(tidyverse)
+library(here)
+library(furrr)
+library(patchwork)
+library(digest)
+library(knitr)
+
+theme_set(theme_minimal(base_size = 12))
+source(here::here("scripts/Network.R"))
+
+# ── Simulation constants (subset of Report 18 needed for Part II only;
+# Part I -- confidence-aggregator and trust-update development -- is not
+# repeated here, see Report 18) ──────────────────────────────────────────────
+MINORITY_SHARE   <- 0.2
+OP_SIGMA         <- 0.1
+SIM_T            <- 20L
+N_SIM            <- 500L
+K_SIM            <- 14L
+P_REWIRE         <- 0.05
+
+DELTA_VALS       <- c(0.2, 0.4)
+R_INGROUP_VALS   <- c(0, 1, 2, 4, 8)
+
+LAMBDA_DIAG   <- 0.5   # trust decay, Report 18 Sec. 3
+CYCLE_PENALTY <- 1     # kappa_cyc for reward+punish trust update, Report 18 Sec. 4
+
+N_SEEDS_MINORITY <- 25L
+
+# r_op = r_pw = r_trust ("background responsiveness") is swept as a
+# robustness check: does the r_ingroup/condition story hold up at low (1),
+# medium (4) and high (8) background responsiveness, or is it specific to
+# one regime? Deliberately NOT averaged across these -- see Section 1.2.
+R_BACKGROUND_VALS <- c(1, 4, 8)
+
+# "homophily" reuses the existing opinion-based network shuffle
+# (shuffle_opinions_homophily(), Report 9) instead of a group-based shuffle:
+# it runs on top of "polarised" opinions, so making the network assortative
+# on opinion indirectly clusters it by group too, since the two are
+# correlated once minority/majority opinion means differ. Fixed at
+# delta=0.4 only (strongest opinion-group correlation, clearest effect).
+HOMOPHILY_TARGET_R <- 0.8
+HOMOPHILY_DELTA    <- 0.4
+
+# Trust: reward+punish update (Report 18 Sec. 4). Self-weight: confidence
+# self-weight with the sum aggregator (Report 18 Sec. 1) -- see the recap
+# in Section 1 below.
+TRUST_MODE       <- "reward_punish"
+SELF_WEIGHT_MODE <- "confidence"
+CONFIDENCE_AGG   <- "sum"
+
+# Colour convention used throughout: majority = blue, minority = red,
+# population-wide/"all" = grey.
+GROUP_COLOURS <- c(all = "grey40", minority = "firebrick3", majority = "steelblue4")
+```
+
+## Opinion Distributions by Condition
+
+Opinions are drawn once at initialisation from group-specific normal
+distributions,
+
+$$o_i \sim \begin{cases}
+  \mathcal{N}(0.5-\delta/2,\ \sigma^2) & g_i = \text{minority} \quad (20\%) \\
+  \mathcal{N}(0.5+\delta/2,\ \sigma^2) & g_i = \text{majority} \quad (80\%)
+\end{cases}, \qquad \sigma = OP\_SIGMA = 0.1,$$
+
+with $\delta=0$ under `random` (both groups share $\mathcal{N}(0.5,\sigma^2)$),
+$\delta\in\{0.2,0.4\}$ under `polarised`, and $\delta=0.4$ under `homophily`
+(same draw as `polarised`, then reshuffled onto the network -- see the
+*Implementation Note: Homophily* section below).
+
+```{r opinion-dist-plot, fig.width=11, fig.height=5}
+dist_conditions <- tribble(
+  ~condition_label,                                   ~mu_min,                  ~mu_maj,
+  "random",                                            0.5,                      0.5,
+  "polarised (delta=0.2)",                             0.5 - 0.2 / 2,            0.5 + 0.2 / 2,
+  "polarised (delta=0.4)",                             0.5 - 0.4 / 2,            0.5 + 0.4 / 2,
+  sprintf("homophily (delta=%.1f)", HOMOPHILY_DELTA),  0.5 - HOMOPHILY_DELTA/2,  0.5 + HOMOPHILY_DELTA/2
+) |>
+  mutate(condition_label = factor(condition_label, levels = c(
+    "random", "polarised (delta=0.2)", "polarised (delta=0.4)",
+    sprintf("homophily (delta=%.1f)", HOMOPHILY_DELTA))))
+
+x_grid <- seq(0, 1, length.out = 400)
+
+df_dist <- dist_conditions |>
+  reframe(x = x_grid,
+          minority = dnorm(x_grid, mu_min, OP_SIGMA),
+          majority = dnorm(x_grid, mu_maj, OP_SIGMA),
+          .by = condition_label) |>
+  pivot_longer(c(minority, majority), names_to = "group", values_to = "density") |>
+  mutate(group = factor(group, levels = c("minority", "majority")))
+
+ggplot(df_dist, aes(x, density, colour = group, fill = group)) +
+  geom_area(position = "identity", alpha = 0.25, linewidth = 0) +
+  geom_line(linewidth = 0.9) +
+  facet_wrap(~ condition_label, nrow = 1) +
+  scale_colour_manual(values = GROUP_COLOURS) +
+  scale_fill_manual(values   = GROUP_COLOURS) +
+  labs(title = "Initial opinion distributions by condition",
+       subtitle = sprintf("o_i ~ N(0.5 -+ delta/2, %.2f^2); homophily reshuffles polarised (delta=%.1f) onto a network with opinion correlation r >= %.1f",
+                          OP_SIGMA, HOMOPHILY_DELTA, HOMOPHILY_TARGET_R),
+       x = "opinion o_i", y = "density", colour = "group", fill = "group") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+`random` and `homophily` share the same $\delta$-implied means as `random`
+($\delta{=}0$) and `polarised (delta=0.4)` respectively -- homophily changes
+*who sits next to whom* on the network, not the opinion draw itself, so its
+marginal distribution is identical to `polarised (delta=0.4)`.
+
+## Opinion Distributions by Condition (Uniform-Distribution Design)
+
+A second, independent study design keeps the same model and metrics
+throughout (Sections 3-5 below) but draws opinions from a **uniform**
+rather than a normal distribution:
+
+$$o_i \sim \begin{cases}
+  \mathcal{U}(0,1)     & \text{random} \quad \text{(both groups, no group difference)} \\
+  \mathcal{U}(0,\,0.5) & g_i=\text{minority} \quad \text{(polarised / homophily)} \\
+  \mathcal{U}(0.5,\,1) & g_i=\text{majority} \quad \text{(polarised / homophily)}
+\end{cases}$$
+
+`random` is simply $\mathcal{U}(0,1)$ for every agent, regardless of group.
+`polarised` puts minority and majority on opposite sides of a hard split at
+$0.5$, with no overlap; since this split is already maximal within $[0,1]$,
+there is no $\delta$ to sweep here (unlike the normal-distribution design
+above). `homophily` uses the same `polarised` draw, then reshuffles it onto
+the network exactly as described in the *Implementation Note: Homophily*
+section below. Results for this design are reported in Section 5, using
+the same plots as Sections 3-4.
+
+```{r opinion-dist-plot-uniform, fig.width=9, fig.height=5}
+dist_conditions_u <- tribble(
+  ~condition_label, ~lo_min, ~hi_min, ~lo_maj, ~hi_maj,
+  "random",          0,       1,       0,       1,
+  "polarised",       0,       0.5,     0.5,     1,
+  "homophily",       0,       0.5,     0.5,     1
+) |>
+  mutate(condition_label = factor(condition_label, levels = c("random", "polarised", "homophily")))
+
+x_grid_u <- seq(0, 1, length.out = 400)
+
+df_dist_u <- dist_conditions_u |>
+  reframe(x = x_grid_u,
+          minority = dunif(x_grid_u, lo_min, hi_min),
+          majority = dunif(x_grid_u, lo_maj, hi_maj),
+          .by = condition_label) |>
+  pivot_longer(c(minority, majority), names_to = "group", values_to = "density") |>
+  mutate(group = factor(group, levels = c("minority", "majority")))
+
+ggplot(df_dist_u, aes(x, density, colour = group, fill = group)) +
+  geom_area(position = "identity", alpha = 0.25, linewidth = 0) +
+  geom_line(linewidth = 0.9) +
+  facet_wrap(~ condition_label, nrow = 1) +
+  scale_colour_manual(values = GROUP_COLOURS) +
+  scale_fill_manual(values   = GROUP_COLOURS) +
+  labs(title = "Initial opinion distributions by condition (uniform-distribution design)",
+       subtitle = "random: U(0,1) for both groups; polarised/homophily: minority U(0,0.5), majority U(0.5,1)",
+       x = "opinion o_i", y = "density", colour = "group", fill = "group") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+---
+
+# Part II: Minority Representation in Liquid Democracy
+
+## RQ1: At which point is the responsiveness to ingroup parameter saturating?
+
+- **H1a.** The relationship between behavioural ingroup responsiveness
+  ($r_{ingroup}$) and minority delegation behaviour is non-linear and
+  exhibits a saturation point.
+
+*Operationalized by:* $RR_m$, $PC_m$, $RC_m$, $CDR$, delegation rate,
+representative share, average delegation chain length.
+
+## RQ2: How does behavioural ingroup preference affect minority representation in liquid democracy?
+
+- **H1b.** At $r_{ingroup}=0$ under random opinion distributions,
+  minority representation is proportional to the minority's population
+  share.
+- **H2b.** Increasing behavioural ingroup responsiveness improves
+  minority representation.
+- **H3b.** Increasing behavioural ingroup responsiveness reduces
+  minority power capture and minority representation capture.
+- **H4b.** The effects of behavioural ingroup responsiveness on minority
+  representation become stronger as opinion polarisation increases.
+
+*Operationalized by:* $RR_m$, $PC_m$, $RC_m$.
+
+## RQ3: Through which delegation mechanisms does behavioural ingroup preference influence minority representation?
+
+- **H1c.** Increasing behavioural ingroup responsiveness reduces
+  cross-group delegation.
+- **H2c.** The reduction in cross-group delegation is stronger under
+  greater opinion polarisation.
+- **H3c.** Increasing behavioural ingroup responsiveness shortens
+  delegation chains.
+- **H4c.** Increasing behavioural ingroup responsiveness reduces
+  ideological drift within both minority and majority groups.
+
+*Operationalized by:* $CDR$, average delegation chain length, average
+ideological drift.
+
+---
+
+# Implementation Note: Homophily
+
+**Energy.** Total opinion disagreement across the friendship graph $G$:
+
+$$E = \sum_{(i,j)\in E(G)} |o_i - o_j|$$
+
+**Metropolis step** (`shuffle_opinions_homophily()`, repeated up to
+`homophily_steps` $=10^5$ times):
+
+1. Draw two lay agents $i,j$ uniformly at random.
+2. Compute the *local* energy change of swapping $o_i \leftrightarrow o_j$
+   (only terms touching $i$ or $j$ change):
+$$E_{\text{before}} = \sum_{k\in \text{nbr}(i)}|o_i-o_k| + \sum_{k\in \text{nbr}(j)}|o_j-o_k|$$
+$$E_{\text{after}} = \sum_{k\in \text{nbr}(i)}|o_j-o_k| + \sum_{k\in \text{nbr}(j)}|o_i-o_k|$$
+$$\Delta E = E_{\text{after}} - E_{\text{before}}$$
+3. Accept the swap if $\Delta E<0$; otherwise accept with probability
+$$P(\text{accept}) = \exp(-\Delta E \cdot t), \qquad t = \texttt{homophily\_t} = 5.$$
+4. Every 100 steps, check the **network opinion correlation** $r$ and stop
+   once $r \ge r^\star$, $r^\star=$ `r HOMOPHILY_TARGET_R`. $r$ is the
+   Pearson correlation between the opinions sitting at either end of an
+   edge, i.e. the ordinary Pearson correlation coefficient applied to the
+   list of edge endpoint pairs (each undirected edge counted once in each
+   direction, so both sides of the pair share the same marginal
+   distribution of opinions):
+$$r = \frac{\sum_{(i,j)\in \vec E(G)} (o_i-\bar o)(o_j-\bar o)}
+           {\sum_{(i,j)\in \vec E(G)} (o_i-\bar o)^2},
+   \qquad \bar o = \frac{1}{N}\sum_{i} o_i,$$
+   where $\vec E(G)$ lists every edge of $G$ in both directions. $r=1$
+   means every edge connects two agents with identical opinions; $r=0$
+   means opinions are uncorrelated with network position (the untouched,
+   randomly wired network).
+
+---
+
+# 1  Model
+
+## 1.1  Metrics
+
+Averaged over the last 5 rounds (`round >= T-4`), then over
+`r N_SEEDS_MINORITY` seeds.
+
+**1. Voting power / share.**
+$$P_M = \sum_{i \in M} p_i, \quad P_{Maj} = \sum_{i \in N\setminus M} p_i,
+\quad \text{share}_M = \frac{P_M}{P_M+P_{Maj}}$$
+Total power actually cast by each group's roots ($p_i$ = root power if
+$i$ is a root, else 0), and each group's share of the total.
+
+**2. Relative Representation.**
+$$RR_m = \frac{\big(\sum_{i\in M} p_i \,/\, \sum_{i\in N} p_i\big)}{m},
+\qquad m = |M|/|N|$$
+Minority's power share divided by its population share; $1$ =
+proportional representation.
+
+**2b. Relative Representation, resolved-population denominator.**
+$$RR_m^{\text{resolved}} = \frac{\big(\sum_{i\in M} p_i \,/\, \sum_{i\in N} p_i\big)}{m_{\text{resolved}}},
+\qquad m_{\text{resolved}} = \frac{\#\{i\in M : \text{root}(i) \text{ defined}\}}{\#\{i\in N : \text{root}(i) \text{ defined}\}}$$
+Same power-share numerator as $RR_m$, but divided by the minority's share
+of the *resolved* population (agents whose delegation chain reaches a
+root, i.e. not stuck in a cycle) instead of its total population share
+$m$. $RR_m$ conflates two channels -- majority capturing minority power,
+and minority votes lost to cycles (which shrink the numerator but not the
+fixed denominator $m$) -- into one number; $RR_m^{\text{resolved}}$
+isolates the first channel alone, directly comparable to $PC_m$ (which is
+resolved-only by construction already). $RR_{Maj}^{\text{resolved}}$ is
+the majority counterpart, analogous to $RR_{Maj}$.
+
+**3. Power Capture.**
+$$PC_m = \frac{\#\{i\in M : \text{root}(i)\in N\setminus M\}}{\#\{i\in M : \text{root}(i) \text{ defined}\}},
+\qquad PC_{Maj} \text{ analogous with } M \leftrightarrow N\setminus M$$
+Fraction of one group's agents whose delegation chain terminates at a representative from the other group.
+
+**4. Cross-group delegation, both directions.**
+$$CDR_{M\to Maj} = \frac{\#\{(i,j)\in E : i\in M,\, j\notin M\}}{\#\{(i,j)\in E: i \in M\}},
+\qquad
+CDR_{Maj\to M} = \frac{\#\{(i,j)\in E : i\notin M,\, j\in M\}}{\#\{(i,j)\in E: i \notin M\}}$$
+Share of each group's own outgoing delegation edges that cross into the
+other group.
+
+**5. Group-specific rates.**
+$$\text{DelRate}_G = \frac{\#\{i\in G : \text{delegated}(i)\}}{|G|}$$
+Delegation rate within group $G$ ($G\in\{N, M, N\setminus M\}$);
+lost-vote rate, chain length and ideological drift use the same
+all/minority/majority split, restricted to each group's own agents.
+
+**6. Representatives per group.**
+$$n_G = \#\{i\in G : \text{root}(i)=i\}$$
+Headcount of group $G$'s direct voters (roots), regardless of how many
+others delegate to them.
+
+## 1.2  Experimental Design
+
+| Factor | Values |
+|---|---|
+| Condition | `random`, `polarised`, `homophily` |
+| Polarisation $\delta$ | $\{0.2, 0.4\}$ under `polarised`; fixed at `r HOMOPHILY_DELTA` under `homophily` |
+| Ingroup preference $r_{ingroup}$ | $\{0, 1, 2, 4, 8\}$ |
+| Background responsiveness $r_{op}=r_{pw}=r_{trust}$ | $\{$ `r paste(R_BACKGROUND_VALS, collapse=", ")` $\}$ |
+
+`random`: $\mathcal{N}(0.5,0.1^2)$ for both groups. `polarised`:
+$\mathcal{N}(0.5\mp\delta/2,0.1^2)$. `homophily`: `polarised` at
+$\delta=$ `r HOMOPHILY_DELTA` + network reshuffle to a network opinion
+correlation $\ge$ `r HOMOPHILY_TARGET_R` (see the *Implementation Note:
+Homophily* section above). Every plot below repeats across all 3
+background-responsiveness levels (separate rows) rather than averaging
+across them, since averaging would blend potentially different regimes
+(e.g. saturation effects) into a number that matches none of them.
+
+---
+
+# 2  Simulation
+
+```{r sim-run-one, include=FALSE}
+run_cell <- function(seed, condition, delta, r_ingroup, r_background) {
+  if (condition == "random") {
+    min_mu <- 0.5
+    maj_mu <- 0.5
+    th     <- NULL
+  } else if (condition == "polarised") {
+    min_mu <- 0.5 - delta / 2
+    maj_mu <- 0.5 + delta / 2
+    th     <- NULL
+  } else {  # homophily
+    min_mu <- 0.5 - delta / 2
+    maj_mu <- 0.5 + delta / 2
+    th     <- HOMOPHILY_TARGET_R
+  }
+
+  res <- simulate_liquid_democracy(
+    seed                    = seed,
+    n_per_community         = N_SIM,
+    n_communities           = 1,
+    node_degree             = K_SIM,
+    T                       = SIM_T,
+    r_op                    = r_background,
+    r_pw                    = r_background,
+    p_rewire                = P_REWIRE,
+    r_ingroup               = r_ingroup,
+    minority_share          = MINORITY_SHARE,
+    minority_opinion_mu     = min_mu,
+    minority_opinion_sigma  = OP_SIGMA,
+    majority_opinion_mu     = maj_mu,
+    majority_opinion_sigma  = OP_SIGMA,
+    self_weight_mode        = SELF_WEIGHT_MODE,
+    confidence_agg          = CONFIDENCE_AGG,
+    sigma_opinion           = "auto",
+    target_homophily        = th,
+    gamma                   = r_background,
+    lambda                  = LAMBDA_DIAG,
+    trust_mode              = TRUST_MODE,
+    cycle_penalty           = CYCLE_PENALTY
+  )
+
+  snaps <- res$snapshots |> dplyr::filter(round >= SIM_T - 4L)
+
+  tibble(
+    seed                         = seed,
+    condition                    = condition,
+    delta                        = delta,
+    r_ingroup                    = r_ingroup,
+    r_background                 = r_background,
+    delegation_rate              = mean(snaps$delegation_rate, na.rm = TRUE),
+    lost_vote_rate                = mean(snaps$lost_vote_rate,  na.rm = TRUE),
+    avg_chain_length_delegators  = mean(snaps$avg_chain_length_delegators, na.rm = TRUE),
+    avg_drift                    = mean(snaps$avg_drift,        na.rm = TRUE),
+    minority_delegation_rate     = mean(snaps$minority_delegation_rate, na.rm = TRUE),
+    majority_delegation_rate     = mean(snaps$majority_delegation_rate, na.rm = TRUE),
+    minority_lost_vote_rate      = mean(snaps$minority_lost_vote_rate,  na.rm = TRUE),
+    majority_lost_vote_rate      = mean(snaps$majority_lost_vote_rate,  na.rm = TRUE),
+    minority_chain_len           = mean(snaps$minority_chain_len, na.rm = TRUE),
+    majority_chain_len           = mean(snaps$majority_chain_len, na.rm = TRUE),
+    minority_drift                = mean(snaps$minority_drift,    na.rm = TRUE),
+    majority_drift                = mean(snaps$majority_drift,    na.rm = TRUE),
+    minority_power                = mean(snaps$minority_power,    na.rm = TRUE),
+    majority_power                = mean(snaps$majority_power,    na.rm = TRUE),
+    RR_m                          = mean(snaps$RR_m,              na.rm = TRUE),
+    RR_m_resolved                 = mean(snaps$RR_m_resolved,     na.rm = TRUE),
+    minority_n_resolved            = mean(snaps$minority_n_resolved, na.rm = TRUE),
+    majority_n_resolved            = mean(snaps$majority_n_resolved, na.rm = TRUE),
+    minority_capture               = mean(snaps$minority_capture, na.rm = TRUE),
+    majority_capture               = mean(snaps$majority_capture, na.rm = TRUE),
+    cross_group_dlg_rate          = mean(snaps$cross_group_dlg_rate, na.rm = TRUE),
+    cdr_min_to_maj                = mean(snaps$cdr_min_to_maj,    na.rm = TRUE),
+    cdr_maj_to_min                = mean(snaps$cdr_maj_to_min,    na.rm = TRUE),
+    minority_n_reps                = mean(snaps$minority_n_reps,  na.rm = TRUE),
+    majority_n_reps                = mean(snaps$majority_n_reps,  na.rm = TRUE)
+  )
+}
+```
+
+```{r sim-grid, include=FALSE}
+seeds_sim <- seq_len(N_SEEDS_MINORITY)
+
+grid_random    <- expand_grid(condition = "random", delta = NA_real_,
+                               r_ingroup = R_INGROUP_VALS, r_background = R_BACKGROUND_VALS, seed = seeds_sim)
+grid_polarised <- expand_grid(condition = "polarised", delta = DELTA_VALS,
+                               r_ingroup = R_INGROUP_VALS, r_background = R_BACKGROUND_VALS, seed = seeds_sim)
+grid_homophily <- expand_grid(condition = "homophily", delta = HOMOPHILY_DELTA,
+                               r_ingroup = R_INGROUP_VALS, r_background = R_BACKGROUND_VALS, seed = seeds_sim)
+grid_sim <- bind_rows(grid_random, grid_polarised, grid_homophily)
+
+params_sim <- list(N = N_SIM, K = K_SIM, T = SIM_T, r_background_vals = R_BACKGROUND_VALS,
+                    lambda = LAMBDA_DIAG, trust_mode = TRUST_MODE,
+                    cycle_penalty = CYCLE_PENALTY,
+                    delta_vals = DELTA_VALS, r_ingroup_vals = R_INGROUP_VALS,
+                    homophily_target = HOMOPHILY_TARGET_R, homophily_delta = HOMOPHILY_DELTA,
+                    minority_share = MINORITY_SHARE,
+                    self_weight_mode = SELF_WEIGHT_MODE, confidence_agg = CONFIDENCE_AGG,
+                    sigma_opinion = "auto", n_seeds = N_SEEDS_MINORITY, version = 9L)
+hash_sim  <- digest::digest(params_sim)
+cache_sim <- here::here("data/sim_report19_cache.rds")
+
+if (file.exists(cache_sim)) {
+  cs <- readRDS(cache_sim)
+  if (identical(cs$hash, hash_sim)) sim_raw <- cs$data else cs <- NULL
+} else cs <- NULL
+
+if (is.null(cs)) {
+  dir.create(here::here("data"), showWarnings = FALSE)
+  plan(multisession, workers = parallel::detectCores() - 1)
+
+  sim_raw <- future_pmap_dfr(
+    list(seed = grid_sim$seed, condition = grid_sim$condition,
+         delta = grid_sim$delta, r_ingroup = grid_sim$r_ingroup,
+         r_background = grid_sim$r_background),
+    run_cell,
+    .options = furrr_options(seed = NULL)
+  )
+  plan(sequential)
+  saveRDS(list(hash = hash_sim, data = sim_raw), cache_sim)
+}
+
+# Average over seeds; build "condition_label"/"r_background_label" factors
+# for plotting, plus derived group-share, deviation and
+# total-representatives columns used below.
+sim_agg <- sim_raw |>
+  group_by(condition, delta, r_ingroup, r_background) |>
+  summarise(across(where(is.numeric) & !any_of("seed"), \(x) mean(x, na.rm = TRUE)),
+            .groups = "drop") |>
+  mutate(
+    condition_label = case_when(
+      condition == "random"    ~ "random",
+      condition == "polarised" ~ sprintf("polarised (delta=%.1f)", delta),
+      condition == "homophily" ~ sprintf("homophily (delta=%.1f)", delta)
+    ),
+    condition_label = factor(condition_label, levels = c(
+      "random", "polarised (delta=0.2)", "polarised (delta=0.4)",
+      sprintf("homophily (delta=%.1f)", HOMOPHILY_DELTA))),
+    r_background_label = factor(paste0("r=", r_background), levels = paste0("r=", R_BACKGROUND_VALS)),
+    minority_power_share_pct = 100 * minority_power / (minority_power + majority_power),
+    majority_power_share_pct = 100 - minority_power_share_pct,
+    # Deviation from proportional share (in percentage points) -- lets
+    # minority and majority sit in ONE panel on a shared, tight y-axis
+    # instead of needing separate rows for a ~60pp baseline gap.
+    minority_power_dev_pct   = minority_power_share_pct - 100 * MINORITY_SHARE,
+    majority_power_dev_pct   = majority_power_share_pct - 100 * (1 - MINORITY_SHARE),
+    all_n_reps                = minority_n_reps + majority_n_reps,
+    # RR_maj: majority's power share over majority's population share --
+    # the same formula as RR_m, just for the other group. Not independent
+    # of RR_m with only two groups, but shown alongside it so both
+    # group-specific lines are visible rather than only the minority one.
+    RR_maj                    = (majority_power_share_pct / 100) / (1 - MINORITY_SHARE),
+    # RR_maj_resolved: majority's counterpart to RR_m_resolved -- same
+    # resolved-power numerator, divided by majority's share of the RESOLVED
+    # population instead of its total population share.
+    RR_maj_resolved            = (majority_power_share_pct / 100) /
+      (majority_n_resolved / (minority_n_resolved + majority_n_resolved))
+  )
+
+SUBTITLE <- sprintf("N = %d | k = %d | T = %d | %d seeds | confidence (sum) | trust: reward+punish",
+                    N_SIM, K_SIM, SIM_T, N_SEEDS_MINORITY)
+```
+
+---
+
+# 3  Representation Overview
+
+```{r plot-part1-rates, fig.width=13, fig.height=16}
+rates_map <- tribble(
+  ~metric,           ~scope,     ~column,
+  "Delegation Rate", "all",      "delegation_rate",
+  "Delegation Rate", "minority", "minority_delegation_rate",
+  "Delegation Rate", "majority", "majority_delegation_rate",
+  "Lost Vote Rate",  "all",      "lost_vote_rate",
+  "Lost Vote Rate",  "minority", "minority_lost_vote_rate",
+  "Lost Vote Rate",  "majority", "majority_lost_vote_rate"
+)
+
+df_part1_rates <- rates_map |>
+  pmap_dfr(function(metric, scope, column)
+    sim_agg |> transmute(condition_label, r_background_label, r_ingroup, value = .data[[column]], metric, scope)) |>
+  mutate(metric = factor(metric, levels = unique(rates_map$metric)),
+         scope  = factor(scope, levels = c("all", "minority", "majority")))
+
+ggplot(df_part1_rates, aes(r_ingroup, value, colour = scope)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.8) +
+  facet_grid(r_background_label + metric ~ condition_label, scales = "free_y") +
+  scale_colour_manual(values = GROUP_COLOURS) +
+  scale_x_continuous(breaks = R_INGROUP_VALS) +
+  labs(title = "Delegation rate & lost-vote rate -- all vs. minority vs. majority, by background r",
+       subtitle = SUBTITLE, x = "r_ingroup", y = NULL, colour = "scope") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+- all minority condition tend to have higher lost vote rates due to smaller population size. 
+
+```{r plot-part1-rr-pc, fig.width=13, fig.height=16}
+# RR_maj and PC_Maj are not independent of RR_m/PC_m (only two groups), but
+# shown as their own red/blue lines so both groups are visible directly,
+# matching the minority=red/majority=blue convention used everywhere else.
+#
+# RR_m/RR_maj (solid) use the total population share as their denominator,
+# so they fold two channels together: majority capturing minority power,
+# AND minority votes lost to cycles (which shrink the resolved-power
+# numerator but not the fixed population-share denominator). RR_m_resolved/
+# RR_maj_resolved (dashed) use the RESOLVED population share instead --
+# same numerator, so the gap between solid and dashed lines is exactly the
+# lost-vote/cycling contribution, and the dashed line isolates the capture
+# channel alone, directly comparable to PC_m/PC_Maj (which are resolved-only
+# by construction already).
+df_rr_pc <- sim_agg |>
+  select(condition_label, r_background_label, r_ingroup,
+         RR_m, RR_maj, RR_m_resolved, RR_maj_resolved,
+         PC_m = minority_capture, PC_Maj = majority_capture) |>
+  pivot_longer(c(RR_m, RR_maj, RR_m_resolved, RR_maj_resolved, PC_m, PC_Maj),
+               names_to = "series", values_to = "value") |>
+  mutate(metric = factor(if_else(series %in% c("RR_m", "RR_maj", "RR_m_resolved", "RR_maj_resolved"), "RR", "PC"),
+                          levels = c("RR", "PC")),
+         scope  = factor(if_else(series %in% c("RR_m", "PC_m", "RR_m_resolved"), "minority", "majority"),
+                          levels = c("minority", "majority")),
+         denom  = factor(if_else(series %in% c("RR_m_resolved", "RR_maj_resolved"), "resolved", "population"),
+                          levels = c("population", "resolved")))
+
+ggplot(df_rr_pc, aes(r_ingroup, value, colour = scope, linetype = denom)) +
+  geom_hline(data = tibble(metric = factor("RR", levels = c("RR", "PC")), value = 1),
+             aes(yintercept = value), linetype = "dotted", colour = "grey50") +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  facet_grid(r_background_label + metric ~ condition_label, scales = "free_y") +
+  scale_colour_manual(values = GROUP_COLOURS) +
+  scale_linetype_manual(values = c(population = "solid", resolved = "dashed")) +
+  scale_x_continuous(breaks = R_INGROUP_VALS) +
+  labs(title = "RR_m / RR_maj (population vs. resolved denominator) and PC_m / PC_Maj, by background r",
+       subtitle = SUBTITLE, x = "r_ingroup", y = NULL, colour = "scope", linetype = "RR denominator") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+- Why is PCm and RRm relation ship positive? I would expect the behavior as it is for majority
+---
+
+# 4  Delegation Mechanisms
+
+```{r plot-part2-cdr, fig.width=13, fig.height=9}
+df_cdr <- sim_agg |>
+  select(condition_label, r_background_label, r_ingroup, all = cross_group_dlg_rate,
+         minority = cdr_min_to_maj, majority = cdr_maj_to_min) |>
+  pivot_longer(c(all, minority, majority), names_to = "scope", values_to = "value") |>
+  mutate(scope = factor(scope, levels = c("all", "minority", "majority")))
+
+ggplot(df_cdr, aes(r_ingroup, value, colour = scope)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  facet_grid(r_background_label ~ condition_label, scales = "free_y") +
+  scale_colour_manual(values = GROUP_COLOURS) +
+  scale_x_continuous(breaks = R_INGROUP_VALS) +
+  labs(title = "Cross-group delegation rate (all = population-wide; minority = M->Maj; majority = Maj->M), by background r",
+       subtitle = SUBTITLE, x = "r_ingroup", y = "share of own edges crossing group", colour = "scope") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+- Difference quiete small but visible between different conditions (direction of results as expected).
+```{r plot-part2-chain-drift, fig.width=13, fig.height=16}
+mech_map <- tribble(
+  ~metric,             ~scope,     ~column,
+  "Chain Length",      "all",      "avg_chain_length_delegators",
+  "Chain Length",      "minority", "minority_chain_len",
+  "Chain Length",      "majority", "majority_chain_len",
+  "Ideological Drift", "all",      "avg_drift",
+  "Ideological Drift", "minority", "minority_drift",
+  "Ideological Drift", "majority", "majority_drift"
+)
+
+df_mech <- mech_map |>
+  pmap_dfr(function(metric, scope, column)
+    sim_agg |> transmute(condition_label, r_background_label, r_ingroup, value = .data[[column]], metric, scope)) |>
+  mutate(metric = factor(metric, levels = unique(mech_map$metric)),
+         scope  = factor(scope, levels = c("all", "minority", "majority")))
+
+ggplot(df_mech, aes(r_ingroup, value, colour = scope)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.8) +
+  facet_grid(r_background_label + metric ~ condition_label, scales = "free_y") +
+  scale_colour_manual(values = GROUP_COLOURS) +
+  scale_x_continuous(breaks = R_INGROUP_VALS) +
+  labs(title = "Chain length & ideological drift -- all vs. minority vs. majority, by background r",
+       subtitle = SUBTITLE, x = "r_ingroup", y = NULL, colour = "scope") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+- decrease of chain length of minority probably due to cycles.
+- ideological drift not lowest for minority in the homophily conditions seems not right.
+
+---
+
+# 5  Robustness Check: Uniform Opinion Distribution
+
+Same model, metrics and plots as Sections 3-4, using the
+uniform-distribution study design introduced at the top of this report
+(*Opinion Distributions by Condition (Uniform-Distribution Design)*).
+
+```{r sim-run-one-uniform, include=FALSE}
+run_cell_uniform <- function(seed, condition, r_ingroup, r_background) {
+  if (condition == "random") {
+    min_lo <- 0;   min_hi <- 1
+    maj_lo <- 0;   maj_hi <- 1
+    clustered <- FALSE  # no override -- relies on setup_agents()'s default U(0,1) draw
+    th        <- NULL
+  } else if (condition == "polarised") {
+    min_lo <- 0;   min_hi <- 0.5
+    maj_lo <- 0.5; maj_hi <- 1
+    clustered <- TRUE
+    th        <- NULL
+  } else {  # homophily
+    min_lo <- 0;   min_hi <- 0.5
+    maj_lo <- 0.5; maj_hi <- 1
+    clustered <- TRUE
+    th        <- HOMOPHILY_TARGET_R
+  }
+
+  res <- simulate_liquid_democracy(
+    seed                    = seed,
+    n_per_community         = N_SIM,
+    n_communities           = 1,
+    node_degree             = K_SIM,
+    T                       = SIM_T,
+    r_op                    = r_background,
+    r_pw                    = r_background,
+    p_rewire                = P_REWIRE,
+    r_ingroup               = r_ingroup,
+    minority_share          = MINORITY_SHARE,
+    opinion_dist            = "uniform",
+    minority_opinion_mu     = if (clustered) (min_lo + min_hi) / 2 else NULL,
+    minority_opinion_min    = min_lo,
+    minority_opinion_max    = min_hi,
+    majority_opinion_mu     = if (clustered) (maj_lo + maj_hi) / 2 else NULL,
+    majority_opinion_min    = maj_lo,
+    majority_opinion_max    = maj_hi,
+    self_weight_mode        = SELF_WEIGHT_MODE,
+    confidence_agg          = CONFIDENCE_AGG,
+    sigma_opinion           = "auto",
+    target_homophily        = th,
+    gamma                   = r_background,
+    lambda                  = LAMBDA_DIAG,
+    trust_mode              = TRUST_MODE,
+    cycle_penalty           = CYCLE_PENALTY
+  )
+
+  snaps <- res$snapshots |> dplyr::filter(round >= SIM_T - 4L)
+
+  tibble(
+    seed                         = seed,
+    condition                    = condition,
+    r_ingroup                    = r_ingroup,
+    r_background                 = r_background,
+    delegation_rate              = mean(snaps$delegation_rate, na.rm = TRUE),
+    lost_vote_rate                = mean(snaps$lost_vote_rate,  na.rm = TRUE),
+    avg_chain_length_delegators  = mean(snaps$avg_chain_length_delegators, na.rm = TRUE),
+    avg_drift                    = mean(snaps$avg_drift,        na.rm = TRUE),
+    minority_delegation_rate     = mean(snaps$minority_delegation_rate, na.rm = TRUE),
+    majority_delegation_rate     = mean(snaps$majority_delegation_rate, na.rm = TRUE),
+    minority_lost_vote_rate      = mean(snaps$minority_lost_vote_rate,  na.rm = TRUE),
+    majority_lost_vote_rate      = mean(snaps$majority_lost_vote_rate,  na.rm = TRUE),
+    minority_chain_len           = mean(snaps$minority_chain_len, na.rm = TRUE),
+    majority_chain_len           = mean(snaps$majority_chain_len, na.rm = TRUE),
+    minority_drift                = mean(snaps$minority_drift,    na.rm = TRUE),
+    majority_drift                = mean(snaps$majority_drift,    na.rm = TRUE),
+    minority_power                = mean(snaps$minority_power,    na.rm = TRUE),
+    majority_power                = mean(snaps$majority_power,    na.rm = TRUE),
+    RR_m                          = mean(snaps$RR_m,              na.rm = TRUE),
+    RR_m_resolved                 = mean(snaps$RR_m_resolved,     na.rm = TRUE),
+    minority_n_resolved            = mean(snaps$minority_n_resolved, na.rm = TRUE),
+    majority_n_resolved            = mean(snaps$majority_n_resolved, na.rm = TRUE),
+    minority_capture               = mean(snaps$minority_capture, na.rm = TRUE),
+    majority_capture               = mean(snaps$majority_capture, na.rm = TRUE),
+    cross_group_dlg_rate          = mean(snaps$cross_group_dlg_rate, na.rm = TRUE),
+    cdr_min_to_maj                = mean(snaps$cdr_min_to_maj,    na.rm = TRUE),
+    cdr_maj_to_min                = mean(snaps$cdr_maj_to_min,    na.rm = TRUE),
+    minority_n_reps                = mean(snaps$minority_n_reps,  na.rm = TRUE),
+    majority_n_reps                = mean(snaps$majority_n_reps,  na.rm = TRUE)
+  )
+}
+```
+
+```{r sim-grid-uniform, include=FALSE}
+grid_random_u    <- expand_grid(condition = "random",
+                                 r_ingroup = R_INGROUP_VALS, r_background = R_BACKGROUND_VALS, seed = seeds_sim)
+grid_polarised_u <- expand_grid(condition = "polarised",
+                                 r_ingroup = R_INGROUP_VALS, r_background = R_BACKGROUND_VALS, seed = seeds_sim)
+grid_homophily_u <- expand_grid(condition = "homophily",
+                                 r_ingroup = R_INGROUP_VALS, r_background = R_BACKGROUND_VALS, seed = seeds_sim)
+grid_sim_u <- bind_rows(grid_random_u, grid_polarised_u, grid_homophily_u)
+
+params_sim_u <- list(N = N_SIM, K = K_SIM, T = SIM_T, r_background_vals = R_BACKGROUND_VALS,
+                      lambda = LAMBDA_DIAG, trust_mode = TRUST_MODE,
+                      cycle_penalty = CYCLE_PENALTY,
+                      r_ingroup_vals = R_INGROUP_VALS,
+                      homophily_target = HOMOPHILY_TARGET_R,
+                      minority_share = MINORITY_SHARE,
+                      self_weight_mode = SELF_WEIGHT_MODE, confidence_agg = CONFIDENCE_AGG,
+                      sigma_opinion = "auto", n_seeds = N_SEEDS_MINORITY,
+                      opinion_dist = "uniform", version = 2L)
+hash_sim_u  <- digest::digest(params_sim_u)
+cache_sim_u <- here::here("data/sim_report19_uniform_cache.rds")
+
+if (file.exists(cache_sim_u)) {
+  cs_u <- readRDS(cache_sim_u)
+  if (identical(cs_u$hash, hash_sim_u)) sim_raw_u <- cs_u$data else cs_u <- NULL
+} else cs_u <- NULL
+
+if (is.null(cs_u)) {
+  dir.create(here::here("data"), showWarnings = FALSE)
+  plan(multisession, workers = parallel::detectCores() - 1)
+
+  sim_raw_u <- future_pmap_dfr(
+    list(seed = grid_sim_u$seed, condition = grid_sim_u$condition,
+         r_ingroup = grid_sim_u$r_ingroup, r_background = grid_sim_u$r_background),
+    run_cell_uniform,
+    .options = furrr_options(seed = NULL)
+  )
+  plan(sequential)
+  saveRDS(list(hash = hash_sim_u, data = sim_raw_u), cache_sim_u)
+}
+
+sim_agg_u <- sim_raw_u |>
+  group_by(condition, r_ingroup, r_background) |>
+  summarise(across(where(is.numeric) & !any_of("seed"), \(x) mean(x, na.rm = TRUE)),
+            .groups = "drop") |>
+  mutate(
+    condition_label = factor(condition, levels = c("random", "polarised", "homophily")),
+    r_background_label = factor(paste0("r=", r_background), levels = paste0("r=", R_BACKGROUND_VALS)),
+    minority_power_share_pct = 100 * minority_power / (minority_power + majority_power),
+    majority_power_share_pct = 100 - minority_power_share_pct,
+    minority_power_dev_pct   = minority_power_share_pct - 100 * MINORITY_SHARE,
+    majority_power_dev_pct   = majority_power_share_pct - 100 * (1 - MINORITY_SHARE),
+    all_n_reps                = minority_n_reps + majority_n_reps,
+    RR_maj                    = (majority_power_share_pct / 100) / (1 - MINORITY_SHARE),
+    RR_maj_resolved            = (majority_power_share_pct / 100) /
+      (majority_n_resolved / (minority_n_resolved + majority_n_resolved))
+  )
+
+SUBTITLE_U <- sprintf("N = %d | k = %d | T = %d | %d seeds | uniform opinion distribution | confidence (sum) | trust: reward+punish",
+                      N_SIM, K_SIM, SIM_T, N_SEEDS_MINORITY)
+```
+
+## 5.1  Representation Overview
+
+```{r plot-part6-rates, fig.width=11, fig.height=16}
+df_part1_rates_u <- rates_map |>
+  pmap_dfr(function(metric, scope, column)
+    sim_agg_u |> transmute(condition_label, r_background_label, r_ingroup, value = .data[[column]], metric, scope)) |>
+  mutate(metric = factor(metric, levels = unique(rates_map$metric)),
+         scope  = factor(scope, levels = c("all", "minority", "majority")))
+
+ggplot(df_part1_rates_u, aes(r_ingroup, value, colour = scope)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.8) +
+  facet_grid(r_background_label + metric ~ condition_label, scales = "free_y") +
+  scale_colour_manual(values = GROUP_COLOURS) +
+  scale_x_continuous(breaks = R_INGROUP_VALS) +
+  labs(title = "Delegation rate & lost-vote rate -- all vs. minority vs. majority, by background r (uniform distribution)",
+       subtitle = SUBTITLE_U, x = "r_ingroup", y = NULL, colour = "scope") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+```{r plot-part6-rr-pc, fig.width=11, fig.height=16}
+# See Section 3's plot-part1-rr-pc for the population-vs-resolved rationale.
+df_rr_pc_u <- sim_agg_u |>
+  select(condition_label, r_background_label, r_ingroup,
+         RR_m, RR_maj, RR_m_resolved, RR_maj_resolved,
+         PC_m = minority_capture, PC_Maj = majority_capture) |>
+  pivot_longer(c(RR_m, RR_maj, RR_m_resolved, RR_maj_resolved, PC_m, PC_Maj),
+               names_to = "series", values_to = "value") |>
+  mutate(metric = factor(if_else(series %in% c("RR_m", "RR_maj", "RR_m_resolved", "RR_maj_resolved"), "RR", "PC"),
+                          levels = c("RR", "PC")),
+         scope  = factor(if_else(series %in% c("RR_m", "PC_m", "RR_m_resolved"), "minority", "majority"),
+                          levels = c("minority", "majority")),
+         denom  = factor(if_else(series %in% c("RR_m_resolved", "RR_maj_resolved"), "resolved", "population"),
+                          levels = c("population", "resolved")))
+
+ggplot(df_rr_pc_u, aes(r_ingroup, value, colour = scope, linetype = denom)) +
+  geom_hline(data = tibble(metric = factor("RR", levels = c("RR", "PC")), value = 1),
+             aes(yintercept = value), linetype = "dotted", colour = "grey50") +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  facet_grid(r_background_label + metric ~ condition_label, scales = "free_y") +
+  scale_colour_manual(values = GROUP_COLOURS) +
+  scale_linetype_manual(values = c(population = "solid", resolved = "dashed")) +
+  scale_x_continuous(breaks = R_INGROUP_VALS) +
+  labs(title = "RR_m / RR_maj (population vs. resolved denominator) and PC_m / PC_Maj, by background r (uniform distribution)",
+       subtitle = SUBTITLE_U, x = "r_ingroup", y = NULL, colour = "scope", linetype = "RR denominator") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+## 5.2  Delegation Mechanisms
+
+```{r plot-part6-cdr, fig.width=11, fig.height=9}
+df_cdr_u <- sim_agg_u |>
+  select(condition_label, r_background_label, r_ingroup, all = cross_group_dlg_rate,
+         minority = cdr_min_to_maj, majority = cdr_maj_to_min) |>
+  pivot_longer(c(all, minority, majority), names_to = "scope", values_to = "value") |>
+  mutate(scope = factor(scope, levels = c("all", "minority", "majority")))
+
+ggplot(df_cdr_u, aes(r_ingroup, value, colour = scope)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  facet_grid(r_background_label ~ condition_label, scales = "free_y") +
+  scale_colour_manual(values = GROUP_COLOURS) +
+  scale_x_continuous(breaks = R_INGROUP_VALS) +
+  labs(title = "Cross-group delegation rate (all = population-wide; minority = M->Maj; majority = Maj->M), by background r (uniform distribution)",
+       subtitle = SUBTITLE_U, x = "r_ingroup", y = "share of own edges crossing group", colour = "scope") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
+
+```{r plot-part6-chain-drift, fig.width=11, fig.height=16}
+df_mech_u <- mech_map |>
+  pmap_dfr(function(metric, scope, column)
+    sim_agg_u |> transmute(condition_label, r_background_label, r_ingroup, value = .data[[column]], metric, scope)) |>
+  mutate(metric = factor(metric, levels = unique(mech_map$metric)),
+         scope  = factor(scope, levels = c("all", "minority", "majority")))
+
+ggplot(df_mech_u, aes(r_ingroup, value, colour = scope)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.8) +
+  facet_grid(r_background_label + metric ~ condition_label, scales = "free_y") +
+  scale_colour_manual(values = GROUP_COLOURS) +
+  scale_x_continuous(breaks = R_INGROUP_VALS) +
+  labs(title = "Chain length & ideological drift -- all vs. minority vs. majority, by background r (uniform distribution)",
+       subtitle = SUBTITLE_U, x = "r_ingroup", y = NULL, colour = "scope") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text       = element_text(face = "bold", size = 9),
+        legend.position  = "bottom")
+```
