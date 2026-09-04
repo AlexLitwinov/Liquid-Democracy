@@ -53,7 +53,7 @@ round from rounding.
 | $r_{op}$ | opinion responsiveness | varied |
 | $r_{pw}$ | power responsiveness | varied |
 | $r_{tr}$ | trust responsiveness (`gamma`) | varied |
-| $\lambda$ | trust adaptation rate | fixed, $\lambda=1-0.5^{2/n_\text{voting\_rounds}}\approx0.1294$ |
+| $\lambda$ | trust adaptation rate | fixed, $\lambda=1-0.5^{2/n_\text{voting\_rounds}}\approx0.0670$ |
 | $c$ | self-reliance baseline | fixed, $c=0.5$ |
 | $k_1,k_2$ | agreement / cycle-penalty weights | fixed at 1 |
 | $r_{ig}$ | ingroup responsiveness | fixed at 0 (Part I only) |
@@ -63,7 +63,7 @@ is fixed via a half-life condition on the trust-relaxation recursion,
 $(1-\lambda)^h=0.5$ for $h=n_\text{voting\_rounds}/2$ voting-round
 updates (half of however many voting rounds a run actually has), giving
 $\lambda=1-0.5^{2/n_\text{voting\_rounds}}$. At this report’s
-$n_\text{voting\_rounds}=10$ that is $\lambda\approx0.1294$.
+$n_\text{voting\_rounds}=20$ that is $\lambda\approx0.0670$.
 
 ------------------------------------------------------------------------
 
@@ -89,7 +89,7 @@ For **N = 1000**: I choose the range of K to
 
 ## 1.2b Extreme K at N=1000, full round-by-round trace (T=600)
 
-![](Report_21_files/figure-gfm/p1-round-check-1.png)<!-- -->
+![](Report_20_files/figure-gfm/p1-round-check-1.png)<!-- -->
 
 - 30 Rounds seems enough to have the system stabilized ( T=30 voting,
   voting rounds = 10)
@@ -98,7 +98,7 @@ For **N = 1000**: I choose the range of K to
 
 N=1000 fixed and $r_{op}=r_{pw}=r_{tr}$ at each level.
 
-![](Report_21_files/figure-gfm/p1-3-plot-1.png)<!-- --> - We see that K
+![](Report_20_files/figure-gfm/p1-3-plot-1.png)<!-- --> - We see that K
 has quiete a strong effect (makes sense since due to K agents have more
 options therefore potentially better options)
 
@@ -117,7 +117,7 @@ K to 16 and would call it something like a model assumption.
 
 ## 1.4 N-sensitivity by responsiveness, K=16 fixed
 
-![](Report_21_files/figure-gfm/p1-4-plot-1.png)<!-- -->
+![](Report_20_files/figure-gfm/p1-4-plot-1.png)<!-- -->
 
 - Once N is sufficiently large to ensure a well-defined network
   structure, further increases in network size have little effect on the
@@ -151,18 +151,18 @@ Plus two power-concentration metrics beyond the four core ones:
 agents) and **share_50pct** (share of agents needed to jointly
 accumulate 50% of total voting power).
 
-![](Report_21_files/figure-gfm/p1-4b-plot-1-1.png)<!-- -->
+![](Report_20_files/figure-gfm/p1-4b-plot-1-1.png)<!-- -->
 
-![](Report_21_files/figure-gfm/p1-4b-plot-2-1.png)<!-- -->
+![](Report_20_files/figure-gfm/p1-4b-plot-2-1.png)<!-- -->
 
-![](Report_21_files/figure-gfm/p1-4b-plot-3-1.png)<!-- -->
+![](Report_20_files/figure-gfm/p1-4b-plot-3-1.png)<!-- -->
 
 ## 1.4c Alternative: single-dial $r_{op}=r_{pw}=r_{tr}$ (kept alongside 1.4b)
 
 Same WS-vs-BA comparison, but reducing the three responsiveness
 dimensions to one shared dial ($r_{op}=r_{pw}=r_{tr}$, varied together)
 
-![](Report_21_files/figure-gfm/p1-4c-plot-1.png)<!-- -->
+![](Report_20_files/figure-gfm/p1-4c-plot-1.png)<!-- -->
 
 ------------------------------------------------------------------------
 
@@ -170,11 +170,11 @@ dimensions to one shared dial ($r_{op}=r_{pw}=r_{tr}$, varied together)
 
 ## Fixed inputs
 
-**N = 500, K = 18, T = 30 (10 voting rounds), c = 0.5.**
+**N = 500, K = 18, T = 60 (20 voting rounds), c = 0.5.**
 
 ## Extreme behaviour: single-dial vs. isolated dimensions, r up to 512
 
-![](Report_21_files/figure-gfm/rq-extreme-plot-1.png)<!-- -->
+![](Report_20_files/figure-gfm/rq-extreme-plot-1.png)<!-- -->
 
 ------------------------------------------------------------------------
 
@@ -207,28 +207,28 @@ keeping the same delegation target as the previous round –
 see `Network.R`’s `history_stability[t]` computation for the exact
 per-round definition).
 
-![](Report_21_files/figure-gfm/rq1-pair-plot-1-1.png)<!-- -->
+![](Report_20_files/figure-gfm/rq1-pair-plot-1-1.png)<!-- -->
 
-![](Report_21_files/figure-gfm/rq1-pair-plot-2-1.png)<!-- -->
+![](Report_20_files/figure-gfm/rq1-pair-plot-2-1.png)<!-- -->
 
-![](Report_21_files/figure-gfm/rq1-pair-plot-3-1.png)<!-- -->
+![](Report_20_files/figure-gfm/rq1-pair-plot-3-1.png)<!-- -->
 
 ------------------------------------------------------------------------
 
 # RQ2: quality of political representation
 
-![](Report_21_files/figure-gfm/rq2-pair-plot-1-1.png)<!-- -->
+![](Report_20_files/figure-gfm/rq2-pair-plot-1-1.png)<!-- -->
 
-![](Report_21_files/figure-gfm/rq2-pair-plot-2-1.png)<!-- -->
+![](Report_20_files/figure-gfm/rq2-pair-plot-2-1.png)<!-- -->
 
-![](Report_21_files/figure-gfm/rq2-pair-plot-3-1.png)<!-- -->
+![](Report_20_files/figure-gfm/rq2-pair-plot-3-1.png)<!-- -->
 
 ------------------------------------------------------------------------
 
 # RQ3: concentration of voting power
 
-![](Report_21_files/figure-gfm/rq3-pair-plot-1-1.png)<!-- -->
+![](Report_20_files/figure-gfm/rq3-pair-plot-1-1.png)<!-- -->
 
-![](Report_21_files/figure-gfm/rq3-pair-plot-2-1.png)<!-- -->
+![](Report_20_files/figure-gfm/rq3-pair-plot-2-1.png)<!-- -->
 
-![](Report_21_files/figure-gfm/rq3-pair-plot-3-1.png)<!-- -->
+![](Report_20_files/figure-gfm/rq3-pair-plot-3-1.png)<!-- -->
