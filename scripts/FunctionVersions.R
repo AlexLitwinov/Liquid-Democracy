@@ -72,6 +72,79 @@ attractiveness_dual_sigmoid <- function(op_i, op_j, pow_i, pow_j, r_op, r_pw) {
 }
 
 
+# Attractiveness v4 — Gaussian Opinion x Logistic Log-Power
+#   [decision_model = "gaussian_mobius", Report 20]
+# A_ij = 2 * a_op_ij * a_pw_ij
+#   a_op_ij = exp(-r_op^2 * (op_i - op_j)^2 / 2)  — Gaussian kernel in
+#             opinion distance: = 1 at zero distance, -> 0 far away.
+#             Width sigma = 1/r_op (larger r_op = sharper opinion gating).
+#   a_pw_ij = σ(r_pw * log(pow_j / pow_i))        — = 0.5 at equal power,
+#             same log-ratio sigmoid as v2/v3.
+#
+# Unlike attractiveness_dual_sigmoid, opinion proximity is a genuine
+# Gaussian (not squashed through a sigmoid). The leading "2 *" matches
+# the scale of the existing trust_mod = 2*sig(gamma*tau) multiplier
+# (Network.R): with trust/ingroup inactive (gamma = 0, r_ingroup = 0),
+# an identical neighbour (Δop = 0, equal power) sits at A_ij = 1, and
+# the unreachable ceiling is A_ij = 2 — see p_self_mobius() below, which
+# is calibrated to that same [0, 2] scale.
+attractiveness_gaussian_log <- function(op_i, op_j, pow_i, pow_j, r_op, r_pw) {
+  a_op <- exp(-0.5 * r_op^2 * (op_i - op_j)^2)
+  a_pw <- .sig(r_pw * log(pow_j / pow_i))
+  2 * a_op * a_pw
+}
+
+
+# Attractiveness v5 -- Exponential-Absolute Opinion x Own-Scaled Logistic Power
+#   [decision_model = "calib", Report 21 calibration pipeline]
+# A_ij = a_op_ij * a_pw_ij  (a_tr_ij multiplied in separately by Network.R's
+#        existing trust_mod path -- see trust_mode = "relaxation" there; a_ig
+#        held at 1 throughout Part I)
+#   a_op_ij = exp(-r_op * |op_i - op_j|)          in (0, 1]  -- NOT squared,
+#             NOT Gaussian, and carries no leading "2" (unlike v4): decays
+#             exponentially in raw opinion distance, width 1/r_op.
+#   a_pw_ij = 2 * L(r_pw * log(pow_j / pow_i))    in (0, 2)  -- same log-ratio
+#             sigmoid as v3/v4, but now carries its OWN leading "2" (unlike
+#             v4, where the "2" sat outside the whole product). This is the
+#             "log" formula validated against the linear-ratio alternative
+#             in reports/testing_power.Rmd.
+#
+# At r_op = r_pw = 0: a_op = 1, a_pw = 2*L(0) = 1, so an identical,
+# equally-powerful, untrusted neighbour sits at A_ij = 1, matching v4's
+# convention -- but the ceiling here is A_ij = 2 * 1 = 2 from a_pw alone
+# (a_op's ceiling is only 1), and with a_tr also capable of reaching 2, the
+# theoretical maximum of the full product a_tr*a_pw*a_op is now 4, not 2 --
+# see p_self_mobius_M() below, calibrated to M = 4.
+attractiveness_calib <- function(op_i, op_j, pow_i, pow_j, r_op, r_pw) {
+  a_op <- exp(-r_op * abs(op_i - op_j))
+  a_pw <- 2 * .sig(r_pw * log(pow_j / pow_i))
+  a_op * a_pw
+}
+
+
+# Attractiveness v6 -- Exponential-Absolute Opinion x Exact Expose Power-Ratio
+#   [decision_model = "expose" -- exact match to Expose Eq. 7 and Eq. 9]
+# A_ij = a_op_ij * a_pw_ij  (a_tr_ij and a_ig_ij multiplied in separately by
+#        Network.R, exactly as for attractiveness_calib() above)
+#   a_op_ij = exp(-r_op * |op_i - op_j|)               -- identical to v5
+#   a_pw_ij = 2 * L(r_pw * (pow_j / pow_i - 1))          -- power RATIO MINUS 1,
+#             matching Expose Eq. 7 exactly. v5 (attractiveness_calib) uses
+#             log(pow_j/pow_i) instead -- kept there, unchanged, so any
+#             existing report calling decision_model = "calib" keeps
+#             reproducing its cached results. This version is what backs the
+#             new decision_model = "expose" (see simulate_liquid_democracy()).
+#
+# Same ceiling as v5: a_op in (0,1], a_pw in (0,2) -> A_ij in (0,2), and with
+# a_tr/a_ig each capable of reaching their own ceiling (2 and 1 respectively),
+# the full product a_tr*a_pw*a_op*a_ig has theoretical maximum 4 -- same M=4
+# used by p_self_mobius_M() below.
+attractiveness_expose <- function(op_i, op_j, pow_i, pow_j, r_op, r_pw) {
+  a_op <- exp(-r_op * abs(op_i - op_j))
+  a_pw <- 2 * .sig(r_pw * (pow_j / pow_i - 1))
+  a_op * a_pw
+}
+
+
 # =============================================================
 # (B) SELF-WEIGHT FORMULAS
 #
@@ -155,6 +228,64 @@ selfweight_dual_sigmoid <- function(i, nb, op, pow, r_op, r_pw) {
   j_star <- nb[which.max(a_nb)]
   .sig(r_op * (2 * abs(op[i] - op[j_star]) - 1)) *
   .sig(r_pw * log(pow[i] / pow[j_star]))
+}
+
+
+# =============================================================
+# (C) SELF-VOTE PROBABILITY — Mobius curve
+#   [decision_model = "gaussian_mobius", Report 20]
+#
+# Used together with attractiveness_gaussian_log() above in place of the
+# dual-sigmoid self-weight computed inline in Network.R. Unlike the
+# selfweight_* formulas in section (B), this formula doesn't need i's or
+# j*'s opinion/power directly — only m, the best neighbour's
+# ALREADY-COMPUTED attractiveness (after trust and ingroup modifiers, on
+# the [0, 2] scale that attractiveness_gaussian_log() and the existing
+# trust_mod produce).
+#
+# Interface:
+#   m — attractiveness of agent i's single best neighbour, in [0, 2]
+#   c — self-reliance knob, in (0, 1)
+#
+# Returns: P_self, the probability that i votes directly rather than
+# delegating.
+#
+# P_self(m) = (2 - m) / (2 + m * (1 - 2c) / c)
+#   m = 0 (worst possible neighbour)  -> P_self = 1  (always vote directly)
+#   m = 1 (identical neighbour)       -> P_self = c  (self-reliance knob)
+#   m = 2 (best possible neighbour)   -> P_self = 0  (always delegate)
+#
+# c is the free self-reliance parameter: large c = self-reliant (delegate
+# only to someone clearly better than me), small c = delegation-happy.
+# =============================================================
+p_self_mobius <- function(m, c) {
+  (2 - m) / (2 + m * (1 - 2 * c) / c)
+}
+
+
+# =============================================================
+# (D) SELF-VOTE PROBABILITY -- general-ceiling Mobius curve
+#   [decision_model = "calib", Report 21 calibration pipeline]
+#
+# Same Mobius shape as p_self_mobius() above, generalised to an explicit
+# ceiling M instead of the hard-coded M = 2. Used with M = 4, matching
+# attractiveness_calib()'s theoretical maximum (a_pw's own ceiling of 2,
+# times a_tr's own ceiling of 2, times a_op's/a_ig's ceiling of 1 each).
+#
+# Interface:
+#   m — attractiveness of agent i's single best neighbour, in [0, M]
+#   c — self-reliance knob, in (0, 1)
+#   M — theoretical ceiling of the attractiveness product (default 4)
+#
+# P_self(m) = (M - m) / (M + m * ((M-1)/c - M))
+#   m = 0        -> P_self = 1  (always vote directly)
+#   m = 1        -> P_self = c  (self-reliance knob -- m = 1 is where an
+#                   identical, untrusted, equally-powerful neighbour sits,
+#                   NOT the midpoint M/2, since M > 2 here)
+#   m = M        -> P_self = 0  (always delegate)
+# =============================================================
+p_self_mobius_M <- function(m, c, M = 4) {
+  (M - m) / (M + m * ((M - 1) / c - M))
 }
 
 

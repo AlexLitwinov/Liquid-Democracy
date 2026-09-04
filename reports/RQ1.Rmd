@@ -1,0 +1,379 @@
+---
+title: "RQ1-3 -- Effect of Responsiveness on Liquid Democracy Outcomes"
+output: github_document
+date: "2026-08-28"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 13, fig.height = 8)
+library(tidyverse)
+library(here)
+library(knitr)
+library(furrr)
+library(digest)
+
+theme_set(theme_minimal(base_size = 12))
+source(here::here("scripts/Network.R"))
+dir.create(here::here("reports/RQ1_files/figure-gfm"), recursive = TRUE, showWarnings = FALSE)
+dir.create(here::here("data"), showWarnings = FALSE)
+
+N_WORKERS <- max(1L, parallel::detectCores() - 1)
+
+run_cached <- function(cache_name, fn, hash_obj) {
+  hash       <- digest::digest(hash_obj)
+  cache_file <- here::here(paste0("data/", cache_name, "_cache.rds"))
+  if (file.exists(cache_file)) {
+    cc <- readRDS(cache_file)
+    if (identical(cc$hash, hash)) return(cc$data)
+  }
+  out <- fn()
+  saveRDS(list(hash = hash, data = out), cache_file)
+  out
+}
+
+# RQ1: delegation behaviour. RQ2: quality of representation (ideological
+# drift). RQ3: concentration of voting power. All three are answered off the
+# SAME simulation grid (see "Shared design" below) -- one run per (pair,
+# fixed-level, seed) cell produces every metric needed for all three RQs at
+# once, so the sweep only has to run once.
+metrics_rq1 <- c("delegation_rate", "lost_vote_rate", "n_direct_voters", "chain_length", "flickerness")
+metrics_rq2 <- c("avg_drift")
+metrics_rq3 <- c("top5_power_share", "share_50pct")
+metrics_all_rqs <- c(metrics_rq1, metrics_rq2, metrics_rq3)
+
+metric_labels <- c(
+  delegation_rate  = "Delegation rate",
+  lost_vote_rate   = "Lost-vote rate",
+  n_direct_voters  = "Direct voters (N x (1 - delegation rate))",
+  chain_length     = "Avg. delegation-chain length",
+  flickerness      = "Flickerness (delegation-target stability)",
+  avg_drift        = "Avg. ideological drift",
+  top5_power_share = "Top-5% voting-power share",
+  share_50pct      = "Agents needed for 50% of power"
+)
+```
+
+## Fixed inputs
+
+```{r rq-fixed-inputs}
+# ══════════════════════════════════════════════════════════════════════
+# KEEP IN SYNC WITH REPORT_21 -- these are Report_21's Part 1-3 decisions,
+# redefined here rather than sourced from that Rmd (more robust to
+# Report_21 changing independently). Update whenever Report_21's N/K/T/c
+# choices change. Values below match Report_21's current PROVISIONAL picks.
+# ══════════════════════════════════════════════════════════════════════
+CHOSEN_N          <- 500L
+CHOSEN_K          <- 18L
+CHOSEN_T          <- 60L    # T=60, 20 of them voting rounds -- see chat
+CHOSEN_VOTING_RDS <- 20L
+CHOSEN_C          <- 0.5    # Report_21 Part 3: value hitting the 50% baseline delegation target
+# lambda: half-life = CHOSEN_VOTING_RDS/2 voting-round (trust-update) steps,
+# i.e. (1-lambda)^h = 0.5 for h = n_voting_rounds/2 -- see Report_21.Rmd's
+# global-config chunk for the full derivation and why this must stay a
+# FIXED constant (not recomputed per experiment). ~0.0670 at
+# CHOSEN_VOTING_RDS = 20, expressed relative to this report's own round
+# design instead of a bare constant.
+LAMBDA_TR         <- 1 - 0.5^(2 / CHOSEN_VOTING_RDS)
+```
+
+**N = `r CHOSEN_N`, K = `r CHOSEN_K`, T = `r CHOSEN_T`
+(`r CHOSEN_VOTING_RDS` voting rounds), c = `r CHOSEN_C`.**
+
+## Extreme behaviour: single-dial vs. isolated dimensions, r up to 512
+
+Before the paired sweep below (bounded at $r\le32$), a wider look across
+the full doubling range this thesis considers, up to $r=512$
+($r \in \{0,1,2,4,8,16,32,64,128,256,512\}$) -- fixed at N=1000, K=16 --
+showing every metric used in RQ1-3 below at once, to see where each one
+saturates rather than assuming the $r\le32$ range used in the paired sweep
+already captures the full picture. Four scenarios: **all**
+($r_{op}=r_{pw}=r_{tr}=r$, one shared dial) and each dimension **isolated**
+in turn ($r_{op}=r$ with $r_{pw}=r_{tr}=0$; $r_{pw}=r$ with
+$r_{op}=r_{tr}=0$; $r_{tr}=r$ with $r_{op}=r_{pw}=0$) -- so the joint
+effect and each mechanism's own isolated effect are visible side by side.
+
+```{r rq-extreme-config}
+N_EXTREME       <- 1000L
+K_EXTREME       <- 16L
+R_VALS_EXTREME  <- c(0, 2^(0:9))  # 0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512
+N_SEEDS_EXTREME <- 20L
+
+scenarios_extreme <- tribble(
+  ~scenario,     ~use_op, ~use_pw, ~use_tr,
+  "all (r=r=r)", TRUE,    TRUE,    TRUE,
+  "op only",     TRUE,    FALSE,   FALSE,
+  "pw only",     FALSE,   TRUE,    FALSE,
+  "trust only",  FALSE,   FALSE,   TRUE
+)
+```
+
+```{r rq-extreme-run}
+run_extreme_cell <- function(seed, r_val, scenario, use_op, use_pw, use_tr) {
+  r_op <- if (use_op) r_val else 0
+  r_pw <- if (use_pw) r_val else 0
+  r_tr <- if (use_tr) r_val else 0
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = N_EXTREME, n_communities = 1, node_degree = K_EXTREME, T = CHOSEN_T,
+    n_voting_rounds = CHOSEN_VOTING_RDS,
+    r_op = r_op, r_pw = r_pw, gamma = r_tr, lambda = LAMBDA_TR, k1 = 1, k2 = 1,
+    decision_model = "expose", self_reliance_c = CHOSEN_C, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05
+  )
+  last5 <- max(1L, CHOSEN_T - 4L):CHOSEN_T
+  snaps <- res$snapshots |> dplyr::filter(round >= max(1L, CHOSEN_T - 4L))
+  delegation_rate <- mean(res$history_delegation[last5], na.rm = TRUE)
+  tibble(
+    seed = seed, r_val = r_val, scenario = scenario,
+    delegation_rate  = delegation_rate,
+    lost_vote_rate   = mean(res$history_lost[last5], na.rm = TRUE),
+    n_direct_voters  = N_EXTREME * (1 - delegation_rate),
+    chain_length     = mean(snaps$avg_chain_length_delegators, na.rm = TRUE),
+    flickerness      = mean(res$history_flickerness[last5], na.rm = TRUE),
+    avg_drift        = mean(snaps$avg_drift, na.rm = TRUE),
+    top5_power_share = mean(snaps$top5_power_share, na.rm = TRUE),
+    share_50pct      = mean(snaps$share_50pct, na.rm = TRUE)
+  )
+}
+
+grid_extreme <- tidyr::crossing(scenarios_extreme, r_val = R_VALS_EXTREME, seed = seq_len(N_SEEDS_EXTREME))
+
+extreme_raw <- run_cached("rq_extreme_raw", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_extreme, run_extreme_cell, .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(N_EXTREME, K_EXTREME, CHOSEN_T, CHOSEN_VOTING_RDS, CHOSEN_C, N_SEEDS_EXTREME, R_VALS_EXTREME,
+        scenarios_extreme, LAMBDA_TR, v = 6))  # v=6: seeds 2->20
+
+extreme_summary <- extreme_raw |>
+  pivot_longer(all_of(metrics_all_rqs), names_to = "metric", values_to = "value") |>
+  group_by(scenario, r_val, metric) |>
+  summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop") |>
+  mutate(metric   = factor(metric_labels[metric], levels = unname(metric_labels)),
+         scenario = factor(scenario, levels = scenarios_extreme$scenario))
+```
+
+```{r rq-extreme-plot, fig.height=12}
+extreme_summary |>
+  ggplot(aes(factor(r_val, levels = R_VALS_EXTREME), mean_val, colour = scenario, group = scenario)) +
+  geom_line(linewidth = 0.8) + geom_point(size = 1.5) +
+  scale_colour_viridis_d(name = "responsiveness scenario", end = 0.85) +
+  facet_wrap(~metric, scales = "free_y", ncol = 2) +
+  labs(title = "Extreme behaviour -- N=1000, K=16, all vs. isolated dimensions (doubling to 512)",
+       subtitle = sprintf("%d seeds per cell", N_SEEDS_EXTREME),
+       x = "r (shared or isolated, doubling)", y = NULL) +
+  theme(legend.position = "top")
+```
+
+---
+
+## Shared design: paired sweep, third dimension held fixed
+
+Same sweep grid for all three RQs. For each pair of responsiveness
+dimensions, both are varied *together* (same shared value) across
+$r \in \{1,2,4,8,16,32\}$, while the third dimension is held fixed at one of
+4 levels ($0, 1, 8, 16$) -- shown as 4 coloured lines in the same plot.
+Repeating this for each of the 3 possible pairs gives 3 plots per RQ (as many
+metrics as that RQ needs, faceted), covering all three responsiveness
+dimensions:
+
+- $r_{op} = r_{pw} \in \{1,2,4,8,16,32\}$, $r_{tr} \in \{0,1,8,16\}$ (fixed)
+- $r_{op} = r_{tr} \in \{1,2,4,8,16,32\}$, $r_{pw} \in \{0,1,8,16\}$ (fixed)
+- $r_{pw} = r_{tr} \in \{1,2,4,8,16,32\}$, $r_{op} \in \{0,1,8,16\}$ (fixed)
+
+```{r rq-config}
+N_SEEDS_PAIR <- 20L
+
+R_VALS_PAIR    <- c(1, 2, 4, 8, 16, 32)  # values for the two paired (jointly varied) dimensions
+R_FIXED_LEVELS <- c(0, 1, 8, 16)          # levels for the third, held-fixed dimension
+```
+
+---
+
+# Simulation grid (answers RQ1, RQ2 and RQ3 at once)
+
+
+```{r rq-pair-run}
+build_pair_grid <- function(pair_label, dim_fixed) {
+  df <- tidyr::crossing(v = R_VALS_PAIR, f = R_FIXED_LEVELS, seed = seq_len(N_SEEDS_PAIR))
+  df$pair_label <- pair_label
+  df$r_op <- if (dim_fixed == "r_op") df$f else df$v
+  df$r_pw <- if (dim_fixed == "r_pw") df$f else df$v
+  df$r_tr <- if (dim_fixed == "r_tr") df$f else df$v
+  df
+}
+
+grid_pair <- bind_rows(
+  build_pair_grid("r_op x r_pw (r_tr fixed)", "r_tr"),
+  build_pair_grid("r_op x r_tr (r_pw fixed)", "r_pw"),
+  build_pair_grid("r_pw x r_tr (r_op fixed)", "r_op")
+)
+
+run_pair_cell <- function(seed, pair_label, v, f, r_op, r_pw, r_tr) {
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = CHOSEN_N, n_communities = 1, node_degree = CHOSEN_K, T = CHOSEN_T,
+    n_voting_rounds = CHOSEN_VOTING_RDS,
+    r_op = r_op, r_pw = r_pw, gamma = r_tr, lambda = LAMBDA_TR, k1 = 1, k2 = 1,
+    decision_model = "expose", self_reliance_c = CHOSEN_C, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05
+  )
+  last5 <- max(1L, CHOSEN_T - 4L):CHOSEN_T
+  snaps <- res$snapshots |> dplyr::filter(round >= max(1L, CHOSEN_T - 4L))
+  delegation_rate <- mean(res$history_delegation[last5], na.rm = TRUE)
+  tibble(
+    seed = seed, pair_label = pair_label, v = v, f = f,
+    r_op = r_op, r_pw = r_pw, r_tr = r_tr,
+    # RQ1
+    delegation_rate  = delegation_rate,
+    lost_vote_rate   = mean(res$history_lost[last5], na.rm = TRUE),
+    n_direct_voters  = CHOSEN_N * (1 - delegation_rate),
+    chain_length     = mean(snaps$avg_chain_length_delegators, na.rm = TRUE),
+    flickerness      = mean(res$history_flickerness[last5], na.rm = TRUE),
+    # RQ2
+    avg_drift        = mean(snaps$avg_drift, na.rm = TRUE),
+    # RQ3
+    top5_power_share = mean(snaps$top5_power_share, na.rm = TRUE),
+    share_50pct      = mean(snaps$share_50pct, na.rm = TRUE)
+  )
+}
+
+pair_raw <- run_cached("rq123_pair_raw", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_pair, run_pair_cell, .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(CHOSEN_N, CHOSEN_K, CHOSEN_T, CHOSEN_VOTING_RDS, CHOSEN_C, N_SEEDS_PAIR, R_VALS_PAIR, R_FIXED_LEVELS, LAMBDA_TR, v = 5))  # v=5: seeds 2->20
+
+pair_summary <- pair_raw |>
+  pivot_longer(all_of(metrics_all_rqs), names_to = "metric", values_to = "value") |>
+  group_by(pair_label, v, f, metric) |>
+  summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop") |>
+  mutate(metric = factor(metric_labels[metric], levels = unname(metric_labels)))
+
+# metrics_subset selects which of the 7 metrics (as their metric_labels) go
+# into this particular plot -- each RQ section below passes its own subset.
+plot_pair <- function(label, metrics_subset) {
+  pair_summary |>
+    filter(pair_label == label, metric %in% metric_labels[metrics_subset]) |>
+    ggplot(aes(v, mean_val, colour = factor(f, levels = R_FIXED_LEVELS))) +
+    geom_line(linewidth = 0.8) + geom_point(size = 2) +
+    scale_x_log10(breaks = R_VALS_PAIR) +
+    scale_colour_viridis_d(name = "fixed level", end = 0.85) +
+    facet_wrap(~metric, scales = "free_y", ncol = 2) +
+    labs(title = sprintf("Paired sweep -- %s", label),
+         subtitle = sprintf("%d seeds per cell", N_SEEDS_PAIR),
+         x = "shared r value (log scale)", y = NULL) +
+    theme(legend.position = "top")
+}
+```
+
+---
+
+# RQ1: delegation behaviour
+
+Metrics: delegation rate, lost-vote rate, number of direct voters, average
+delegation-chain length, and flickerness (share of agents keeping the same
+delegation target as the previous round -- `history_flickerness` from
+`simulate_liquid_democracy()`, NA on round 1; see `Network.R`'s
+`history_stability[t]` computation for the exact per-round definition).
+
+```{r rq1-pair-plot-1, fig.height=14}
+plot_pair("r_op x r_pw (r_tr fixed)", metrics_rq1)
+```
+
+```{r rq1-pair-plot-2, fig.height=14}
+plot_pair("r_op x r_tr (r_pw fixed)", metrics_rq1)
+```
+
+```{r rq1-pair-plot-3, fig.height=14}
+plot_pair("r_pw x r_tr (r_op fixed)", metrics_rq1)
+```
+
+## Answering RQ1
+
+*(Fill in once the plots above reflect the real simulation run -- this is
+a scaffold, not a pre-written conclusion.)*
+
+- **Ideological responsiveness ($r_{op}$):** ...
+- **Competence/power responsiveness ($r_{pw}$):** ...
+- **Trust responsiveness ($r_{tr}$):** ...
+- **Interactions between dimensions:** ...
+- **Overall answer to RQ1:** ...
+
+---
+
+# RQ2: quality of political representation
+
+Metric: average ideological drift (`avg_drift`) -- the mean distance between
+an agent's own opinion and the opinion of the agent who ultimately casts a
+vote on its behalf.
+
+Expected: $r_{op}$ reduces drift (dissimilar neighbours become less
+attractive delegates); $r_{pw}$ increases drift (powerful delegates stay
+attractive even when ideologically distant); $r_{tr}$ reduces drift, same
+mechanism as $r_{op}$. Because attractiveness is multiplicative, the joint
+$r_{op} \times r_{pw}$ effect is expected to favour the opinion term (net
+drift reduction), not a simple additive combination of the two individual
+effects.
+
+```{r rq2-pair-plot-1, fig.height=6}
+plot_pair("r_op x r_pw (r_tr fixed)", metrics_rq2)
+```
+
+```{r rq2-pair-plot-2, fig.height=6}
+plot_pair("r_op x r_tr (r_pw fixed)", metrics_rq2)
+```
+
+```{r rq2-pair-plot-3, fig.height=6}
+plot_pair("r_pw x r_tr (r_op fixed)", metrics_rq2)
+```
+
+## Answering RQ2
+
+*(Fill in once the plots above reflect the real simulation run -- this is
+a scaffold, not a pre-written conclusion.)*
+
+- **Ideological responsiveness ($r_{op}$):** ...
+- **Competence/power responsiveness ($r_{pw}$):** ...
+- **Trust responsiveness ($r_{tr}$):** ...
+- **Joint $r_{op} \times r_{pw}$ effect (opinion term expected to dominate):** ...
+- **Overall answer to RQ2:** ...
+
+---
+
+# RQ3: concentration of voting power
+
+Metrics: voting-power share held by the top 5% of agents (`top5_power_share`)
+and the fraction of agents needed to collectively hold 50% of total voting
+power (`share_50pct`).
+
+Expected: $r_{op}$ lowers concentration (more agents vote directly);
+$r_{pw}$ raises concentration (rich-get-richer -- already-powerful agents
+become more attractive delegates). For the joint $r_{op} \times r_{pw}$
+effect: as in RQ2, low opinion-based attractiveness is expected to constrain
+how much high voting power can raise a neighbour's overall attractiveness --
+so increasing both together should yield *lower* concentration than high
+$r_{pw}$ alone.
+
+```{r rq3-pair-plot-1, fig.height=8}
+plot_pair("r_op x r_pw (r_tr fixed)", metrics_rq3)
+```
+
+```{r rq3-pair-plot-2, fig.height=8}
+plot_pair("r_op x r_tr (r_pw fixed)", metrics_rq3)
+```
+
+```{r rq3-pair-plot-3, fig.height=8}
+plot_pair("r_pw x r_tr (r_op fixed)", metrics_rq3)
+```
+
+## Answering RQ3
+
+*(Fill in once the plots above reflect the real simulation run -- this is
+a scaffold, not a pre-written conclusion.)*
+
+- **Ideological responsiveness ($r_{op}$):** ...
+- **Competence/power responsiveness ($r_{pw}$):** ...
+- **Joint $r_{op} \times r_{pw}$ effect (opinion term expected to constrain concentration):** ...
+- **Overall answer to RQ3:** ...

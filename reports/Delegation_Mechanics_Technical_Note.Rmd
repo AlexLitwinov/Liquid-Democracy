@@ -1,0 +1,987 @@
+---
+title: "Delegation Mechanics: Legacy Dual-Sigmoid vs. Gaussian/Mobius Decision Model"
+subtitle: "A Technical Reference for the Liquid Democracy Simulation (accompanies Report 20)"
+date: "2026-07-30"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    theme: flatly
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5.5, fig.align = "center")
+library(tidyverse)
+library(here)
+library(patchwork)
+library(knitr)
+
+theme_set(theme_minimal(base_size = 12))
+
+# This document sources the ACTUAL production code -- it is not a
+# reimplementation. Every formula plotted or tabulated below is the exact
+# function used inside simulate_liquid_democracy() in Network.R. If the
+# formulas in FunctionVersions.R / Network.R ever change, re-knitting this
+# document will automatically reflect the update (or fail loudly if an
+# assumption below no longer holds).
+source(here::here("scripts/Network.R"))
+```
+
+# Purpose and Scope
+
+This note is a self-contained technical reference explaining the
+delegation-decision mechanics of the liquid-democracy simulation, comparing
+the **legacy** dual-sigmoid model (used in Reports 15-19) against the **new**
+Gaussian-opinion / Mobius-self-vote model introduced for Report 20
+(`decision_model = "gaussian_mobius"` in `simulate_liquid_democracy()`).
+
+Both formula sets are switched with a single argument; everything else in
+the simulation -- network construction, the trust update, ingroup
+preference, cycle handling, homophily shuffling, and all recorded metrics --
+is **completely unchanged** between the two models. This note therefore
+focuses exclusively on the one part of the model that *did* change: how
+attractive a neighbour looks to an agent, and how that agent decides whether
+to vote directly or delegate.
+
+Throughout, $i$ is the focal agent, $j$ ranges over $i$'s network
+neighbours, $o$ denotes opinion, $p$ denotes current voting power, and
+$j^\*= \arg\max_j A_{ij}$ is $i$'s single most attractive neighbour.
+
+---
+
+# Part I -- The New Decision Model (`gaussian_mobius`)
+
+## Overview: the three-step pipeline
+
+Every round, for every lay agent $i$ with at least one neighbour, the
+simulation resolves a delegation decision in three steps:
+
+```{r pipeline-diagram-new, fig.height=3.2, echo=FALSE}
+draw_pipeline <- function(labels, fills, title) {
+  n <- length(labels)
+  boxes <- tibble(
+    x    = seq_len(n),
+    label = labels,
+    fill  = fills
+  )
+  arrows <- tibble(x = boxes$x[-n] + 0.38, xend = boxes$x[-1] - 0.38, y = 1, yend = 1)
+
+  ggplot() +
+    geom_rect(data = boxes, aes(xmin = x - 0.38, xmax = x + 0.38,
+                                 ymin = 0.6, ymax = 1.4, fill = fill),
+              colour = "grey30", linewidth = 0.6) +
+    geom_text(data = boxes, aes(x = x, y = 1, label = label),
+              size = 3.4, lineheight = 0.95) +
+    geom_segment(data = arrows, aes(x = x, xend = xend, y = y, yend = yend),
+                 arrow = arrow(length = unit(0.2, "cm")), linewidth = 0.6, colour = "grey30") +
+    scale_fill_identity() +
+    coord_cartesian(xlim = c(0.4, n + 0.6), ylim = c(0.3, 1.7)) +
+    theme_void() +
+    labs(title = title) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 12))
+}
+
+draw_pipeline(
+  labels = c("Step 1\nAttractiveness\nA_ij for every\nneighbour j",
+             "Step 2\nSelf-vote prob.\nP_self(m),\nm = max_j A_ij",
+             "Step 3\nResolve:\nself-vote w.p. P_self,\nelse delegate ~ A_ij"),
+  fills = c("#cfe8f3", "#f6d6ac", "#d9ead3"),
+  title = "gaussian_mobius pipeline"
+)
+```
+
+Step 1 computes a full vector of attractivenesses (one per neighbour). Step
+2 collapses that vector to a single scalar $m$ (the best neighbour's
+attractiveness) and maps it to a self-vote probability. Step 3 draws a
+Bernoulli($P_{\text{self}}$) coin; on failure, agent $i$ delegates to a
+neighbour sampled proportional to attractiveness. This is a genuine
+information bottleneck: **Step 2 never looks at *who* $j^\*$ is (their
+opinion, their power) -- only at *how attractive* they are.** Keep this in
+mind; it is the single biggest structural difference from the legacy model,
+discussed at length in Part III.
+
+## Step 1: Attractiveness
+
+$$A_{ij} = 2\,\tau_{ij}\,a^{\text{op}}_{ij}\,a^{\text{pw}}_{ij}$$
+
+implemented as `attractiveness_gaussian_log()` in `FunctionVersions.R`. It
+returns $2\,a^{\text{op}}_{ij}\,a^{\text{pw}}_{ij}$; the trust factor
+$\tau_{ij}$ is applied afterwards, exactly as for every other attractiveness
+formula in this codebase (see Part I.5).
+
+### Opinion factor: a Gaussian kernel
+
+$$a^{\text{op}}_{ij} = \exp\!\left(-\tfrac{1}{2}\,r_{op}^2\,(o_i - o_j)^2\right)$$
+
+This is a Gaussian bump centred on $o_i$ with standard deviation
+$\sigma_{\text{op}} = 1/r_{op}$: it equals exactly $1$ when $j$'s opinion is
+identical to $i$'s, and decays smoothly to $0$ as the opinion gap grows.
+$r_{op}$ is an inverse *width*: larger $r_{op}$ means a narrower, more
+selective bump (only near-identical neighbours count as attractive);
+smaller $r_{op}$ means a wide, forgiving bump (almost any neighbour scores
+close to 1 on the opinion dimension).
+
+```{r new-op-kernel-plot, fig.height=4.5}
+op_dist <- seq(0, 1, length.out = 300)
+r_op_vals <- c(0.5, 1, 2, 4, 8)
+
+df_op_new <- expand_grid(delta = op_dist, r_op = r_op_vals) |>
+  # attractiveness_gaussian_log(op_i, op_j, pow_i, pow_j, r_op, r_pw) returns
+  # 2*a_op*a_pw. With pow_i = pow_j = 1, a_pw = sig(0) = 0.5 exactly, so
+  # 2*a_pw = 1 -- the real production function's output already equals
+  # a_op(delta) in isolation, with NO further division needed. (Do not divide
+  # by 0.5 here: that would double-count the leading "2*" already baked into
+  # the function, unlike attractiveness_dual_sigmoid below which has no such
+  # factor -- verified against the reference ldmodel.py numerically.)
+  mutate(a_op = attractiveness_gaussian_log(0, delta, 1, 1, r_op, 1),
+         r_op_label = factor(paste0("r_op = ", r_op), levels = paste0("r_op = ", r_op_vals)))
+
+ggplot(df_op_new, aes(delta, a_op, colour = r_op_label)) +
+  geom_line(linewidth = 1) +
+  scale_colour_viridis_d(end = 0.85) +
+  labs(title = "New opinion factor a_op(Delta) -- Gaussian kernel",
+       subtitle = "a_op = exp(-0.5 * r_op^2 * Delta^2); Delta = |o_i - o_j|",
+       x = expression(Delta == "|"*o[i]-o[j]*"|"), y = expression(a[op]),
+       colour = NULL) +
+  theme(legend.position = "bottom")
+```
+
+**Numeric example.** At $r_{op}=4$:
+
+```{r new-op-kernel-table}
+tibble(Delta = c(0, 0.1, 0.25, 0.5, 0.75, 1)) |>
+  mutate(a_op = attractiveness_gaussian_log(0, Delta, 1, 1, 4, 1)) |>
+  kable(digits = 4, col.names = c("Opinion distance $\\Delta$", "$a^{\\text{op}}$ (r_op = 4)"))
+```
+
+A neighbour half a unit away on the $[0,1]$ opinion scale is already down to
+about 14% attractiveness at this responsiveness level (`r round(attractiveness_gaussian_log(0, 0.5, 1, 1, 4, 1), 3)`
+exactly), and a neighbour three-quarters of a unit away is down to about 1%
+-- opinion gating is aggressive once $r_{op}$ is moderately large.
+
+### Power factor: unchanged from the legacy model
+
+$$a^{\text{pw}}_{ij} = \sigma\!\left(r_{pw}\,\log\frac{p_j}{p_i}\right), \qquad \sigma(x) = \frac{1}{1+e^{-x}}$$
+
+This half of the formula is **identical in form** to the legacy model (Part
+II) -- a sigmoid of the log power ratio. It equals $0.5$ when $i$ and $j$
+hold equal power, saturates toward $1$ as $j$ becomes arbitrarily more
+powerful, and toward $0$ as $j$ becomes negligible. $r_{pw}$ is the
+steepness of that saturation.
+
+```{r new-pw-kernel-plot}
+pow_ratio <- 10^seq(-2, 2, length.out = 300)
+r_pw_vals <- c(0.5, 1, 2, 4)
+
+df_pw <- expand_grid(ratio = pow_ratio, r_pw = r_pw_vals) |>
+  # Delta_op = 0 forces a_op = 1 exactly, so the real function's output /
+  # 2 isolates a_pw(ratio). This is the SAME function used for the legacy
+  # power factor -- see Part II.2.
+  mutate(a_pw = attractiveness_gaussian_log(0, 0, 1, ratio, 1, r_pw) / 2,
+         r_pw_label = factor(paste0("r_pw = ", r_pw), levels = paste0("r_pw = ", r_pw_vals)))
+
+ggplot(df_pw, aes(ratio, a_pw, colour = r_pw_label)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 0.5, linetype = "dotted", colour = "grey50") +
+  geom_vline(xintercept = 1, linetype = "dotted", colour = "grey50") +
+  scale_x_log10() +
+  scale_colour_viridis_d(end = 0.85, option = "magma") +
+  labs(title = "Power factor a_pw(power ratio) -- identical in old and new models",
+       subtitle = "a_pw = sig(r_pw * log(p_j / p_i)); = 0.5 at equal power (dotted lines)",
+       x = expression(p[j]/p[i]~"(log scale)"), y = expression(a[pw]), colour = NULL) +
+  theme(legend.position = "bottom")
+```
+
+```{r new-pw-kernel-table}
+tibble(ratio = c(0.1, 0.5, 1, 2, 10)) |>
+  mutate(a_pw = attractiveness_gaussian_log(0, 0, 1, ratio, 1, 2) / 2) |>
+  kable(digits = 4, col.names = c("Power ratio $p_j/p_i$", "$a^{\\text{pw}}$ (r_pw = 2)"))
+```
+
+## Step 2: Self-vote probability -- the Mobius curve
+
+Let $m_i = \max_j A_{ij}$ (the attractiveness of $i$'s single best
+neighbour, on the $[0,2]$ scale established above). The self-vote
+probability is:
+
+$$P_{\text{self}}(m) = \frac{2 - m}{\,2 + \dfrac{1-2c}{c}\,m\,}$$
+
+implemented as `p_self_mobius()`. It is a Mobius (rational-linear)
+transform pinned at three anchors:
+
+| best neighbour   | $m$ | $P_{\text{self}}$ | meaning              |
+|---               |---  |---                 |---                   |
+| nightmare        | $0$ | $1$                | always self-vote     |
+| identical to me  | $1$ | $c$                | self-reliance knob    |
+| perfect          | $2$ | $0$                | always delegate       |
+
+$c \in (0,1)$ is the **entire** free parameter of this step: it is set
+directly (`self_reliance_c` in `simulate_liquid_democracy()`) and does not
+depend on $r_{op}$, $r_{pw}$, or anything about $j^\*$ specifically -- see
+Part III.2 for why this matters.
+
+```{r new-selfvote-plot, fig.height=4.5}
+m_grid <- seq(0, 2, length.out = 300)
+c_vals <- c(0.1, 0.2, 0.5, 0.8)
+
+df_pself <- expand_grid(m = m_grid, c = c_vals) |>
+  mutate(P_self = p_self_mobius(m, c),
+         c_label = factor(paste0("c = ", c), levels = paste0("c = ", c_vals)))
+
+ggplot(df_pself, aes(m, P_self, colour = c_label)) +
+  geom_line(linewidth = 1) +
+  geom_point(data = tibble(m = c(0, 1, 2), P_self = c(1, NA, 0)),
+             aes(m, P_self), inherit.aes = FALSE, colour = "grey30", size = 0, alpha = 0) +
+  annotate("point", x = 0, y = 1, colour = "grey20", size = 2) +
+  annotate("point", x = 2, y = 0, colour = "grey20", size = 2) +
+  annotate("text", x = 0.05, y = 1.04, label = "m=0 -> always self-vote", hjust = 0, size = 3) +
+  annotate("text", x = 1.95, y = 0.06, label = "m=2 -> always delegate", hjust = 1, size = 3) +
+  scale_colour_viridis_d(end = 0.85, option = "plasma") +
+  labs(title = "Self-vote probability P_self(m) -- Mobius curve",
+       subtitle = "m = attractiveness of the single best neighbour, on [0,2]",
+       x = expression(m == max[j]~A[ij]), y = expression(P[self]), colour = "self-reliance c") +
+  theme(legend.position = "bottom")
+```
+
+**Numeric example.** At $m=1$ (an exactly identical best neighbour),
+$P_{\text{self}} = c$ *by construction, for every value of $r_{op}$ and
+$r_{pw}$*:
+
+```{r new-selfvote-table}
+tibble(c = c(0.1, 0.2, 0.5, 0.8)) |>
+  mutate(`P_self(m=1)` = p_self_mobius(1, c)) |>
+  kable(digits = 3)
+```
+
+## Step 3: Delegate choice
+
+Conditional on not self-voting, $i$ delegates to a neighbour sampled with
+probability proportional to $A_{ij}$ among its real (non-padding)
+neighbours -- a straightforward weighted draw, **structurally identical**
+to the legacy model's delegate-choice step (`nb[sample.int(length(w), 1L,
+prob = w)]` in `Network.R`, unchanged by `decision_model`). What differs
+between the two models is only the *shape* of the weights being sampled
+from, not the sampling rule itself.
+
+```{r new-delegate-choice-example, fig.height=4}
+A_vals <- c(j1 = 0.2, j2 = 0.8, j3 = 1.5, j4 = 0.1)
+df_choice <- tibble(neighbour = names(A_vals), A = A_vals) |>
+  mutate(P_delegate_to = A / sum(A))
+
+ggplot(df_choice, aes(neighbour, P_delegate_to, fill = neighbour)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = sprintf("A=%.1f\nP=%.2f", A, P_delegate_to)), vjust = -0.15, size = 3.3) +
+  scale_fill_viridis_d(end = 0.85) +
+  coord_cartesian(ylim = c(0, max(df_choice$P_delegate_to) * 1.35)) +
+  labs(title = "Delegate choice: weighted sampling proportional to A_ij (illustrative example)",
+       subtitle = "4 neighbours with attractivenesses 0.2, 0.8, 1.5, 0.1 -> delegation probabilities, given not self-voting",
+       x = NULL, y = "P(delegate to j | delegating)")
+```
+
+## Trust interaction (unchanged mechanism, recap only)
+
+Trust is **not** part of the new formula set -- it is the existing Report
+18 mechanism, applied identically regardless of `decision_model`:
+
+$$\texttt{trust\_mod}_{ij} = 2\,\sigma(\gamma\,\tau_{ij}), \qquad w_{ij} = \texttt{trust\_mod}_{ij} \times A_{ij}$$
+
+with $\tau_{ij}$ updated each round via the `punish_only` / `reward_punish`
+rules documented in `Network.R`. `trust_mod = 1` (neutral) when $\gamma=0$
+or $\tau_{ij}=0$; it can exceed $1$ (boosting a well-trusted neighbour) or
+fall toward $0$ (suppressing a mistrusted one).
+
+```{r trust-mod-plot, fig.height=4}
+tau_grid <- seq(-3, 3, length.out = 200)
+gamma_vals <- c(0.5, 1, 2, 4)
+
+df_trust <- expand_grid(tau = tau_grid, gamma = gamma_vals) |>
+  mutate(trust_mod = 2 * .sig(gamma * tau),
+         gamma_label = factor(paste0("gamma = ", gamma), levels = paste0("gamma = ", gamma_vals)))
+
+ggplot(df_trust, aes(tau, trust_mod, colour = gamma_label)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 1, linetype = "dotted", colour = "grey50") +
+  geom_hline(yintercept = 2, linetype = "dashed", colour = "firebrick3") +
+  annotate("text", x = -2.8, y = 2.05, label = "trust_mod ceiling = 2", colour = "firebrick3", size = 3, hjust = 0) +
+  scale_colour_viridis_d(end = 0.85, option = "cividis") +
+  labs(title = "trust_mod(tau) = 2*sig(gamma*tau) -- unchanged in both decision models",
+       x = expression(tau[ij]), y = "trust_mod", colour = NULL) +
+  theme(legend.position = "bottom")
+```
+
+Note the dashed ceiling at $\texttt{trust\_mod}=2$: this will matter in Part
+III.6, because the new model's $m$ is computed from the *trust-adjusted*
+weight $w_{j^\*}$, not the raw attractiveness.
+
+## Parameter glossary (new model)
+
+```{r param-glossary-new}
+tibble(
+  Parameter = c("r_op", "r_pw", "self_reliance_c", "gamma", "lambda", "trust_mode"),
+  Controls = c(
+    "Inverse width of the Gaussian opinion kernel a_op. Larger = narrower = more opinion-selective.",
+    "Steepness of the power-ratio sigmoid a_pw. Larger = more power-deferential.",
+    "Self-reliance knob c in the Mobius P_self curve. Larger = more self-reliant (delegates only to clearly-better neighbours). Independent of r_op/r_pw.",
+    "Trust sensitivity: how strongly accumulated trust tau rescales attractiveness (unchanged mechanism).",
+    "Trust decay/momentum: how much of last round's tau carries over (unchanged mechanism).",
+    "'punish_only' or 'reward_punish' trust update rule (unchanged mechanism)."
+  ),
+  `Typical range` = c("0.5 - 8", "0.5 - 8", "0.1 - 0.9 (open interval)", "0 (off) - 8", "0 - 1", "categorical")
+) |>
+  kable()
+```
+
+---
+
+# Part II -- Recap: The Legacy Dual-Sigmoid Model
+
+Reports 15-19 use `decision_model = "legacy"` (the default), summarised
+here for direct comparison.
+
+## Attractiveness (dual sigmoid)
+
+$$A_{ij} = \sigma\big(r_{op}(1-2|o_i-o_j|)\big)\,\times\,\sigma\!\left(r_{pw}\log\frac{p_j}{p_i}\right)$$
+
+implemented as `attractiveness_dual_sigmoid()`. Both factors are sigmoids:
+opinion similarity $1-2|o_i-o_j|$ is remapped from $[-1,1]$ (identical to
+maximally distant) through a sigmoid, and the power factor is the same
+log-ratio sigmoid used in the new model.
+
+```{r old-op-kernel-plot, fig.height=4.5}
+df_op_old <- expand_grid(delta = op_dist, r_op = r_op_vals) |>
+  mutate(a_op = attractiveness_dual_sigmoid(0, delta, 1, 1, r_op, 1) / 0.5,
+         r_op_label = factor(paste0("r_op = ", r_op), levels = paste0("r_op = ", r_op_vals)))
+
+ggplot(df_op_old, aes(delta, a_op, colour = r_op_label)) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = 0.5, linetype = "dotted", colour = "grey50") +
+  annotate("text", x = 0.51, y = 0.95, label = "fixed midpoint\nDelta = 0.5", hjust = 0, size = 3) +
+  scale_colour_viridis_d(end = 0.85) +
+  labs(title = "Legacy opinion factor a_op(Delta) -- sigmoid of similarity",
+       subtitle = "a_op = sig(r_op * (1 - 2*Delta)); always crosses exactly 0.5 at Delta = 0.5",
+       x = expression(Delta == "|"*o[i]-o[j]*"|"), y = expression(a[op]), colour = NULL) +
+  theme(legend.position = "bottom")
+```
+
+The power factor $a^{\text{pw}}$ is the **identical function** already
+plotted in Part I.2 -- the legacy and new models do not differ on the power
+dimension at all.
+
+## Self-weight (dual-sigmoid argmax) and the "confidence" patch
+
+Given $j^\*=\arg\max_j A_{ij}$ (found using the same attractiveness weights
+as Step 3), the legacy self-weight is a **second, independent** formula
+that re-derives a weight from $j^\*$'s specific opinion and power gap --
+it does *not* reuse $A_{ij^\*}$ directly:
+
+$$w^{\text{raw}}_{\text{self}} = \sigma\big(r_{op}(2|o_i-o_{j^\*}|-1)\big) \times \sigma\!\left(r_{pw}\log\frac{p_i}{p_{j^\*}}\right)$$
+
+This is a mirror image of the attractiveness formula (opinion sign
+flipped: far away $\Rightarrow$ high self-confidence). `self_weight_mode`
+controls what happens next:
+
+* `"raw"`: use $w^{\text{raw}}_{\text{self}}$ as-is.
+* `"confidence"` (used in Reports 17-19): blend it toward "always
+  self-vote" using a saturating function of total responsiveness
+  $r_{\text{tot}} = r_{op}+r_{pw}+r_{ingroup}$ (or their mean, per
+  `confidence_agg`):
+
+$$\text{conf} = \frac{r_{\text{tot}}}{1+r_{\text{tot}}}, \qquad
+  w_{\text{self}} = (1-\text{conf}) + \text{conf}\cdot w^{\text{raw}}_{\text{self}}$$
+
+This blending step exists to fix a specific, documented artefact: at
+$r_{op}=r_{pw}=0$ (no responsiveness at all), $w^{\text{raw}}_{\text{self}}
+= \sigma(0)\cdot\sigma(0) = 0.25$ exactly -- a **floor** that keeps roughly a
+quarter of agents self-voting even when nobody cares about opinion or power
+at all, which is not a meaningful behavioural claim, just an artefact of
+multiplying two sigmoids evaluated at zero. `"confidence"` mode papers over
+this by interpolating toward $1$ (self-vote) as responsiveness $\to 0$.
+
+```{r old-selfweight-floor-table}
+tibble(r = c(0, 0.5, 1, 2, 4, 8)) |>
+  mutate(
+    `w_self_raw (identical j*)` = .sig(r * (2 * 0 - 1)) * .sig(r * log(1)),
+    `confidence blend (r_ingroup=0)` = {
+      conf <- (2 * r) / (1 + 2 * r)  # r_tot = r_op + r_pw = 2r here
+      (1 - conf) + conf * `w_self_raw (identical j*)`
+    }
+  ) |>
+  kable(digits = 4)
+```
+
+```{r old-confidence-blend-plot, fig.height=4.5}
+r_seq <- seq(0, 8, length.out = 200)
+df_conf <- tibble(r = r_seq) |>
+  mutate(
+    w_raw = .sig(r * (2 * 0 - 1)) * .sig(r * log(1)),
+    conf  = (2 * r) / (1 + 2 * r),
+    w_confidence = (1 - conf) + conf * w_raw
+  ) |>
+  pivot_longer(c(w_raw, w_confidence), names_to = "mode", values_to = "w_self") |>
+  mutate(mode = recode(mode, w_raw = "raw", w_confidence = "confidence"))
+
+ggplot(df_conf, aes(r, w_self, colour = mode)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 0.25, linetype = "dotted", colour = "grey50") +
+  annotate("text", x = 0.1, y = 0.27, label = "0.25 floor (raw mode)", size = 3, hjust = 0) +
+  scale_colour_manual(values = c(raw = "#d95f02", confidence = "#1b9e77")) +
+  labs(title = "Legacy self-weight at an identical best neighbour, vs. responsiveness r = r_op = r_pw",
+       subtitle = "'raw' mode floors at 0.25 as r -> 0; 'confidence' mode fixes this by interpolating toward self-vote",
+       x = "r (= r_op = r_pw)", y = expression(w[self]), colour = "self_weight_mode") +
+  theme(legend.position = "bottom")
+```
+
+## Delegate choice
+
+Identical mechanism to Part I.4 -- weighted sampling proportional to
+$A_{ij}$, unaffected by `decision_model`.
+
+## Parameter glossary (legacy model)
+
+```{r param-glossary-old}
+tibble(
+  Parameter = c("r_op", "r_pw", "self_weight_mode", "confidence_agg", "r_ingroup", "gamma / lambda / trust_mode"),
+  Controls = c(
+    "Steepness of the opinion-similarity sigmoid AND (via the mirrored formula) part of self-confidence.",
+    "Steepness of the power-ratio sigmoid AND (via the mirrored formula) part of self-confidence.",
+    "'raw' (use w_self_raw as-is) or 'confidence' (blend toward always-self-vote at low responsiveness).",
+    "'sum' or 'mean' -- how r_op/r_pw/r_ingroup combine into r_tot for the confidence blend.",
+    "Ingroup responsiveness -- multiplies attractiveness by sig(+-r_ingroup), also feeds r_tot.",
+    "Same trust mechanism as the new model, unaffected by decision_model."
+  )
+) |>
+  kable()
+```
+
+---
+
+# Part III -- Detailed Comparison
+
+## III.1 What changed, in one table
+
+```{r formula-comparison-table}
+tibble(
+  Component = c("Opinion factor", "Power factor", "Self-vote step",
+                "Self-vote inputs", "Delegate choice", "Trust interaction"),
+  Legacy = c(
+    "$\\sigma(r_{op}(1-2\\Delta))$ -- sigmoid, fixed midpoint at $\\Delta=0.5$",
+    "$\\sigma(r_{pw}\\log(p_j/p_i))$",
+    "Re-derived formula, mirror of attractiveness, evaluated at $j^*$'s raw $(o_{j^*}, p_{j^*})$",
+    "2 numbers: $\\Delta(i,j^*)$ and power ratio $(i,j^*)$, both fed through $r_{op}, r_{pw}$ again",
+    "Sample $\\propto A_{ij}$ among neighbours",
+    "trust_mod multiplies $A_{ij}$ (affects $j^*$ selection and sampling only)"
+  ),
+  `Gaussian/Mobius` = c(
+    "$\\exp(-\\tfrac12 r_{op}^2\\Delta^2)$ -- Gaussian, $r_{op}$-dependent half-width",
+    "$\\sigma(r_{pw}\\log(p_j/p_i))$ -- unchanged",
+    "$P_{\\text{self}}(m)$, Mobius curve, single free parameter $c$",
+    "1 number: $m = A_{ij^*}$ (already includes trust/ingroup)",
+    "Sample $\\propto A_{ij}$ among neighbours -- unchanged",
+    "trust_mod multiplies $A_{ij}$, feeding directly into $m$ (see III.6)"
+  )
+) |>
+  kable(escape = FALSE)
+```
+
+The power factor and the delegate-choice mechanism are **literally the same
+code** in both models. Everything else changed. The next five subsections
+unpack why each change matters.
+
+## III.2 Ceiling non-equivalence: what does "identical neighbour" mean?
+
+An *identical* neighbour ($\Delta=0$, equal power) is the natural reference
+point for "as attractive as it gets, ideologically." The two models treat
+it very differently:
+
+```{r ceiling-comparison-plot, fig.height=4.5}
+r_seq2 <- seq(0.25, 16, length.out = 200)
+df_ceiling <- tibble(r = r_seq2) |>
+  mutate(
+    old = attractiveness_dual_sigmoid(0, 0, 1, 1, r, r),
+    new = attractiveness_gaussian_log(0, 0, 1, 1, r, r)
+  ) |>
+  pivot_longer(c(old, new), names_to = "model", values_to = "A_identical")
+
+ggplot(df_ceiling, aes(r, A_identical, colour = model)) +
+  geom_line(linewidth = 1.1) +
+  geom_hline(yintercept = c(0.5, 1), linetype = "dotted", colour = "grey50") +
+  scale_colour_manual(values = c(old = "#d95f02", new = "#1b9e77"),
+                       labels = c(old = "legacy (dual sigmoid)", new = "gaussian_mobius")) +
+  labs(title = "Attractiveness of an IDENTICAL neighbour (Delta=0, equal power), vs. r = r_op = r_pw",
+       subtitle = "New model: always exactly 1. Legacy model: rises toward 0.5 only as r -> infinity",
+       x = "r (= r_op = r_pw)", y = expression(A[ij]~"(identical neighbour)"), colour = NULL) +
+  theme(legend.position = "bottom")
+```
+
+At $r=4$ (a typical "responsive" setting used throughout Reports 17-19),
+an identical neighbour scores $A \approx$ `r round(attractiveness_dual_sigmoid(0,0,1,1,4,4), 3)`
+under the legacy model but exactly $1$ under the new one. **The new model's
+"1" is an invariant reference point, independent of $r_{op}, r_{pw}$; the
+legacy model's ceiling is itself a function of responsiveness, and never
+actually reaches even $0.5$ at finite $r$.** This is a direct, mechanical
+consequence of multiplying two sigmoids that individually saturate below 1
+rather than a Gaussian that reaches exactly 1 at zero distance.
+
+## III.3 Decoupling: is self-reliance its own parameter, or entangled with $r$?
+
+This is the most consequential conceptual change. Evaluate each model's
+self-vote quantity specifically at the "identical best neighbour" case
+($m=1$ for the new model; $\Delta=0$, ratio$=1$ for the legacy formula):
+
+```{r selfvote-decoupling-plot, fig.height=4.5}
+df_decouple_old <- tibble(r = r_seq2) |>
+  mutate(w_self = .sig(r * (2 * 0 - 1)) * .sig(r * log(1)), model = "legacy")
+
+df_decouple_new <- expand_grid(r = r_seq2, c = c(0.2, 0.5, 0.8)) |>
+  mutate(w_self = p_self_mobius(1, c), model = paste0("gaussian_mobius, c=", c))
+
+ggplot() +
+  geom_line(data = df_decouple_old, aes(r, w_self, colour = model), linewidth = 1.1) +
+  geom_line(data = df_decouple_new, aes(r, w_self, colour = model), linewidth = 1.1, linetype = "dashed") +
+  scale_colour_manual(values = c("legacy" = "#d95f02",
+                                 "gaussian_mobius, c=0.2" = "#1b9e77",
+                                 "gaussian_mobius, c=0.5" = "#377eb8",
+                                 "gaussian_mobius, c=0.8" = "#984ea3")) +
+  labs(title = "Self-vote probability at an IDENTICAL best neighbour, vs. background responsiveness r",
+       subtitle = "Legacy: entangled with r, collapses toward 0 as r grows. New: flat -- exactly c, for any r",
+       x = "r (= r_op = r_pw, legacy only)", y = expression(P[self]~"or"~w[self]~"(identical best neighbour)"),
+       colour = NULL) +
+  theme(legend.position = "bottom")
+```
+
+Under the legacy model, self-reliance when facing an identical neighbour is
+not a free choice -- it is *whatever falls out* of $r_{op}, r_{pw}$, which
+also simultaneously control how sharply opinion/power gate attractiveness.
+Turning up "how much do I care about opinion similarity" (raising $r_{op}$)
+**automatically and inescapably** turns down "how likely am I to still vote
+for myself when facing someone just like me" (from $0.25$ at $r=0$ down to
+essentially $0$ by $r\approx8$, confirmed numerically above). There is no
+way, in the legacy model, to have a highly opinion-selective agent who is
+*also* strongly self-reliant, short of the `"confidence"` patch, which
+addresses only the $r\to0$ floor, not this coupling.
+
+The new model removes this coupling entirely: $c$ is set independently and
+$P_{\text{self}}(m{=}1)=c$ for *every* $r_{op}$. An agent can be extremely
+opinion-selective ($r_{op}=8$) and still self-reliant ($c=0.8$)
+simultaneously -- a combination that is difficult to reach in the legacy
+model and impossible to reach *exactly* by construction.
+
+## III.4 Where does $r_{op}$ actually act? A hidden non-equivalence
+
+Both models expose an argument literally called `r_op`, swept over the same
+values in Report 20 as in Report 19 ($1, 4, 8$). **These are not
+comparable in the same units.** Consider the opinion distance at which
+$a^{\text{op}}=0.5$ (the "half-attractiveness point"):
+
+* **Legacy:** $\sigma(r_{op}(1-2\Delta))=0.5 \iff \Delta = 0.5$, **for every
+  value of $r_{op}$.** $r_{op}$ only controls how *sharply* the curve
+  transitions around that fixed midpoint -- it never moves.
+* **New:** $\exp(-\tfrac12 r_{op}^2\Delta^2)=0.5 \iff \Delta =
+  \sqrt{2\ln2}/r_{op} \approx 1.1774/r_{op}$ -- the half-attractiveness
+  point *moves inward* as $r_{op}$ grows.
+
+```{r half-width-plot, fig.height=4.5}
+r_seq3 <- seq(0.25, 16, length.out = 200)
+df_half <- tibble(r = r_seq3) |>
+  mutate(legacy = 0.5, new = sqrt(2 * log(2)) / r) |>
+  pivot_longer(c(legacy, new), names_to = "model", values_to = "half_distance")
+
+ggplot(df_half, aes(r, half_distance, colour = model)) +
+  geom_line(linewidth = 1.1) +
+  scale_colour_manual(values = c(legacy = "#d95f02", new = "#1b9e77")) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(title = "Half-attractiveness distance (where a_op = 0.5), vs. r_op",
+       subtitle = "Legacy: r_op controls STEEPNESS at a FIXED reference point (Delta=0.5).\nNew: r_op controls the LOCATION of the reference point (an inverse bandwidth).",
+       x = "r_op", y = expression("opinion distance"~Delta~"where"~a[op]==0.5), colour = NULL) +
+  theme(legend.position = "bottom")
+```
+
+**Practical consequence:** "$r_{op}=8$" means "a sharp step exactly at
+$\Delta=0.5$" in the legacy model, but "a narrow bump that has already
+collapsed by $\Delta\approx0.15$" in the new model. Report 20 sweeps the
+same numeric values as Report 19 for continuity, but any claim of the form
+"the effect of $r_{op}$ is X in both models" should be read as
+label-comparable, not magnitude-comparable, unless the sweep is
+re-calibrated via the mapping above (see Part VII.3 for a concrete fix).
+
+## III.5 Sharper echo chambers?
+
+Because the new model's opinion gate is genuinely bounded away from the
+legacy sigmoid's shallow tails (a Gaussian's tail decays like
+$e^{-\Delta^2}$, faster than a sigmoid's like $e^{-\Delta}$ for large
+arguments), a highly polarised, highly opinion-responsive population is
+expected to show attractiveness collapsing *faster* across an opinion gap
+under `gaussian_mobius` than under `legacy`, at matched nominal $r_{op}$.
+Combined with III.4 (the new model's bandwidth also *shrinks* with
+$r_{op}$, compounding the effect), this predicts: **more baseline
+opinion-driven self-segregation under the new model, before ingroup
+preference ($r_{ingroup}$) is even switched on.** This is directly relevant
+to Report 20's hypotheses -- see Part V.
+
+## III.6 A genuine edge case: trust can push $m$ past its designed ceiling
+
+Recall from Part I.5 that $\texttt{trust\_mod} = 2\sigma(\gamma\tau)$ can
+itself range up to (not including) $2$. In the **legacy** model, trust only
+ever affects (a) *which* neighbour becomes $j^\*$ (the argmax is computed
+over trust-adjusted weights) and (b) the delegate-choice sampling weights.
+The self-weight formula in Step 2 is *recomputed from scratch* from
+$j^\*$'s raw opinion/power gap -- it never sees the trust-adjusted number
+itself, so it is mathematically guaranteed to stay in $[0,1]$ (a product of
+two sigmoids) regardless of how extreme trust becomes.
+
+The **new** model's Step 2 uses $m = w_{j^\*}$ directly -- the
+*trust-adjusted* attractiveness. If trust pushes a neighbour's weight above
+the formula's designed ceiling of $2$ (entirely possible: $A_{ij}\le2$
+times $\texttt{trust\_mod}<2$ can exceed $2$), the Mobius formula
+extrapolates outside its intended domain:
+
+```{r edge-case-mobius-plot, fig.height=4.5}
+m_ext <- seq(0, 3, length.out = 300)
+df_edge <- tibble(m = m_ext) |> mutate(P_self = p_self_mobius(m, 0.5))
+
+ggplot(df_edge, aes(m, P_self)) +
+  geom_rect(aes(xmin = 2, xmax = 3, ymin = -Inf, ymax = Inf), fill = "#fdecea", alpha = 0.6, inherit.aes = FALSE) +
+  geom_line(linewidth = 1.1, colour = "#377eb8") +
+  geom_hline(yintercept = 0, linetype = "dotted", colour = "grey40") +
+  geom_vline(xintercept = 2, linetype = "dashed", colour = "firebrick3") +
+  annotate("text", x = 2.05, y = 0.35, label = "beyond designed ceiling\n(trust-boosted m > 2)\nP_self < 0 -> treated\nas 'never self-vote'",
+           hjust = 0, size = 3, colour = "firebrick4") +
+  labs(title = "p_self_mobius(m, c=0.5) extrapolated beyond the nominal [0,2] domain",
+       x = expression(m == w[j^"*"]~"(trust-adjusted)"), y = expression(P[self]))
+```
+
+```{r edge-case-table}
+tibble(m = c(0, 1, 1.5, 2, 2.5, 3)) |>
+  mutate(P_self = p_self_mobius(m, 0.5)) |>
+  kable(digits = 4, caption = "P_self(m, c=0.5): note the sign flip past m=2")
+```
+
+Negative $P_{\text{self}}$ is not a crash -- `runif(1) < P_self` is simply
+always `FALSE` for a negative threshold, so the practical effect is "always
+delegate," which is arguably the *intended direction* (a
+strongly-trust-boosted neighbour should be very delegate-worthy) but is
+reached through an out-of-domain formula evaluation rather than by design.
+This is flagged explicitly as a concrete, fixable weakness in Part VII.
+
+---
+
+# Part IV -- Advantages and Disadvantages
+
+```{r adv-disadv-table}
+tibble(
+  Criterion = c("Realism", "Interpretability", "Flexibility", "Robustness",
+                "Computational complexity", "Ease of parameter tuning"),
+  `Legacy (dual sigmoid)` = c(
+    "Sigmoid saturation is a common choice-model primitive (logistic response); opinion cutoff shape is arguably less 'natural' than a bell curve of similarity.",
+    "Single family of parameters (r_op, r_pw, r_ingroup) drives everything, but the self-weight formula's meaning is only clear once you see it's a 'mirror' of attractiveness -- non-obvious on first read.",
+    "self_weight_mode/confidence_agg add two more categorical switches on top of r_op/r_pw to reach a full delegation-rate range -- flexible, but via a layered patch rather than a single mechanism.",
+    "Self-weight is always a valid probability in [0,1] by construction, regardless of how extreme trust or attractiveness become -- no known domain violations.",
+    "One extra sigmoid evaluation per agent per round vs. the new model -- negligible difference either way.",
+    "r_op/r_pw jointly govern opinion gating AND self-reliance -- tuning one for a target delegation rate can silently distort the other."
+  ),
+  `Gaussian/Mobius` = c(
+    "Gaussian opinion kernel matches a natural 'similarity as closeness in a metric space' intuition; Mobius curve is a clean, purpose-built interpolant with named anchors rather than an emergent by-product of two sigmoids.",
+    "Anchors (m=0->1, m=1->c, m=2->0) are directly readable off the formula; c has a literal meaning ('self-vote probability when facing an identical neighbour') independent of anything else.",
+    "c is a single, dedicated self-reliance knob -- can be swept independently of r_op/r_pw without any patch or blending logic.",
+    "m can exceed the formula's designed [0,2] ceiling under strong reward+punish trust, producing negative (out-of-domain) probabilities -- see III.6. Rare, but real and currently unguarded.",
+    "Same order of cost (one exp(), one division) -- negligible difference either way.",
+    "c alone controls self-reliance; r_op/r_pw only shape the opinion/power kernels -- but r_op's meaning is not comparable across models (III.4), complicating any joint calibration against legacy results."
+  )
+) |>
+  kable(escape = FALSE)
+```
+
+**When legacy may still be preferable.** If the research question is
+specifically about the interaction between *responsiveness* and
+*self-reliance being the same underlying quantity* (e.g. modelling agents
+whose confidence and pickiness are genuinely the same trait), the legacy
+formula's entanglement is a feature, not a bug. It is also the
+already-published, already-validated basis for Reports 15-19; switching
+wholesale would break continuity with that body of results unless
+`decision_model = "legacy"` is retained for replication (which it is).
+
+---
+
+# Part V -- Impact on the Simulation
+
+## What we expect to change
+
+* **Cross-group delegation baseline (H1c/H2c, Report 20).** Per III.5, the
+  Gaussian kernel plus its shrinking bandwidth should produce *lower
+  baseline cross-group attractiveness* under polarisation, independent of
+  $r_{ingroup}$. If Report 20 finds a *smaller marginal effect* of
+  $r_{ingroup}$ on cross-group delegation than Report 19 did, that is not
+  necessarily evidence against H1c/H2c -- it may simply mean the opinion
+  kernel is already doing part of that work, leaving less room for
+  $r_{ingroup}$ to add on top. This is a genuine confound to check before
+  interpreting effect sizes across the two reports.
+* **Delegation rate range.** The `"confidence"` patch was built specifically
+  to let legacy delegation rates span the full $[0,1]$ range; the Mobius
+  curve does this natively via $c$. We do not expect a qualitative
+  difference in *achievable* delegation rates, but the *shape* of how
+  delegation rate responds to $r_{op}$ should differ, because $r_{op}$ now
+  also reshapes the opinion kernel's bandwidth (III.4), not just its
+  steepness at a fixed point.
+* **Voting power concentration (Gini, top-5% share).** Indirectly affected
+  through the delegation-rate and chain-length channels above -- no direct
+  mechanical change, since `compute_power()` itself is untouched.
+* **Trust dynamics.** The trust *update* rule is identical, but its
+  *consequence* differs: under legacy, trust cannot destabilise the
+  self-weight formula (III.6); under the new model, strong reward+punish
+  trust interacts with the Mobius ceiling. Expect this to matter mainly in
+  Report 18/20-style trust-heavy diagnostic sweeps (high $\gamma$, high
+  $\lambda$), not in the baseline Report 20 grid where $\gamma=r_{background}
+  \le 8$ and $\lambda=0.5$.
+* **Stability / convergence.** No structural reason to expect a change:
+  both models resolve the delegation decision independently each round from
+  the current opinion/power/trust state; neither introduces new
+  path-dependence.
+
+## Small-scale sensitivity check (this document's own simulation)
+
+To make the discussion above concrete rather than purely formulaic, this
+section runs a small, self-contained sweep with the *actual* simulation
+code (not a toy re-derivation) -- deliberately with **no group structure**
+(uniform-random opinions, no minority split), so that only the
+decision-model effect is visible, uncontaminated by Report 20's separate
+ingroup-preference analysis.
+
+```{r sim-sensitivity, cache=TRUE}
+sens_seeds <- 1:3
+r_vals     <- c(0.5, 1, 2, 4, 8)
+
+run_sens <- function(seed, r, model) {
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = 120, n_communities = 1, node_degree = 6,
+    T = 12, r_op = r, r_pw = r, p_rewire = 0.05,
+    decision_model = model,
+    self_reliance_c = 0.5,       # ignored when model == "legacy"
+    self_weight_mode = "confidence",  # ignored when model == "gaussian_mobius"
+    gamma = r, lambda = 0.5, trust_mode = "reward_punish",
+    sigma_opinion = "auto"
+  )
+  snaps <- res$snapshots |> dplyr::filter(round >= 12 - 4)
+  tibble(seed = seed, r = r, model = model,
+         delegation_rate  = mean(snaps$delegation_rate, na.rm = TRUE),
+         avg_drift        = mean(snaps$avg_drift, na.rm = TRUE),
+         gini_power       = mean(snaps$gini_power, na.rm = TRUE),
+         top5_power_share = mean(snaps$top5_power_share, na.rm = TRUE))
+}
+
+grid_sens <- expand_grid(seed = sens_seeds, r = r_vals, model = c("legacy", "gaussian_mobius"))
+sens_raw  <- pmap_dfr(grid_sens, run_sens)
+
+sens_agg <- sens_raw |>
+  group_by(r, model) |>
+  summarise(across(c(delegation_rate, avg_drift, gini_power, top5_power_share), mean), .groups = "drop")
+```
+
+```{r sim-sensitivity-plot, fig.height=6}
+sens_long <- sens_agg |>
+  pivot_longer(c(delegation_rate, avg_drift, gini_power, top5_power_share),
+               names_to = "metric", values_to = "value") |>
+  mutate(metric = recode(metric,
+                         delegation_rate = "Delegation rate", avg_drift = "Avg. ideological drift",
+                         gini_power = "Gini (power)", top5_power_share = "Top-5% power share"))
+
+ggplot(sens_long, aes(r, value, colour = model)) +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  facet_wrap(~ metric, scales = "free_y") +
+  scale_colour_manual(values = c(legacy = "#d95f02", gaussian_mobius = "#1b9e77")) +
+  scale_x_log10(breaks = r_vals) +
+  labs(title = "Decision-model sensitivity check (no group structure; N=120, T=12, 3 seeds)",
+       subtitle = "Same r_op = r_pw = r swept for both models -- see III.4 caveat on comparability",
+       x = "r (= r_op = r_pw = gamma)", y = NULL, colour = "decision_model") +
+  theme(legend.position = "bottom")
+```
+
+## The new model's independent self-reliance axis
+
+This is the sensitivity surface that **cannot be produced by the legacy
+model at all** without conflating it with $r_{op}/r_{pw}$ (III.3) -- a
+direct visualisation of what the new parameter buys:
+
+```{r new-model-heatmap, cache=TRUE, fig.height=5}
+c_vals_heat <- c(0.1, 0.3, 0.5, 0.7, 0.9)
+
+run_heat <- function(seed, r, c_self) {
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = 120, n_communities = 1, node_degree = 6,
+    T = 12, r_op = r, r_pw = r, p_rewire = 0.05,
+    decision_model = "gaussian_mobius", self_reliance_c = c_self,
+    gamma = r, lambda = 0.5, trust_mode = "reward_punish",
+    sigma_opinion = "auto"
+  )
+  snaps <- res$snapshots |> dplyr::filter(round >= 12 - 4)
+  tibble(seed = seed, r = r, c_self = c_self,
+         delegation_rate = mean(snaps$delegation_rate, na.rm = TRUE))
+}
+
+grid_heat <- expand_grid(seed = sens_seeds, r = r_vals, c_self = c_vals_heat)
+heat_raw  <- pmap_dfr(grid_heat, run_heat)
+
+heat_agg <- heat_raw |> group_by(r, c_self) |> summarise(delegation_rate = mean(delegation_rate), .groups = "drop")
+
+ggplot(heat_agg, aes(factor(r), factor(c_self), fill = delegation_rate)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.2f", delegation_rate)), size = 3.4,
+            colour = ifelse(heat_agg$delegation_rate > 0.5, "white", "black")) +
+  scale_fill_viridis_c(limits = c(0, 1), option = "viridis") +
+  labs(title = "gaussian_mobius: delegation rate over (r_op = r_pw, self_reliance_c)",
+       subtitle = "r_op/r_pw shape the opinion/power kernels; c independently sets self-reliance -- two orthogonal axes",
+       x = "r (= r_op = r_pw = gamma)", y = "self_reliance_c", fill = "delegation\nrate")
+```
+
+Reading across a row (fixed $r$, varying $c$) isolates the self-reliance
+axis; reading down a column (fixed $c$, varying $r$) isolates the
+opinion/power responsiveness axis. There is no equivalent clean
+decomposition available for the legacy model.
+
+---
+
+# Part VI -- Consolidated Visual Comparison
+
+## Side-by-side decision flow
+
+```{r flow-diagram-both, fig.height=6.5, echo=FALSE}
+p_legacy <- draw_pipeline(
+  labels = c("Attractiveness\nA_ij = sig(op)*sig(pw)",
+             "Find j* = argmax A_ij\n(trust/ingroup applied)",
+             "Re-derive w_self\nfrom (o_j*, p_j*)\n['raw' or 'confidence']",
+             "Bernoulli(w_self):\nself-vote, else\nsample ~ A_ij"),
+  fills = c("#f6d6ac", "#f6d6ac", "#fbb4ae", "#d9ead3"),
+  title = "legacy pipeline"
+)
+
+p_new <- draw_pipeline(
+  labels = c("Attractiveness\nA_ij = 2*gauss(op)*sig(pw)",
+             "Find j* = argmax A_ij\n(trust/ingroup applied)",
+             "m = A_ij* directly\nP_self = mobius(m, c)",
+             "Bernoulli(P_self):\nself-vote, else\nsample ~ A_ij"),
+  fills = c("#cfe8f3", "#cfe8f3", "#b3d9c9", "#d9ead3"),
+  title = "gaussian_mobius pipeline"
+)
+
+p_legacy / p_new
+```
+
+The structural difference is entirely in the third box: **legacy
+re-derives** a fresh quantity from $j^\*$'s identity; **the new model
+reuses** the number already computed in box 1/2. This single design choice
+is the source of both the model's main advantage (decoupled, clean
+self-reliance parameter, III.3) and its main new risk (out-of-domain $m$,
+III.6).
+
+## Combined kernel comparison (opinion + power, both models)
+
+```{r capstone-patchwork, fig.height=8}
+p_op_overlay <- ggplot() +
+  geom_line(data = df_op_old |> filter(r_op %in% c(1, 4)),
+            aes(delta, a_op, colour = r_op_label, linetype = "legacy"), linewidth = 1) +
+  geom_line(data = df_op_new |> filter(r_op %in% c(1, 4)),
+            aes(delta, a_op, colour = r_op_label, linetype = "gaussian_mobius"), linewidth = 1) +
+  scale_colour_viridis_d(end = 0.7) +
+  scale_linetype_manual(values = c(legacy = "dashed", gaussian_mobius = "solid")) +
+  labs(title = "Opinion kernel: legacy (dashed) vs. new (solid), r_op in {1, 4}",
+       x = expression(Delta), y = expression(a[op]), colour = "r_op", linetype = "model") +
+  theme(legend.position = "bottom")
+
+p_pself_vs_old <- ggplot() +
+  geom_line(data = df_conf, aes(r, w_self, linetype = mode), colour = "#d95f02", linewidth = 1) +
+  geom_hline(data = tibble(c = c(0.2, 0.5, 0.8)), aes(yintercept = c),
+             colour = "#1b9e77", linetype = "dotted") +
+  annotate("text", x = 6, y = c(0.2, 0.5, 0.8) + 0.03,
+           label = paste0("new model, c=", c(0.2, 0.5, 0.8)), colour = "#1b9e77", size = 3) +
+  labs(title = "Self-vote at identical best neighbour: legacy (orange, varies with r) vs. new (green, flat at c)",
+       x = "r (= r_op = r_pw)", y = expression(w[self]~"or"~P[self]), linetype = "legacy mode") +
+  theme(legend.position = "bottom")
+
+p_op_overlay / p_pself_vs_old
+```
+
+---
+
+# Part VII -- Overall Assessment
+
+## Summary comparison table
+
+```{r final-summary-table}
+tibble(
+  Dimension = c("Opinion gating", "Power gating", "Self-vote mechanism",
+                "Self-reliance tunability", "Ceiling behaviour", "Known edge cases",
+                "Continuity with Reports 15-19", "Recommended for"),
+  `Legacy (dual sigmoid)` = c(
+    "Sigmoid, fixed midpoint at Delta=0.5, steepness varies with r_op",
+    "Sigmoid of log power ratio (shared with new model)",
+    "Two-sigmoid mirror of attractiveness, evaluated at j*'s raw values",
+    "Entangled with r_op/r_pw; patched via self_weight_mode='confidence'",
+    "Approaches but never reaches 0.5 (identical neighbour) at finite r",
+    "None known -- self-weight always in [0,1] regardless of trust",
+    "Exact replication of all published results",
+    "Continuity work; studies where responsiveness and self-reliance are meant to be the same trait"
+  ),
+  `Gaussian/Mobius` = c(
+    "Gaussian, r_op-dependent bandwidth (half-width shrinks as 1/r_op)",
+    "Sigmoid of log power ratio (shared with legacy model)",
+    "Single Mobius curve of m = A_ij*, with named anchors",
+    "Fully decoupled via dedicated parameter c",
+    "Exactly 1 (identical neighbour), invariant to r_op/r_pw",
+    "m can exceed 2 under strong reward+punish trust -> P_self < 0 (III.6)",
+    "New for Report 20; r_op is not magnitude-comparable to legacy (III.4)",
+    "New work specifically about self-reliance as an independent axis; cleaner default going forward"
+  )
+) |>
+  kable(escape = FALSE)
+```
+
+## Recommendation
+
+For a thesis chapter whose explicit interest is *how self-reliance shapes
+delegation independently of opinion/power responsiveness* -- which is what
+Report 20's design suggests -- **`gaussian_mobius` is the better-justified
+default going forward**: it removes an ad hoc patch (`"confidence"` mode),
+gives the self-reliance parameter a literal, checkable meaning ($c =
+P_{\text{self}}$ at an identical neighbour, for *any* $r$), and its ceiling
+behaviour is exact rather than asymptotic. `legacy` remains valuable and
+should stay available (as it already is, via one argument) for
+(a) exact replication of Reports 15-19, and (b) any analysis that
+specifically wants responsiveness and self-confidence to be the same
+underlying quantity.
+
+## Weaknesses of the new implementation, and concrete fixes
+
+1. **Out-of-domain $m$ under strong trust (III.6).** *Fix:* clamp before
+   evaluating the curve, preserving the formula's intent while removing
+   the sign flip:
+
+   ```r
+   p_self_mobius(pmin(w[j_idx], 2), self_reliance_c)
+   ```
+
+   A one-line change in `Network.R`'s `gaussian_mobius` branch. As a
+   diagnostic, it would be worth logging how often the clamp actually
+   binds across Report 20's grid (likely rare at $\gamma\le8$,
+   $\lambda=0.5$, but worth quantifying rather than assuming).
+
+2. **$r_{op}$ not comparable across models (III.4).** *Fix:* either (a)
+   explicitly caveat any cross-model $r_{op}$ comparison in the thesis
+   text (the honest, zero-code option), or (b) recalibrate the
+   `gaussian_mobius` sweep so its half-attractiveness distance matches the
+   legacy sweep's fixed $\Delta=0.5$ reference by construction --
+   i.e. choose $r_{op}$ values from $r_{op} = \sqrt{2\ln2}/\Delta^\star$
+   for a chosen target $\Delta^\star$, rather than reusing Report 19's raw
+   numbers verbatim.
+
+3. **No sensitivity instrumentation yet for $c$ specifically.** Report 20's
+   grid does not currently sweep `self_reliance_c` at all (it is fixed at
+   $0.5$ throughout, per its setup chunk). Given III.3 identifies this as
+   the headline new capability, a supplementary sweep over $c$ (holding
+   $r_{ingroup}$ and $r_{background}$ fixed) would make direct use of the
+   model's main advantage rather than leaving it implicit.

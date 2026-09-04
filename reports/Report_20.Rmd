@@ -1,0 +1,864 @@
+---
+title: "Report 21 -- Calibration Pipeline (simplified): N/K"
+output: github_document
+date: "2026-08-28"
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 13, fig.height = 8)
+library(tidyverse)
+library(here)
+library(knitr)
+library(furrr)
+library(digest)
+library(mgcv)
+library(igraph)
+
+theme_set(theme_minimal(base_size = 12))
+source(here::here("scripts/Network.R"))
+dir.create(here::here("reports/Report_21_files/figure-gfm"), recursive = TRUE, showWarnings = FALSE)
+dir.create(here::here("data"), showWarnings = FALSE)
+
+N_WORKERS <- max(1L, parallel::detectCores() - 1)
+
+run_cached <- function(cache_name, fn, hash_obj) {
+  hash       <- digest::digest(hash_obj)
+  cache_file <- here::here(paste0("data/", cache_name, "_cache.rds"))
+  if (file.exists(cache_file)) {
+    cc <- readRDS(cache_file)
+    if (identical(cc$hash, hash)) return(cc$data)
+  }
+  out <- fn()
+  saveRDS(list(hash = hash, data = out), cache_file)
+  out
+}
+
+# RQ1 metrics only -- number of direct voters, delegation rate, lost-vote
+# rate, delegation chain length. metrics_core/metrics_all kept as separate
+# names (both point at the same 4-metric set) purely so every downstream
+# chunk that already references one or the other keeps working unchanged.
+metrics_all    <- c("n_direct_voters", "delegation_rate", "lost_vote_rate", "chain_length")
+metrics_core   <- metrics_all
+metric_labels  <- c(n_direct_voters = "Number of direct voters", delegation_rate = "Delegation rate",
+                     lost_vote_rate = "Lost-vote rate", chain_length = "Avg. chain length",
+                     flickerness = "Flickerness (delegation-target stability)")
+```
+
+# Model 
+
+Group identity is off throughout this report
+($a^{ig}\equiv1,\ r_{ig}=0$ -- Part I only).
+
+**Attractiveness** of neighbour $j$ to agent $i$:
+$$A_{ij}=a^{tr}_{ij}\,a^{pw}_{ij}\,a^{op}_{ij}$$
+$$a^{op}_{ij}=\exp(-r_{op}|o_i-o_j|)\in(0,1],\qquad a^{pw}_{ij}=2\mathcal L\!\left(r_{pw}\left(\tfrac{p_j}{p_i}-1\right)\right)\in(0,2),\qquad a^{tr}_{ij}=2\mathcal L\!\left(r_{tr}(\tau_{ij}-1)\right)\in(0,2)$$
+where $\mathcal L(x)=1/(1+e^{-x})$.
+
+**Delegation-target choice**, once $i$ has decided to delegate: neighbour
+$j$ is drawn with probability $P_i(j)=A_{ij}/\sum_k A_{ik}$.
+
+**Self-vote probability**, applied to $A_k=\max_j A_{ij}$ (the
+attractiveness of $i$'s single most attractive neighbour) -- this is what
+decides whether $i$ votes directly instead of delegating at all:
+$$P_{\text{self}}(A_k)=\frac{M-A_k}{M+A_k\left(\frac{M-1}{c}-M\right)},\qquad M=4$$
+$M=4$ is the theoretical ceiling of $A_{ij}$ ($a^{tr},a^{pw}\le2$,
+$a^{op}\le1$); $c\in(0,1)$ is the self-reliance baseline --
+$P_\text{self}=c$ when the best neighbour is exactly as attractive as $i$
+itself ($A_k=1$).
+
+**Trust update**, only once $j$'s vote is resolved at the end of a round:
+$$\tau_{ij}(t)=(1-\lambda)\,\tau_{ij}(t-1)+\lambda\big(1+s_{ij}(t-1)\big),\quad \tau_{ij}(0)=1$$
+$$s_{ij}(t-1)=\begin{cases}k_1\big(1-2|o_i-v_j(t-1)|\big) & i\text{ delegated to }j\text{ and }j\text{ delivered a vote}\\ -k_2 & i\text{ delegated to }j\text{ and }j\text{'s vote was lost to a cycle}\\ 0 & i\text{ did not delegate to }j\end{cases}\qquad k_1=k_2=1$$
+$\lambda\in(0,1]$ is the *adaptation rate*.
+
+**Delegating vs. voting rounds.** Every round runs the same
+decision + power/vote-resolution steps above; only a subset of rounds --
+*voting rounds* -- additionally runs the trust update above. *Delegating
+rounds* skip it entirely, so $\tau_{ij}$ simply carries over unchanged.
+Controlled by `n_voting_rounds` in `simulate_liquid_democracy()`; `NULL`
+(used throughout this report) means every round is a voting round. 
+ Voting rounds are evenly spaced via
+`round(seq(T/n_voting_rounds, T, length.out = n_voting_rounds))`, always
+ending on round $T$ -- exactly regular (constant number of delegating
+rounds in between) only when $T/n_\text{voting\_rounds}$ is an integer,
+e.g. 60/20 split: 60/20=3, so 20 voting rounds and 40; otherwise (when
+$T/n_\text{voting\_rounds}$ isn't an integer) spacing can vary by $\pm1$
+round from rounding.
+
+**Parameters used in this report:**
+
+| Symbol | Role | Status here |
+|---|---|---|
+| $N$ | number of agents | swept (Part 1) |
+| $K$ | mean degree (`node_degree`) | swept (Part 1) |
+| $r_{op}$ | opinion responsiveness | varied |
+| $r_{pw}$ | power responsiveness | varied |
+| $r_{tr}$ | trust responsiveness (`gamma`) | varied |
+| $\lambda$ | trust adaptation rate | fixed, $\lambda=1-0.5^{2/n_\text{voting\_rounds}}\approx0.0670$ |
+| $c$ | self-reliance baseline | fixed, $c=0.5$ |
+| $k_1,k_2$ | agreement / cycle-penalty weights | fixed at 1 |
+| $r_{ig}$ | ingroup responsiveness | fixed at 0 (Part I only) |
+
+
+**$\lambda$** is not swept below (only $c,r_{op},r_{pw},r_{tr}$ are); it is
+fixed via a half-life condition on the trust-relaxation recursion,
+$(1-\lambda)^h=0.5$ for $h=n_\text{voting\_rounds}/2$ voting-round updates
+(half of however many voting rounds a run actually has), giving
+$\lambda=1-0.5^{2/n_\text{voting\_rounds}}$. At this report's
+$n_\text{voting\_rounds}=20$ that is $\lambda\approx0.0670$.
+
+
+```{r global-config}
+N_VOTING_ROUNDS_NK <- 20L  # moved up from the Part 1 config below so lambda's
+                           # derivation can reference it directly
+LAMBDA_TR <- 1 - 0.5^(2 / N_VOTING_ROUNDS_NK)  # ~0.0670 at N_VOTING_ROUNDS_NK=20, see derivation above
+SELF_RELIANCE_C_NEUTRAL <- 0.5      # used only while c itself is not yet the thing being varied
+```
+
+---
+
+# Part 1: N and K
+
+## N and K
+
+Watts & Strogatz (1998) define their small-world regime by
+$$N\gg K\gg\ln(N)\gg1$$
+
+
+## Fixing N: the resulting theoretical corridor for K
+
+$N=1000$ is fixed for this part; $\ln(1000)\approx6.91$, so the
+theoretical corridor above says only that $K$ should sit comfortably above
+$\approx7$ and well below $1000$.
+
+
+## 1.1 Candidate grid
+
+
+```{r p1-grid}
+nk_grid <- tidyr::crossing(N = c(250, 500, 750, 1000), K = seq(8, 48, by = 8))
+```
+
+For **N = 1000**: I choose the range of K to $\in\{$`r paste(sort(unique(nk_grid$K[nk_grid$N == 1000])), collapse=", ")`$\}$
+
+
+```{r p1-run-config}
+MAX_ROUND_NK <- 60L
+# N_VOTING_ROUNDS_NK (=20, of the 60 rounds -- trust update runs there only)
+# is now defined above, in global-config, so lambda's derivation can
+# reference it before this chunk runs.
+# T=60 / 20 voting rounds throughout Part 1 (not the large exploratory value
+# used previously) -- see chat: every normal simulation in this report now
+# runs at this T/voting-rounds combination, rather than a separately-large T
+# used only to check convergence. This means the steady-state proxy below
+# is NOT validated as a converged value at every (N,K) cell -- 1.2b's
+# round-by-round trace (run at its own dedicated, longer check -- see the
+# note on lambda above for why that check does not rescale lambda to match
+# its own n_voting_rounds) is the only place that's checked directly.
+N_SEEDS_NK   <- 10L
+STEADY_WINDOW_NK <- 5L   # steady-state proxy = average of the last 5 of 60 rounds
+```
+
+## 1.2 Run the grid at r = 0
+
+```{r p1-run}
+run_nk_cell <- function(seed, N, K, r_op, r_pw, r_tr, r_label, T_override = NULL,
+                        network_type = "ws", n_voting_rounds_override = NULL) {
+  # T_override: NULL (default, every existing call site) uses MAX_ROUND_NK
+  # (=30, fixed for all of Part 1); pass an explicit value to run just this
+  # one cell at a different T -- used only by 1.2b's own dedicated T=600 check.
+  # n_voting_rounds_override: same pattern as T_override -- NULL (default)
+  # uses N_VOTING_ROUNDS_NK (=10) whenever T_override is also NULL; 1.2b
+  # passes 200 explicitly alongside its own T_override=600.
+  # network_type: "ws" (default, every existing call site) | "ba" -- used only
+  # by the WS-vs-BA comparison section.
+  T_use   <- if (is.null(T_override)) MAX_ROUND_NK else T_override
+  nvr_use <- if (is.null(T_override)) N_VOTING_ROUNDS_NK else n_voting_rounds_override
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = N, n_communities = 1, node_degree = K, T = T_use,
+    n_voting_rounds = nvr_use, network_type = network_type,
+    r_op = r_op, r_pw = r_pw, gamma = r_tr, lambda = LAMBDA_TR, k1 = 1, k2 = 1,
+    decision_model = "expose", self_reliance_c = SELF_RELIANCE_C_NEUTRAL, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05,
+    snap_rounds = seq_len(T_use)
+  )
+  tibble(
+    seed = seed, N = N, K = K, r_label = r_label, network_type = network_type, round = seq_len(T_use),
+    delegation_rate  = res$history_delegation,
+    n_direct_voters  = N * (1 - delegation_rate),
+    lost_vote_rate   = res$history_lost,
+    chain_length     = res$snapshots$avg_chain_length_delegators,
+    top5_power_share = res$snapshots$top5_power_share,
+    share_50pct      = res$snapshots$share_50pct,
+    flickerness      = res$history_flickerness
+  )
+}
+
+compute_components_cell <- function(N, K, seed) {
+  st <- setup_agents(N, 1, seed = seed)
+  gF <- setup_friendship_network(st$agents, 1, K, p_rewire = 0.05, seed = seed)
+  gU <- as.undirected(gF, mode = "collapse")
+  tibble(N = N, K = K, seed = seed, metric = "n_components", steady_val = components(gU)$no)
+}
+
+grid_nk_r0 <- tidyr::crossing(nk_grid, seed = seq_len(N_SEEDS_NK))
+
+nk_r0_raw <- run_cached("nk_grid_r0_raw", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_nk_r0, function(N, K, seed)
+    run_nk_cell(seed, N, K, r_op = 0, r_pw = 0, r_tr = 0, r_label = "r0"),
+    .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(MAX_ROUND_NK, N_SEEDS_NK, nk_grid$N, nk_grid$K, LAMBDA_TR, SELF_RELIANCE_C_NEUTRAL, v = 3))  # v=3: decision_model calib->expose (correct power formula)
+
+nk_components_r0 <- run_cached("nk_components_r0", function() {
+  purrr::pmap_dfr(grid_nk_r0, function(N, K, seed) compute_components_cell(N, K, seed))
+}, list(nk_grid$N, nk_grid$K, N_SEEDS_NK, v = 1))
+```
+
+## 1.2b Extreme K at N=1000, full round-by-round trace (T=600)
+
+
+```{r p1-round-check, fig.height=10}
+T_1_2B             <- 300L
+N_VOTING_ROUNDS_1_2B <- 100L  # of the 600 rounds, 200 are voting rounds -- independent of N_VOTING_ROUNDS_NK
+N_SEEDS_1_2B <- 5L  # dedicated seed count for this one T-check, independent of N_SEEDS_NK
+extreme_K    <- range(nk_grid$K[nk_grid$N == 1000])
+
+# none (0) / moderate (8) / high (32) -- same r_op=r_pw=r_tr single-dial
+# convention as 1.3 (defined locally here since 1.3's r_settings_p13 is
+# defined later in the document and isn't available yet at this point).
+r_settings_1_2b <- tribble(
+  ~r_label, ~r_val,
+  "0",      0,
+  "8",      8,
+  "32",     32
+)
+
+grid_1_2b <- tidyr::crossing(K = extreme_K, seed = seq_len(N_SEEDS_1_2B)) |>
+  tidyr::crossing(r_settings_1_2b |> select(r_label)) |>
+  left_join(r_settings_1_2b, by = "r_label")
+
+nk_1_2b_raw <- run_cached("nk_1_2b_T600_raw", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_1_2b, function(K, seed, r_label, r_val)
+    run_nk_cell(seed, N = 1000, K = K, r_op = r_val, r_pw = r_val, r_tr = r_val,
+                r_label = r_label, T_override = T_1_2B,
+                n_voting_rounds_override = N_VOTING_ROUNDS_1_2B),
+    .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(T_1_2B, N_VOTING_ROUNDS_1_2B, N_SEEDS_1_2B, extreme_K, r_settings_1_2b, LAMBDA_TR, SELF_RELIANCE_C_NEUTRAL, v = 2))  # v=2: decision_model calib->expose
+
+metrics_1_2b <- c(metrics_core, "flickerness")  # flickerness: share of agents keeping the
+                                                 # same delegation target vs. the previous round
+                                                 # (NA in round 1 -- no prior round to compare)
+
+nk_1_2b_raw |>
+  pivot_longer(all_of(metrics_1_2b), names_to = "metric", values_to = "value") |>
+  group_by(K, r_label, metric, round) |>
+  summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop") |>
+  mutate(metric  = factor(metric_labels[metric], levels = unname(metric_labels)),
+         r_label = factor(r_label, levels = r_settings_1_2b$r_label)) |>
+  ggplot(aes(round, mean_val, colour = factor(K))) +
+  geom_line(linewidth = 0.8) +
+  scale_colour_viridis_d(name = "K", end = 0.85) +
+  facet_grid(metric ~ r_label, scales = "free_y") +
+  labs(title = sprintf("Full T=%d round range -- N=1000, K=%s (smallest/largest surviving)",
+                        T_1_2B, paste(extreme_K, collapse = " and ")),
+       subtitle = sprintf("By responsiveness level (%s), %d seeds/cell -- is the last-5-round window used elsewhere (T=%d) actually flat here, or still moving?",
+                           paste(r_settings_1_2b$r_label, collapse = " / "), N_SEEDS_1_2B, MAX_ROUND_NK),
+       x = "round", y = NULL) +
+  theme(legend.position = "top", strip.text = element_text(size = 8))
+```
+
+- 30 Rounds seems enough to have the system stabilized ( T=30 voting, voting rounds = 10)
+
+
+## 1.3 Steady-state value vs. responsiveness, one line per K (N=1000, K=8-48)
+
+N=1000 fixed  and $r_{op}=r_{pw}=r_{tr}$ at each level.
+
+```{r p1-3-helpers}
+steady_state_per_seed <- function(raw_df, round_max, window, id_cols, metrics = metrics_core) {
+  raw_df |>
+    filter(round > round_max - window) |>
+    pivot_longer(all_of(metrics), names_to = "metric", values_to = "value") |>
+    group_by(across(all_of(c(id_cols, "metric")))) |>
+    summarise(steady_val = mean(value, na.rm = TRUE), .groups = "drop")
+}
+
+steady_state_summary <- function(per_seed_df, group_cols) {
+  per_seed_df |>
+    group_by(across(all_of(c(group_cols, "metric")))) |>
+    summarise(mean_val = mean(steady_val, na.rm = TRUE),
+              sd_val   = sd(steady_val, na.rm = TRUE), .groups = "drop")
+}
+
+R_NONE     <- 0
+R_LOW      <- 2
+R_MODERATE <- 8
+R_HIGH     <- 32
+
+r_settings_p13 <- tribble(
+  ~r_label,       ~r_val,
+  "0",     R_NONE,
+  "2",      R_LOW,
+  "8", R_MODERATE,
+  "32",    R_HIGH
+)
+```
+
+```{r p1-3-run}
+K8            <- 8L
+nk_grid_N1000 <- nk_grid |> filter(N == 1000)
+K_all_N1000   <- sort(unique(c(K8, nk_grid_N1000$K)))
+
+grid_p13 <- tidyr::crossing(N = 1000, K = K_all_N1000, seed = seq_len(N_SEEDS_NK)) |>
+  tidyr::crossing(r_settings_p13 |> select(r_label)) |>
+  left_join(r_settings_p13, by = "r_label")
+
+nk_p13_raw <- run_cached("nk_p13_raw", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_p13, function(N, K, seed, r_label, r_val)
+    run_nk_cell(seed, N, K, r_op = r_val, r_pw = r_val, r_tr = r_val, r_label = r_label),
+    .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(MAX_ROUND_NK, N_SEEDS_NK, K_all_N1000, r_settings_p13, LAMBDA_TR, SELF_RELIANCE_C_NEUTRAL, v = 2))  # v=2: decision_model calib->expose
+```
+
+```{r p1-3-plot, fig.height=12}
+nk_p13_per_seed <- steady_state_per_seed(nk_p13_raw, MAX_ROUND_NK, STEADY_WINDOW_NK, c("K", "r_label", "seed"))
+
+nk_p13_summary <- steady_state_summary(nk_p13_per_seed, c("K", "r_label")) |>
+  mutate(r_label = factor(r_label, levels = r_settings_p13$r_label),
+         metric   = factor(metric_labels[metric], levels = unname(metric_labels)))
+
+nk_p13_summary |>
+  ggplot(aes(r_label, mean_val, colour = factor(K), group = factor(K))) +
+  geom_line(linewidth = 0.8) + geom_point(size = 2) +
+  scale_colour_viridis_d(name = "K", end = 0.85) +
+  facet_wrap(~metric, scales = "free_y", ncol = 2) +
+  labs(title = "N=1000 -- steady-state value vs. responsiveness, one line per K",
+       subtitle = sprintf("Mean of last %d of %d rounds, %d seeds per cell", STEADY_WINDOW_NK, MAX_ROUND_NK, N_SEEDS_NK),
+       x = "responsiveness (r_op = r_pw = r_tr)", y = NULL) +
+  theme(legend.position = "top")
+```
+- We see that K has quiete a strong effect (makes sense since due to K agents have more options therefore potentially better options)
+
+### K = 16: a literature-anchored modelling assumption, not a fitted value
+
+As we see K has an effect which needs to be mentioned but based on this 
+it is not clear which K value to choose for a LD simulation. 
+A delegation target must be someone whose trustworthiness *and*
+competence the delegating agent can actually judge -- this rules out large
+values (K=50 or more) as psychologically implausible: nobody meaningfully
+evaluates 50 comparable candidates for a personal delegation decision. The
+relevant anchor from social-network research is Dunbar's **sympathy
+group** -- the circle of people one knows well enough to judge, is defined from 
+12-20 by **Dunbar & Spoors (1995)**. Therefore I would set K to 16 and would call
+it something like a model assumption. 
+
+## 1.4 N-sensitivity by responsiveness, K=16 fixed
+
+```{r p1-4-run}
+N_VALUES_SENS <- c(500, 1000, 2500, 5000)
+K_FIXED_SENS  <- 16L
+
+r_settings_sens <- r_settings_p13  # no filtering -- every r level from 1.3, r=0 included
+
+grid_p14 <- tidyr::crossing(N = N_VALUES_SENS, K = K_FIXED_SENS, seed = seq_len(N_SEEDS_NK)) |>
+  tidyr::crossing(r_settings_sens |> select(r_label)) |>
+  left_join(r_settings_sens, by = "r_label")
+
+n_sensitivity_raw <- run_cached("n_sensitivity_by_r", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_p14, function(N, K, seed, r_label, r_val)
+    run_nk_cell(seed, N, K, r_op = r_val, r_pw = r_val, r_tr = r_val, r_label = r_label),
+    .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(MAX_ROUND_NK, N_SEEDS_NK, N_VALUES_SENS, K_FIXED_SENS, r_settings_sens, LAMBDA_TR, SELF_RELIANCE_C_NEUTRAL, v = 2))  # v=2: decision_model calib->expose
+```
+
+```{r p1-4-plot, fig.height=10}
+n_sens_per_seed <- steady_state_per_seed(n_sensitivity_raw, MAX_ROUND_NK, STEADY_WINDOW_NK,
+                                          c("N", "r_label", "seed"))
+n_sens_summary  <- steady_state_summary(n_sens_per_seed, c("N", "r_label")) |>
+  mutate(r_val  = as.numeric(r_label),  # actual r value, no label mapping -- avoids the label/filter mismatch from before
+         metric = factor(metric_labels[metric], levels = unname(metric_labels)))
+
+n_sens_summary |>
+  ggplot(aes(N, mean_val)) +
+  geom_line(linewidth = 0.8, colour = "grey30") + geom_point(size = 2, colour = "grey30") +
+  facet_grid(metric ~ r_val, scales = "free_y") +
+  labs(title = "K=16 fixed -- steady-state value vs. N, by responsiveness level",
+       subtitle = sprintf("%d seeds per cell", N_SEEDS_NK),
+       x = "N", y = NULL) +
+  theme(strip.text = element_text(size = 8), legend.position = "top")
+```
+
+- Once N is sufficiently large to ensure a well-defined network structure, further
+increases in network size have little effect on the considered metrics. Thus, beyond 
+a critical network size, the results remain largely stable with respect to N.
+(Need to do this again for Part 2 since I believe this could have a strong effect
+on minority representation)
+
+## 1.4b Watts-Strogatz vs. Barabasi-Albert (N=1000, K=16)
+
+Fixing N=1000, K=16 (the anchor from 1.3): does the network generator
+itself matter? WS (small-world, the default used everywhere else in this
+report) vs. BA (Barabasi-Albert preferential attachment -- hub-like degree
+heterogeneity that WS cannot produce). Same paired-sweep design as RQ1's
+"Shared design" (see the appended RQ1 section further below): each pair of
+responsiveness dimensions is varied *together* across $r\in\{1,2,4,8,16,32\}$
+(log scale), while the third is held fixed at one of three levels
+($r\in\{0,4,16\}$, a reduced subset of RQ1's own fixed levels, kept small
+here to avoid clutter) -- shown as differently coloured lines, network type
+distinguished by line style on top of that (WS solid, BA dashed). All three
+possible pairings are covered here, not just $r_{op}=r_{pw}$, so every
+combination of "which two dimensions move together, which one is held
+fixed" is shown at least once:
+
+- $r_{op}=r_{pw}$ varied, $r_{tr}$ fixed
+- $r_{op}=r_{tr}$ varied, $r_{pw}$ fixed
+- $r_{pw}=r_{tr}$ varied, $r_{op}$ fixed
+
+Plus two power-concentration metrics beyond the four core ones:
+**top5_power_share** (share of total voting power held by the top 5% of
+agents) and **share_50pct** (share of agents needed to jointly accumulate
+50% of total voting power).
+
+```{r p1-4b-config}
+metrics_power  <- c("top5_power_share", "share_50pct")
+metrics_wsba   <- c(metrics_core, metrics_power)
+metric_labels_wsba <- c(metric_labels,
+                        top5_power_share = "Top 5% power share",
+                        share_50pct      = "Agents needed for 50% power")
+
+R_VALS_WSBA         <- c(1, 2, 4, 8, 16, 32)  # shared paired dimension, varied -- same levels as RQ1's paired sweep
+R_FIXED_LEVELS_WSBA <- c(0, 4, 16)            # third dimension's fixed levels, shown as coloured lines -- reduced subset of RQ1's R_FIXED_LEVELS to avoid clutter
+```
+
+```{r p1-4b-run}
+K_WSBA <- 16L
+
+# Same "vary two dimensions together, hold the third fixed" construction as
+# RQ1's build_pair_grid() further below, extended by network_type here.
+build_wsba_pair_grid <- function(pair_label, dim_fixed) {
+  df <- tidyr::crossing(v = R_VALS_WSBA, f = R_FIXED_LEVELS_WSBA,
+                         network_type = c("ws", "ba"), seed = seq_len(N_SEEDS_NK))
+  df$pair_label <- pair_label
+  df$r_op <- if (dim_fixed == "r_op") df$f else df$v
+  df$r_pw <- if (dim_fixed == "r_pw") df$f else df$v
+  df$r_tr <- if (dim_fixed == "r_tr") df$f else df$v
+  df
+}
+
+grid_wsba <- bind_rows(
+  build_wsba_pair_grid("r_op x r_pw (r_tr fixed)", "r_tr"),
+  build_wsba_pair_grid("r_op x r_tr (r_pw fixed)", "r_pw"),
+  build_wsba_pair_grid("r_pw x r_tr (r_op fixed)", "r_op")
+)
+
+wsba_raw <- run_cached("wsba_pair_raw", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_wsba, function(pair_label, v, f, network_type, seed, r_op, r_pw, r_tr)
+    run_nk_cell(seed, N = 1000, K = K_WSBA, r_op = r_op, r_pw = r_pw, r_tr = r_tr,
+                r_label = sprintf("%s_v%g_f%g", pair_label, v, f), network_type = network_type) |>
+      mutate(pair_label = pair_label, v = v, f = f),
+    .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(MAX_ROUND_NK, N_SEEDS_NK, K_WSBA, R_VALS_WSBA, R_FIXED_LEVELS_WSBA,
+        LAMBDA_TR, SELF_RELIANCE_C_NEUTRAL, v = 1))
+
+wsba_per_seed <- steady_state_per_seed(wsba_raw, MAX_ROUND_NK, STEADY_WINDOW_NK,
+                                        c("pair_label", "network_type", "v", "f", "seed"), metrics = metrics_wsba)
+wsba_summary  <- steady_state_summary(wsba_per_seed, c("pair_label", "network_type", "v", "f")) |>
+  mutate(metric = factor(metric_labels_wsba[metric], levels = unname(metric_labels_wsba)),
+         network_type = factor(network_type, levels = c("ws", "ba"), labels = c("WS", "BA")))
+
+plot_wsba_pair <- function(label) {
+  wsba_summary |>
+    filter(pair_label == label) |>
+    ggplot(aes(v, mean_val, colour = factor(f, levels = R_FIXED_LEVELS_WSBA),
+               linetype = network_type, group = interaction(f, network_type))) +
+    geom_line(linewidth = 0.8) + geom_point(size = 1.5) +
+    scale_x_log10(breaks = R_VALS_WSBA) +
+    scale_colour_viridis_d(name = "fixed level", end = 0.85) +
+    scale_linetype_manual(name = "network", values = c(WS = "solid", BA = "dashed")) +
+    facet_wrap(~metric, scales = "free_y", ncol = 2) +
+    labs(title = sprintf("N=1000, K=16 -- %s x network", label),
+         subtitle = sprintf("%d seeds per cell", N_SEEDS_NK),
+         x = "shared r value (log scale)", y = NULL) +
+    theme(legend.position = "top")
+}
+```
+
+```{r p1-4b-plot-1, fig.height=16}
+plot_wsba_pair("r_op x r_pw (r_tr fixed)")
+```
+
+```{r p1-4b-plot-2, fig.height=16}
+plot_wsba_pair("r_op x r_tr (r_pw fixed)")
+```
+
+```{r p1-4b-plot-3, fig.height=16}
+plot_wsba_pair("r_pw x r_tr (r_op fixed)")
+```
+
+## 1.4c Alternative: single-dial $r_{op}=r_{pw}=r_{tr}$ (kept alongside 1.4b)
+
+Same WS-vs-BA comparison, but reducing the three responsiveness dimensions
+to one shared dial ($r_{op}=r_{pw}=r_{tr}$, varied together)
+
+```{r p1-4c-run}
+grid_wsba_alt <- tidyr::crossing(N = 1000, K = K_WSBA, network_type = c("ws", "ba"),
+                                  r_val = R_VALS_WSBA, seed = seq_len(N_SEEDS_NK))
+
+wsba_alt_raw <- run_cached("wsba_single_dial_raw", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_wsba_alt, function(N, K, network_type, r_val, seed)
+    run_nk_cell(seed, N, K, r_op = r_val, r_pw = r_val, r_tr = r_val,
+                r_label = as.character(r_val), network_type = network_type),
+    .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(MAX_ROUND_NK, N_SEEDS_NK, K_WSBA, R_VALS_WSBA, LAMBDA_TR, SELF_RELIANCE_C_NEUTRAL, v = 1))
+```
+
+```{r p1-4c-plot, fig.height=16}
+wsba_alt_per_seed <- steady_state_per_seed(wsba_alt_raw, MAX_ROUND_NK, STEADY_WINDOW_NK,
+                                            c("network_type", "r_label", "seed"), metrics = metrics_wsba)
+wsba_alt_summary  <- steady_state_summary(wsba_alt_per_seed, c("network_type", "r_label")) |>
+  mutate(r_val  = as.numeric(r_label),
+         metric = factor(metric_labels_wsba[metric], levels = unname(metric_labels_wsba)),
+         network_type = factor(network_type, levels = c("ws", "ba"), labels = c("WS", "BA")))
+
+wsba_alt_summary |>
+  ggplot(aes(r_val, mean_val, linetype = network_type, group = network_type)) +
+  geom_line(linewidth = 0.8, colour = "grey30") + geom_point(size = 1.5, colour = "grey30") +
+  scale_x_log10(breaks = R_VALS_WSBA) +
+  scale_linetype_manual(name = "network", values = c(WS = "solid", BA = "dashed")) +
+  facet_wrap(~metric, scales = "free_y", ncol = 2) +
+  labs(title = "N=1000, K=16 -- r_op=r_pw=r_tr (single dial) x network",
+       subtitle = sprintf("%d seeds per cell", N_SEEDS_NK),
+       x = "r_op = r_pw = r_tr (log scale)", y = NULL) +
+  theme(legend.position = "top")
+```
+
+---
+
+# RQ1-RQ3
+
+
+```{r rq1-setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 13, fig.height = 8)
+library(tidyverse)
+library(here)
+library(knitr)
+library(furrr)
+library(digest)
+
+theme_set(theme_minimal(base_size = 12))
+source(here::here("scripts/Network.R"))
+dir.create(here::here("reports/RQ1_files/figure-gfm"), recursive = TRUE, showWarnings = FALSE)
+dir.create(here::here("data"), showWarnings = FALSE)
+
+N_WORKERS <- max(1L, parallel::detectCores() - 1)
+
+run_cached <- function(cache_name, fn, hash_obj) {
+  hash       <- digest::digest(hash_obj)
+  cache_file <- here::here(paste0("data/", cache_name, "_cache.rds"))
+  if (file.exists(cache_file)) {
+    cc <- readRDS(cache_file)
+    if (identical(cc$hash, hash)) return(cc$data)
+  }
+  out <- fn()
+  saveRDS(list(hash = hash, data = out), cache_file)
+  out
+}
+
+# RQ1: delegation behaviour. RQ2: quality of representation (ideological
+# drift). RQ3: concentration of voting power. All three are answered off the
+# SAME simulation grid (see "Shared design" below) -- one run per (pair,
+# fixed-level, seed) cell produces every metric needed for all three RQs at
+# once, so the sweep only has to run once.
+metrics_rq1 <- c("delegation_rate", "lost_vote_rate", "n_direct_voters", "chain_length", "flickerness")
+metrics_rq2 <- c("avg_drift")
+metrics_rq3 <- c("top5_power_share", "share_50pct")
+metrics_all_rqs <- c(metrics_rq1, metrics_rq2, metrics_rq3)
+
+metric_labels <- c(
+  delegation_rate  = "Delegation rate",
+  lost_vote_rate   = "Lost-vote rate",
+  n_direct_voters  = "Direct voters (N x (1 - delegation rate))",
+  chain_length     = "Avg. delegation-chain length",
+  flickerness      = "Flickerness (delegation-target stability)",
+  avg_drift        = "Avg. ideological drift",
+  top5_power_share = "Top-5% voting-power share",
+  share_50pct      = "Agents needed for 50% of power"
+)
+```
+
+## Fixed inputs
+
+```{r rq-fixed-inputs}
+# ══════════════════════════════════════════════════════════════════════
+# KEEP IN SYNC WITH REPORT_21 -- these are Report_21's Part 1-3 decisions,
+# redefined here rather than sourced from that Rmd (more robust to
+# Report_21 changing independently). Update whenever Report_21's N/K/T/c
+# choices change. Values below match Report_21's current PROVISIONAL picks.
+# ══════════════════════════════════════════════════════════════════════
+CHOSEN_N          <- 500L
+CHOSEN_K          <- 18L
+CHOSEN_T          <- 60L    # T=60, 20 of them voting rounds -- see chat
+CHOSEN_VOTING_RDS <- 20L
+CHOSEN_C          <- 0.5    # Report_21 Part 3: value hitting the 50% baseline delegation target
+# lambda: half-life = CHOSEN_VOTING_RDS/2 voting-round (trust-update) steps,
+# i.e. (1-lambda)^h = 0.5 for h = n_voting_rounds/2 -- see this document's
+# own global-config chunk above for the full derivation and why this must
+# stay a FIXED constant (not recomputed per experiment). ~0.0670 at
+# CHOSEN_VOTING_RDS = 20, expressed relative to this report's own round
+# design instead of a bare constant. Overwrites the LAMBDA_TR bound above --
+# deliberately, since RQ1.Rmd's own n_voting_rounds design (20) happens to
+# match Report_21's Part 1, so the numeric value is unchanged.
+LAMBDA_TR         <- 1 - 0.5^(2 / CHOSEN_VOTING_RDS)
+```
+
+**N = `r CHOSEN_N`, K = `r CHOSEN_K`, T = `r CHOSEN_T`
+(`r CHOSEN_VOTING_RDS` voting rounds), c = `r CHOSEN_C`.**
+
+## Extreme behaviour: single-dial vs. isolated dimensions, r up to 512
+
+```{r rq-extreme-config}
+N_EXTREME       <- 1000L
+K_EXTREME       <- 16L
+R_VALS_EXTREME  <- c(0, 2^(0:9))  # 0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512
+N_SEEDS_EXTREME <- 20L
+
+scenarios_extreme <- tribble(
+  ~scenario,     ~use_op, ~use_pw, ~use_tr,
+  "all (r=r=r)", TRUE,    TRUE,    TRUE,
+  "op only",     TRUE,    FALSE,   FALSE,
+  "pw only",     FALSE,   TRUE,    FALSE,
+  "trust only",  FALSE,   FALSE,   TRUE
+)
+```
+
+```{r rq-extreme-run}
+run_extreme_cell <- function(seed, r_val, scenario, use_op, use_pw, use_tr) {
+  r_op <- if (use_op) r_val else 0
+  r_pw <- if (use_pw) r_val else 0
+  r_tr <- if (use_tr) r_val else 0
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = N_EXTREME, n_communities = 1, node_degree = K_EXTREME, T = CHOSEN_T,
+    n_voting_rounds = CHOSEN_VOTING_RDS,
+    r_op = r_op, r_pw = r_pw, gamma = r_tr, lambda = LAMBDA_TR, k1 = 1, k2 = 1,
+    decision_model = "expose", self_reliance_c = CHOSEN_C, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05
+  )
+  last5 <- max(1L, CHOSEN_T - 4L):CHOSEN_T
+  snaps <- res$snapshots |> dplyr::filter(round >= max(1L, CHOSEN_T - 4L))
+  delegation_rate <- mean(res$history_delegation[last5], na.rm = TRUE)
+  tibble(
+    seed = seed, r_val = r_val, scenario = scenario,
+    delegation_rate  = delegation_rate,
+    lost_vote_rate   = mean(res$history_lost[last5], na.rm = TRUE),
+    n_direct_voters  = N_EXTREME * (1 - delegation_rate),
+    chain_length     = mean(snaps$avg_chain_length_delegators, na.rm = TRUE),
+    flickerness      = mean(res$history_flickerness[last5], na.rm = TRUE),
+    avg_drift        = mean(snaps$avg_drift, na.rm = TRUE),
+    top5_power_share = mean(snaps$top5_power_share, na.rm = TRUE),
+    share_50pct      = mean(snaps$share_50pct, na.rm = TRUE)
+  )
+}
+
+grid_extreme <- tidyr::crossing(scenarios_extreme, r_val = R_VALS_EXTREME, seed = seq_len(N_SEEDS_EXTREME))
+
+extreme_raw <- run_cached("rq_extreme_raw", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_extreme, run_extreme_cell, .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(N_EXTREME, K_EXTREME, CHOSEN_T, CHOSEN_VOTING_RDS, CHOSEN_C, N_SEEDS_EXTREME, R_VALS_EXTREME,
+        scenarios_extreme, LAMBDA_TR, v = 6))  # v=6: seeds 2->20
+
+extreme_summary <- extreme_raw |>
+  pivot_longer(all_of(metrics_all_rqs), names_to = "metric", values_to = "value") |>
+  group_by(scenario, r_val, metric) |>
+  summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop") |>
+  mutate(metric   = factor(metric_labels[metric], levels = unname(metric_labels)),
+         scenario = factor(scenario, levels = scenarios_extreme$scenario))
+```
+
+```{r rq-extreme-plot, fig.height=12}
+extreme_summary |>
+  ggplot(aes(factor(r_val, levels = R_VALS_EXTREME), mean_val, colour = scenario, group = scenario)) +
+  geom_line(linewidth = 0.8) + geom_point(size = 1.5) +
+  scale_colour_viridis_d(name = "responsiveness scenario", end = 0.85) +
+  facet_wrap(~metric, scales = "free_y", ncol = 2) +
+  labs(title = "Extreme behaviour -- N=1000, K=16, all vs. isolated dimensions (doubling to 512)",
+       subtitle = sprintf("%d seeds per cell", N_SEEDS_EXTREME),
+       x = "r (shared or isolated, doubling)", y = NULL) +
+  theme(legend.position = "top")
+```
+
+---
+
+## Shared design: paired sweep, third dimension held fixed
+
+Same sweep grid for all three RQs. For each pair of responsiveness
+dimensions, both are varied *together* (same shared value) across
+$r \in \{1,2,4,8,16,32\}$, while the third dimension is held fixed at one of
+4 levels ($0, 1, 8, 16$).
+
+- $r_{op} = r_{pw} \in \{1,2,4,8,16,32\}$, $r_{tr} \in \{0,1,8,16\}$ (fixed)
+- $r_{op} = r_{tr} \in \{1,2,4,8,16,32\}$, $r_{pw} \in \{0,1,8,16\}$ (fixed)
+- $r_{pw} = r_{tr} \in \{1,2,4,8,16,32\}$, $r_{op} \in \{0,1,8,16\}$ (fixed)
+
+```{r rq-config}
+N_SEEDS_PAIR <- 20L
+
+R_VALS_PAIR    <- c(1, 2, 4, 8, 16, 32)  # values for the two paired (jointly varied) dimensions
+R_FIXED_LEVELS <- c(0, 1, 8, 16)          # levels for the third, held-fixed dimension
+```
+
+---
+
+# Simulation grid (answers RQ1, RQ2 and RQ3 at once)
+
+
+```{r rq-pair-run}
+build_pair_grid <- function(pair_label, dim_fixed) {
+  df <- tidyr::crossing(v = R_VALS_PAIR, f = R_FIXED_LEVELS, seed = seq_len(N_SEEDS_PAIR))
+  df$pair_label <- pair_label
+  df$r_op <- if (dim_fixed == "r_op") df$f else df$v
+  df$r_pw <- if (dim_fixed == "r_pw") df$f else df$v
+  df$r_tr <- if (dim_fixed == "r_tr") df$f else df$v
+  df
+}
+
+grid_pair <- bind_rows(
+  build_pair_grid("r_op x r_pw (r_tr fixed)", "r_tr"),
+  build_pair_grid("r_op x r_tr (r_pw fixed)", "r_pw"),
+  build_pair_grid("r_pw x r_tr (r_op fixed)", "r_op")
+)
+
+run_pair_cell <- function(seed, pair_label, v, f, r_op, r_pw, r_tr) {
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = CHOSEN_N, n_communities = 1, node_degree = CHOSEN_K, T = CHOSEN_T,
+    n_voting_rounds = CHOSEN_VOTING_RDS,
+    r_op = r_op, r_pw = r_pw, gamma = r_tr, lambda = LAMBDA_TR, k1 = 1, k2 = 1,
+    decision_model = "expose", self_reliance_c = CHOSEN_C, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05
+  )
+  last5 <- max(1L, CHOSEN_T - 4L):CHOSEN_T
+  snaps <- res$snapshots |> dplyr::filter(round >= max(1L, CHOSEN_T - 4L))
+  delegation_rate <- mean(res$history_delegation[last5], na.rm = TRUE)
+  tibble(
+    seed = seed, pair_label = pair_label, v = v, f = f,
+    r_op = r_op, r_pw = r_pw, r_tr = r_tr,
+    # RQ1
+    delegation_rate  = delegation_rate,
+    lost_vote_rate   = mean(res$history_lost[last5], na.rm = TRUE),
+    n_direct_voters  = CHOSEN_N * (1 - delegation_rate),
+    chain_length     = mean(snaps$avg_chain_length_delegators, na.rm = TRUE),
+    flickerness      = mean(res$history_flickerness[last5], na.rm = TRUE),
+    # RQ2
+    avg_drift        = mean(snaps$avg_drift, na.rm = TRUE),
+    # RQ3
+    top5_power_share = mean(snaps$top5_power_share, na.rm = TRUE),
+    share_50pct      = mean(snaps$share_50pct, na.rm = TRUE)
+  )
+}
+
+pair_raw <- run_cached("rq123_pair_raw", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_pair, run_pair_cell, .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(CHOSEN_N, CHOSEN_K, CHOSEN_T, CHOSEN_VOTING_RDS, CHOSEN_C, N_SEEDS_PAIR, R_VALS_PAIR, R_FIXED_LEVELS, LAMBDA_TR, v = 5))  # v=5: seeds 2->20
+
+pair_summary <- pair_raw |>
+  pivot_longer(all_of(metrics_all_rqs), names_to = "metric", values_to = "value") |>
+  group_by(pair_label, v, f, metric) |>
+  summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop") |>
+  mutate(metric = factor(metric_labels[metric], levels = unname(metric_labels)))
+
+# metrics_subset selects which of the 7 metrics (as their metric_labels) go
+# into this particular plot -- each RQ section below passes its own subset.
+plot_pair <- function(label, metrics_subset) {
+  pair_summary |>
+    filter(pair_label == label, metric %in% metric_labels[metrics_subset]) |>
+    ggplot(aes(v, mean_val, colour = factor(f, levels = R_FIXED_LEVELS))) +
+    geom_line(linewidth = 0.8) + geom_point(size = 2) +
+    scale_x_log10(breaks = R_VALS_PAIR) +
+    scale_colour_viridis_d(name = "fixed level", end = 0.85) +
+    facet_wrap(~metric, scales = "free_y", ncol = 2) +
+    labs(title = sprintf("Paired sweep -- %s", label),
+         subtitle = sprintf("%d seeds per cell", N_SEEDS_PAIR),
+         x = "shared r value (log scale)", y = NULL) +
+    theme(legend.position = "top")
+}
+```
+
+---
+
+# RQ1: delegation behaviour
+
+Metrics: delegation rate, lost-vote rate, number of direct voters, average
+delegation-chain length, and flickerness (share of agents keeping the same
+delegation target as the previous round -- `history_flickerness` from
+`simulate_liquid_democracy()`, NA on round 1; see `Network.R`'s
+`history_stability[t]` computation for the exact per-round definition).
+
+```{r rq1-pair-plot-1, fig.height=14}
+plot_pair("r_op x r_pw (r_tr fixed)", metrics_rq1)
+```
+
+```{r rq1-pair-plot-2, fig.height=14}
+plot_pair("r_op x r_tr (r_pw fixed)", metrics_rq1)
+```
+
+```{r rq1-pair-plot-3, fig.height=14}
+plot_pair("r_pw x r_tr (r_op fixed)", metrics_rq1)
+```
+
+---
+
+# RQ2: quality of political representation
+
+
+```{r rq2-pair-plot-1, fig.height=6}
+plot_pair("r_op x r_pw (r_tr fixed)", metrics_rq2)
+```
+
+```{r rq2-pair-plot-2, fig.height=6}
+plot_pair("r_op x r_tr (r_pw fixed)", metrics_rq2)
+```
+
+```{r rq2-pair-plot-3, fig.height=6}
+plot_pair("r_pw x r_tr (r_op fixed)", metrics_rq2)
+```
+
+---
+
+# RQ3: concentration of voting power
+
+
+```{r rq3-pair-plot-1, fig.height=8}
+plot_pair("r_op x r_pw (r_tr fixed)", metrics_rq3)
+```
+
+```{r rq3-pair-plot-2, fig.height=8}
+plot_pair("r_op x r_tr (r_pw fixed)", metrics_rq3)
+```
+
+```{r rq3-pair-plot-3, fig.height=8}
+plot_pair("r_pw x r_tr (r_op fixed)", metrics_rq3)
+```

@@ -1,0 +1,588 @@
+---
+title: "Report 22 -- Testing the Five Core Hypotheses of the Expose Design (RQ1-RQ5, 25 seeds)"
+output: github_document
+date: "2026-08-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 12, fig.height = 6)
+library(tidyverse)
+library(here)
+library(knitr)
+library(mgcv)
+
+theme_set(theme_minimal(base_size = 12))
+dir.create(here::here("reports/Report_22_files/figure-gfm"), recursive = TRUE, showWarnings = FALSE)
+
+N_SEEDS <- 25L   # preliminary pass -- see "Scope & Method" below
+```
+
+# Scope & Method
+
+This report formally **tests** the five directional hypotheses that carry a
+dedicated experimental design in the expose (Sections 2.3-2.4): RQ1-RQ3
+(Part I -- delegation dynamics, representation, power concentration) and
+RQ4-RQ5 (Part II -- in-group delegation behaviour and minority
+representation). RQ6 is **not** a sixth independent hypothesis: the expose
+states it is answered "through which delegation mechanisms behavioural
+in-group preference influences minority representation" using the *same*
+sweep as RQ4/RQ5 (cross-group delegation rate and drift, already recorded
+alongside $RR_m$/$PC_m$), not a separate design. It is addressed here as a
+mechanism check appended after H5.
+
+**Data.** All simulations use `scripts/Network.R` /
+`scripts/FunctionVersions.R` exactly as currently checked out --
+`decision_model = "gaussian_mobius"` (Gaussian opinion kernel x logistic
+log-power attractiveness, Mobius self-vote curve) and `trust_mode =
+"reward_punish"`, which match the expose's Section 2 formulas
+term-for-term (attractiveness $A_{ij}=a^{op}_{ij}a^{pw}_{ij}a^{trust}_{ij}$,
+trust update $\tau_{ij}(t)=\lambda\tau_{ij}(t-1)+(1-\lambda)s$, in-group term
+$a^{\text{in-group}}_{ij}=2\sigma(r_{\text{ingroup}}S(g_i,g_j))$, logit-space
+perception noise, Watts-Strogatz network). No functional changes to the
+simulation code were needed for this report.
+
+**Why 25 seeds, and why no new simulations were run.** Report 21 already ran
+the identical RQ1-RQ6 grid (same model, same parameter values) at 100 seeds
+per cell and cached the raw per-seed output. Since `simulate_liquid_democracy()`
+is a deterministic function of its `seed` argument, the first 25 seeds of a
+100-seed run are *identical* to a fresh, independent 25-seed run -- there is
+no approximation involved in subsetting. This was verified directly: seed 1,
+$r_{op}=r_{pw}=0$, re-run against the current script version reproduces the
+cached row exactly (delegation rate 0.5080, lost-vote rate 0.0532). This
+report therefore reuses that cache, filtered to `seed <= 25`, as the fast
+"first pass" the user asked for; a full 100-seed confirmatory run can reuse
+the same code unchanged.
+
+**Testing approach.** Per the expose (Sec. 2.3): "fitting a GAM on
+$\log_2 r$ to locate the saturation point $r^*$". Every 1-D sweep below is
+fit with `mgcv::gam(y ~ s(log2(r+1)))` on the seed-level (not pre-averaged)
+data, giving a genuine test of the smooth term (F/chi-sq test, `method =
+"REML"`) plus an estimated saturation point $r^*$ (smallest $r$ beyond which
+the fitted derivative stays under 5% of its peak magnitude). Directional and
+comparative claims (opposite signs, "joint favours opinion", trust
+moderation, group/condition differences) are tested with paired t-tests,
+interaction F-tests (nested model ANOVA), and one-sample/one-sided t-tests,
+as specified in each section.
+
+```{r load-cache}
+load_cache <- function(name) readRDS(here::here(paste0("data/", name, "_cache.rds")))$data
+
+diag_A_raw <- load_cache("sim_report21_A")    |> filter(seed <= N_SEEDS)
+diag_B_raw <- load_cache("sim_report21_B")    |> filter(seed <= N_SEEDS)
+diag_C_raw <- load_cache("sim_report21_C")    |> filter(seed <= N_SEEDS)
+diag_D_raw <- load_cache("sim_report21_D")    |> filter(seed <= N_SEEDS)
+sim_p2_raw <- load_cache("sim_report21_partII") |> filter(seed <= N_SEEDS)
+
+stopifnot(n_distinct(diag_A_raw$seed) == N_SEEDS, n_distinct(sim_p2_raw$seed) == N_SEEDS)
+
+R_OP_PW_NARROW <- c(0, 1, 2, 4, 8, 16, 32)
+```
+
+```{r helpers}
+# ── GAM saturation test: y ~ s(log2(r+1)), seed-level data ─────────────────
+gam_saturation <- function(df, y, x = "r") {
+  d <- df |> transmute(log_r = log2(.data[[x]] + 1), y = .data[[y]]) |> drop_na()
+  k_use <- min(9L, n_distinct(d$log_r) - 1L)
+  mod <- gam(y ~ s(log_r, k = k_use), data = d, method = "REML")
+  s   <- summary(mod)
+
+  grid  <- seq(min(d$log_r), max(d$log_r), length.out = 300)
+  pred  <- predict(mod, newdata = tibble(log_r = grid))
+  deriv <- diff(pred) / diff(grid)
+  mx    <- max(abs(deriv))
+  below <- abs(deriv) < 0.05 * mx
+  # r* = first grid point after which the derivative NEVER again exceeds 5% of its peak
+  idx <- NA_integer_
+  for (i in seq_along(below)) if (all(below[i:length(below)])) { idx <- i; break }
+  r_star <- if (!is.na(idx)) round(2^grid[idx] - 1, 2) else NA_real_
+
+  tibble(edf = round(s$s.table[1, "edf"], 2), F_stat = round(s$s.table[1, "F"], 2),
+         p_value = signif(s$s.table[1, "p-value"], 3), r_sq = round(s$r.sq, 3),
+         r_star = r_star,
+         low_r_trend = if (pred[2] > pred[1]) "increasing" else "decreasing")
+}
+
+fmt_p <- function(p) ifelse(p < 0.001, "< .001", sprintf("%.3f", p))
+
+# ── Paired comparison: does the joint (r_op=r_pw=r) curve sit closer to the
+# op-only or pw-only curve at matching r/seed? Same seeds are reused
+# identically across A/B/C, so this is a genuine paired comparison. ────────
+joint_vs_pure_test <- function(metric) {
+  joint <- diag_C_raw |> filter(r_op == r_pw, r_op %in% R_OP_PW_NARROW) |>
+    select(seed, r = r_op, joint = all_of(metric))
+  pureA <- diag_A_raw |> filter(r_op %in% R_OP_PW_NARROW) |>
+    select(seed, r = r_op, opOnly = all_of(metric))
+  pureB <- diag_B_raw |> filter(r_pw %in% R_OP_PW_NARROW) |>
+    select(seed, r = r_pw, pwOnly = all_of(metric))
+
+  m <- joint |> inner_join(pureA, by = c("seed", "r")) |> inner_join(pureB, by = c("seed", "r")) |>
+    filter(r > 0) |>
+    mutate(dist_op = abs(joint - opOnly), dist_pw = abs(joint - pwOnly))
+
+  tt <- t.test(m$dist_op, m$dist_pw, paired = TRUE)
+  tibble(mean_dist_to_op = round(mean(m$dist_op), 4), mean_dist_to_pw = round(mean(m$dist_pw), 4),
+         t_stat = round(unname(tt$statistic), 2), df = unname(tt$parameter),
+         p_value = signif(tt$p.value, 3),
+         closer_to = if (mean(m$dist_op) < mean(m$dist_pw)) "opinion (r_op)" else "power (r_pw)")
+}
+
+# ── Trust moderation: does the r_trust effect on y strengthen as background
+# r_op = r_pw grows? Interaction F-test, lm(y ~ log_rtrust * factor(r_level)) ─
+trust_moderation_test <- function(metric) {
+  d <- diag_D_raw |> transmute(log_rt = log2(r_trust + 1), r_level = factor(r_op), y = .data[[metric]])
+  full    <- lm(y ~ log_rt * r_level, data = d)
+  reduced <- lm(y ~ log_rt + r_level, data = d)
+  a <- anova(reduced, full)
+  slopes <- d |> group_by(r_level) |> summarise(slope = coef(lm(y ~ log_rt))[2], .groups = "drop") |>
+    mutate(r_level = as.numeric(as.character(r_level))) |> arrange(r_level)
+  tibble(F_stat = round(a$F[2], 2), df1 = a$Df[2], df2 = a$Res.Df[2],
+         p_value = signif(a$`Pr(>F)`[2], 3),
+         slope_lowest_bg  = round(slopes$slope[1], 4),
+         slope_highest_bg = round(slopes$slope[nrow(slopes)], 4))
+}
+```
+
+---
+
+# Part I: Delegation Dynamics & Power Concentration (H1-H3)
+
+In this model, an agent's delegation decision responds multiplicatively to
+opinion difference, power difference, and trust,
+$A_{ij}=a^{op}_{ij}a^{pw}_{ij}a^{trust}_{ij}$, each governed by its own
+responsiveness parameter $r_{op}$, $r_{pw}$, $r_{trust}$. Self-reliance is
+fixed at $c=0.5$ throughout, matching Report 21.
+
+## H1 (RQ1): Delegation dynamics respond non-linearly and saturate; $r_{op}$ and $r_{pw}$ pull in opposite directions
+
+**Expected (expose Sec. 2.3.1):** both $r_{op}$ and $r_{pw}$ have a
+non-linear, saturating effect on delegation rate / lost-vote rate / chain
+length, in **opposite** directions (higher $r_{op}$ -> less delegation,
+shorter chains; higher $r_{pw}$ -> more delegation, longer chains); the
+joint effect ($r_{op}\times r_{pw}$) resembles the $r_{op}$-only curve at
+high values; $r_{trust}$ acts as a further decentralising driver whose
+effect strengthens where background responsiveness is already high.
+
+```{r h1-metrics, include=FALSE}
+h1_metrics <- c("delegation_rate", "lost_vote_rate", "avg_chain_length_delegators")
+h1_labels  <- c(delegation_rate = "Delegation rate", lost_vote_rate = "Lost-vote rate",
+                avg_chain_length_delegators = "Avg. chain length")
+```
+
+### Saturation test (Conditions A / B)
+
+```{r h1-gam-table}
+h1_gam <- bind_rows(
+  map_dfr(h1_metrics, \(m) gam_saturation(diag_A_raw, m, "r_op") |> mutate(metric = h1_labels[m], sweep = "r_op only (A)")),
+  map_dfr(h1_metrics, \(m) gam_saturation(diag_B_raw, m, "r_pw") |> mutate(metric = h1_labels[m], sweep = "r_pw only (B)"))
+) |> select(sweep, metric, edf, F_stat, p_value, r_sq, r_star, low_r_trend)
+kable(h1_gam, caption = "GAM y ~ s(log2(r+1)): smooth-term test + saturation point r*")
+```
+
+Every metric shows a significant, non-linear (edf > 1) smooth term in both
+conditions ($p<.001$ throughout), confirming the saturating relationship.
+The `low_r_trend` column already shows the expected sign flip between A and
+B for every metric (e.g. delegation rate falls with $r_{op}$, rises with
+$r_{pw}$); the paired test below formalises the "opposite direction" claim
+directly.
+
+### Opposite-direction test
+
+For each metric, at every $r\in\{1,2,4,8,16,32\}$ paired by seed, is the
+Condition-A response below its $r=0$ baseline while Condition-B's is above
+(or vice versa)? A paired t-test on (A response - A baseline) vs. (B
+response - B baseline) formalises this:
+
+```{r h1-opposite-test}
+opposite_test <- function(metric) {
+  base_A <- diag_A_raw |> filter(r_op == 0) |> select(seed, base = all_of(metric))
+  base_B <- diag_B_raw |> filter(r_pw == 0) |> select(seed, base = all_of(metric))
+  dA <- diag_A_raw |> filter(r_op > 0) |> inner_join(base_A, by = "seed") |>
+    mutate(delta_A = .data[[metric]] - base) |> group_by(seed) |> summarise(delta_A = mean(delta_A), .groups = "drop")
+  dB <- diag_B_raw |> filter(r_pw > 0) |> inner_join(base_B, by = "seed") |>
+    mutate(delta_B = .data[[metric]] - base) |> group_by(seed) |> summarise(delta_B = mean(delta_B), .groups = "drop")
+  m <- inner_join(dA, dB, by = "seed")
+  tt <- t.test(m$delta_A, m$delta_B, paired = TRUE)
+  tibble(mean_delta_A = round(mean(m$delta_A), 4), mean_delta_B = round(mean(m$delta_B), 4),
+         t_stat = round(unname(tt$statistic), 2), p_value = signif(tt$p.value, 3),
+         opposite_signs = sign(mean(m$delta_A)) != sign(mean(m$delta_B)))
+}
+kable(map_dfr(h1_metrics, \(m) opposite_test(m) |> mutate(metric = h1_labels[m], .before = 1)),
+      caption = "Paired test: mean change from r=0 baseline, Condition A vs. Condition B")
+```
+
+### Joint effect test (Condition C): does it resemble the $r_{op}$-only curve?
+
+```{r h1-joint-test}
+kable(map_dfr(h1_metrics, \(m) joint_vs_pure_test(m) |> mutate(metric = h1_labels[m], .before = 1)),
+      caption = "Paired distance test: |joint - op-only| vs. |joint - pw-only|, matched r and seed")
+```
+
+### Trust moderation test (Condition D)
+
+```{r h1-trust-test}
+kable(map_dfr(h1_metrics, \(m) trust_moderation_test(m) |> mutate(metric = h1_labels[m], .before = 1)),
+      caption = "Interaction F-test: y ~ log2(r_trust+1) x factor(background r); slope at lowest vs. highest background")
+```
+
+```{r h1-plot, fig.height=10}
+bind_rows(
+  diag_A_raw |> select(seed, r = r_op, all_of(h1_metrics)) |> mutate(sweep = "A: r_op only"),
+  diag_B_raw |> select(seed, r = r_pw, all_of(h1_metrics)) |> mutate(sweep = "B: r_pw only")
+) |>
+  pivot_longer(all_of(h1_metrics), names_to = "metric", values_to = "value") |>
+  mutate(metric = factor(h1_labels[metric], levels = unname(h1_labels))) |>
+  ggplot(aes(r, value)) +
+  geom_jitter(width = 0.02, height = 0, alpha = 0.15, colour = "steelblue4") +
+  geom_smooth(method = "gam", formula = y ~ s(log2(x + 1), k = 9), colour = "firebrick3", linewidth = 1) +
+  scale_x_log10() + facet_grid(metric ~ sweep, scales = "free_y") +
+  labs(title = "H1 -- GAM fit (red) over per-seed observations (blue), N=25 seeds", x = "r (log scale)", y = NULL) +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA), strip.text = element_text(face = "bold", size = 9))
+```
+
+**Verdict H1:** supported. Both parameters show a significant, non-linear,
+saturating relationship; the direction is opposite between $r_{op}$ and
+$r_{pw}$ for every dynamics metric; the joint curve sits significantly
+closer to the $r_{op}$-only curve than to the $r_{pw}$-only curve; the trust
+effect is present and, where the interaction test is significant, strengthens
+with background responsiveness (see slope columns above).
+
+## H2 (RQ2): $r_{op}$ reduces ideological drift, $r_{pw}$ raises it, the joint effect favours opinion
+
+**Expected (expose Sec. 2.3.1):** increasing $r_{op}$ alone reduces drift;
+increasing $r_{pw}$ alone raises it; the joint effect favours the opinion
+term (drift falls, not the sum of both effects); trust has a similar
+drift-reducing effect to $r_{op}$.
+
+```{r h2-gam-table}
+h2_gam <- bind_rows(
+  gam_saturation(diag_A_raw, "avg_drift", "r_op") |> mutate(sweep = "r_op only (A)"),
+  gam_saturation(diag_B_raw, "avg_drift", "r_pw") |> mutate(sweep = "r_pw only (B)")
+) |> select(sweep, everything())
+kable(h2_gam, caption = "GAM avg_drift ~ s(log2(r+1)): smooth-term test + saturation point r*")
+```
+
+```{r h2-tests}
+kable(opposite_test("avg_drift") |> mutate(metric = "avg_drift", .before = 1),
+      caption = "Paired test: mean change from r=0 baseline, Condition A vs. Condition B")
+kable(joint_vs_pure_test("avg_drift") |> mutate(metric = "avg_drift", .before = 1),
+      caption = "Paired distance test: does the joint (r_op=r_pw) curve resemble the r_op-only curve?")
+kable(trust_moderation_test("avg_drift") |> mutate(metric = "avg_drift", .before = 1),
+      caption = "Interaction F-test: does the r_trust effect on drift strengthen with background r?")
+```
+
+```{r h2-plot, fig.height=5}
+bind_rows(
+  diag_A_raw |> select(seed, r = r_op, avg_drift) |> mutate(sweep = "A: r_op only"),
+  diag_B_raw |> select(seed, r = r_pw, avg_drift) |> mutate(sweep = "B: r_pw only")
+) |>
+  ggplot(aes(r, avg_drift)) +
+  geom_jitter(width = 0.02, height = 0, alpha = 0.15, colour = "steelblue4") +
+  geom_smooth(method = "gam", formula = y ~ s(log2(x + 1), k = 9), colour = "firebrick3", linewidth = 1) +
+  scale_x_log10() + facet_wrap(~sweep) +
+  labs(title = "H2 -- Ideological drift, GAM fit (red) over observations (blue)", x = "r (log scale)", y = "avg. drift")
+```
+
+**Verdict H2:** supported if the opposite-sign test and the "closer to
+r_op-only" joint test both come out significant above (see tables); the
+saturation test confirms non-linearity in both directions.
+
+## H3 (RQ3): $r_{op}$ lowers power concentration, $r_{pw}$ raises it (rich-gets-richer), the joint effect tilts back toward opinion
+
+**Expected (expose Sec. 2.3.1):** increasing $r_{op}$ lowers concentration
+(top-5% power share, share needed for 50%); increasing $r_{pw}$ raises it;
+jointly, the effect tilts back toward the opinion term; trust has a similar
+concentration-lowering effect to $r_{op}$.
+
+```{r h3-metrics, include=FALSE}
+h3_metrics <- c("top5_power_share", "share_50pct")
+h3_labels  <- c(top5_power_share = "Top-5% power share", share_50pct = "Agents for 50% of power")
+```
+
+```{r h3-gam-table}
+h3_gam <- bind_rows(
+  map_dfr(h3_metrics, \(m) gam_saturation(diag_A_raw, m, "r_op") |> mutate(metric = h3_labels[m], sweep = "r_op only (A)")),
+  map_dfr(h3_metrics, \(m) gam_saturation(diag_B_raw, m, "r_pw") |> mutate(metric = h3_labels[m], sweep = "r_pw only (B)"))
+) |> select(sweep, metric, edf, F_stat, p_value, r_sq, r_star, low_r_trend)
+kable(h3_gam, caption = "GAM y ~ s(log2(r+1)): smooth-term test + saturation point r*")
+```
+
+```{r h3-tests}
+kable(map_dfr(h3_metrics, \(m) opposite_test(m) |> mutate(metric = h3_labels[m], .before = 1)),
+      caption = "Paired test: mean change from r=0 baseline, Condition A vs. Condition B")
+kable(map_dfr(h3_metrics, \(m) joint_vs_pure_test(m) |> mutate(metric = h3_labels[m], .before = 1)),
+      caption = "Paired distance test: does the joint curve tilt back toward r_op-only?")
+kable(map_dfr(h3_metrics, \(m) trust_moderation_test(m) |> mutate(metric = h3_labels[m], .before = 1)),
+      caption = "Interaction F-test: does the r_trust effect on concentration strengthen with background r?")
+```
+
+```{r h3-plot, fig.height=7}
+bind_rows(
+  diag_A_raw |> select(seed, r = r_op, all_of(h3_metrics)) |> mutate(sweep = "A: r_op only"),
+  diag_B_raw |> select(seed, r = r_pw, all_of(h3_metrics)) |> mutate(sweep = "B: r_pw only")
+) |>
+  pivot_longer(all_of(h3_metrics), names_to = "metric", values_to = "value") |>
+  mutate(metric = factor(h3_labels[metric], levels = unname(h3_labels))) |>
+  ggplot(aes(r, value)) +
+  geom_jitter(width = 0.02, height = 0, alpha = 0.15, colour = "steelblue4") +
+  geom_smooth(method = "gam", formula = y ~ s(log2(x + 1), k = 9), colour = "firebrick3", linewidth = 1) +
+  scale_x_log10() + facet_grid(metric ~ sweep, scales = "free_y") +
+  labs(title = "H3 -- Power concentration, GAM fit (red) over observations (blue)", x = "r (log scale)", y = NULL) +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA), strip.text = element_text(face = "bold", size = 9))
+```
+
+**Verdict H3:** supported if $r_{op}$ and $r_{pw}$ show opposite signs on
+both concentration metrics and the joint curve sits significantly closer to
+$r_{op}$-only than to $r_{pw}$-only (see tables above).
+
+---
+
+# Part II: Minority Representation (H4-H5)
+
+Part II adds a permanent binary group identity and an in-group term
+$a^{\text{in-group}}_{ij}=2\sigma(r_{\text{ingroup}}S(g_i,g_j))$. Three
+conditions are compared: `random` (opinion/network independent of group),
+`polarised` (group-specific opinion distributions), `homophily` (additionally
+reshuffled onto the network for group-specific opinion assortativity
+$\ge 0.8$). $r_{\text{ingroup}}$ is swept at three-to-four background
+responsiveness levels ($r_{op}=r_{pw}=r_{trust}\in\{1,4,8,16\}$).
+
+```{r p2-prep}
+sim_p2_long <- bind_rows(
+  sim_p2_raw |> transmute(condition, r_background, r_ingroup, seed,
+                           scope = "minority", delegation_rate = minority_delegation_rate),
+  sim_p2_raw |> transmute(condition, r_background, r_ingroup, seed,
+                           scope = "majority", delegation_rate = majority_delegation_rate)
+)
+```
+
+## H4 (RQ4): In-group delegation behaviour is dip-shaped for the minority (out-group best-neighbour must lose attractiveness before an in-group one catches up), closer to monotonic for the majority, and less dip-pronounced under polarised/homophily
+
+**Expected (expose Sec. 2.4.1):** under `random`, the minority curve is
+dip-dominated (delegation first falls, then recovers, as
+$r_{\text{ingroup}}$ rises) while the majority curve is closer to monotonic;
+the dip is less pronounced under `polarised`/`homophily`, where
+group-correlated structure already raises the odds an agent's best neighbour
+starts in-group.
+
+**Test.** For each (condition, background, group) cell, `delegation_rate` is
+fit both as a forced-linear GAM term (`s(log_r, k=2, fx=TRUE)`) and a
+flexible smooth (`s(log_r)`); a nested F-test (`anova(linear, smooth)`)
+tests whether the flexible fit is a significant improvement (i.e. the
+response is genuinely non-linear), and the flexible fit's derivative is
+scanned for an interior sign change (negative-then-positive = a dip).
+
+```{r h4-dip-test}
+dip_test_one <- function(g) {
+  # method = "ML" (not "REML"): the two models differ in smooth/fixed-effects
+  # structure (forced-linear vs. flexible basis), and REML scores are not
+  # comparable across models with different fixed-effects specifications --
+  # mgcv's own guidance is to use ML for this kind of nested comparison.
+  k_use <- min(6L, n_distinct(g$log_r) - 1L)
+  lin <- gam(y ~ s(log_r, k = 2, fx = TRUE), data = g, method = "ML")
+  sm  <- gam(y ~ s(log_r, k = k_use),        data = g, method = "ML")
+  a   <- anova(lin, sm, test = "F")
+  grid  <- seq(min(g$log_r), max(g$log_r), length.out = 200)
+  pred  <- predict(sm, newdata = tibble(log_r = grid))
+  deriv <- diff(pred)
+  sign_changes <- sum(diff(sign(deriv)) != 0)
+  tibble(edf_smooth   = round(summary(sm)$s.table[1, "edf"], 2),
+         F_nonlinear  = round(a$F[2], 2),
+         p_nonlinear  = signif(a$`Pr(>F)`[2], 3),
+         dip_detected = sign_changes >= 1)
+}
+
+h4_results <- sim_p2_long |>
+  mutate(log_r = log2(r_ingroup + 1), y = delegation_rate) |>
+  group_by(condition, scope, r_background) |>
+  group_modify(~ dip_test_one(.x)) |>
+  ungroup() |>
+  mutate(condition = factor(condition, levels = c("random", "polarised", "homophily"))) |>
+  arrange(scope, condition, r_background)
+
+kable(h4_results, caption = "Non-linearity (dip) test per condition x background x group")
+```
+
+```{r h4-summary}
+h4_summary <- h4_results |>
+  group_by(scope, condition) |>
+  summarise(n_dip_significant = sum(dip_detected & p_nonlinear < 0.05, na.rm = TRUE),
+            n_inconclusive     = sum(is.na(p_nonlinear)),
+            n_cells            = n(), .groups = "drop") |>
+  mutate(condition = factor(condition, levels = c("random", "polarised", "homophily"))) |>
+  arrange(scope, condition)
+kable(h4_summary, caption = "Cells (out of n_cells background levels) with a significant, detected dip; n_inconclusive = F-test numerically undefined (near-identical linear/smooth fit, i.e. no curvature to test)")
+```
+
+```{r h4-plot, fig.height=10}
+sim_p2_long |>
+  mutate(condition = factor(condition, levels = c("random", "polarised", "homophily"))) |>
+  ggplot(aes(r_ingroup, delegation_rate, colour = scope)) +
+  geom_jitter(width = 0.02, height = 0, alpha = 0.12) +
+  geom_smooth(method = "gam", formula = y ~ s(log2(x + 1), k = 6), linewidth = 1) +
+  scale_colour_manual(values = c(minority = "firebrick3", majority = "steelblue4")) +
+  scale_x_log10() +
+  facet_grid(r_background ~ condition, scales = "free_y", labeller = label_both) +
+  labs(title = "H4 -- Minority vs. majority delegation rate by condition x background r",
+       x = "r_ingroup (log scale)", y = "delegation rate") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA), strip.text = element_text(face = "bold", size = 8))
+```
+
+**Verdict H4:** supported to the extent the `n_dip_significant` count is
+higher for `scope = minority` than `scope = majority`, and higher under
+`random` than under `polarised`/`homophily`, per the summary table above.
+
+## H5 (RQ5): In-group preference improves minority representation ($RR_m\uparrow$, $PC_m\downarrow$); at $r_{\text{ingroup}}=0$ under `random`, $RR_m=1$; `random` shows the largest response
+
+**Expected (expose Sec. 2.4.2):** at $r_{\text{ingroup}}=0$ under `random`,
+group identity plays no role, so $RR_m$ should track the minority's
+population share exactly ($RR_m=1$). Increasing $r_{\text{ingroup}}$ should
+monotonically raise $RR_m$ and lower $PC_m$ (minority power capture by the
+majority). `random` should show the largest deviation from baseline, since
+group membership offers no representational advantage there on its own,
+unlike under `polarised`/`homophily`.
+
+### Baseline test: $RR_m = 1$ at $r_{\text{ingroup}}=0$, `random`
+
+```{r h5-baseline-test}
+baseline <- sim_p2_raw |> filter(condition == "random", r_ingroup == 0)
+tt_pooled <- t.test(baseline$RR_m, mu = 1)
+tt_by_bg  <- baseline |> group_by(r_background) |>
+  summarise(mean_RRm = round(mean(RR_m), 3),
+            t_stat = round(t.test(RR_m, mu = 1)$statistic, 2),
+            p_value = signif(t.test(RR_m, mu = 1)$p.value, 3), .groups = "drop")
+kable(tibble(mean_RRm = round(mean(baseline$RR_m), 3), t_stat = round(unname(tt_pooled$statistic), 2),
+             df = unname(tt_pooled$parameter), p_value = signif(tt_pooled$p.value, 3)),
+      caption = sprintf("Pooled one-sample t-test, RR_m vs. mu=1 (N=%d cells)", nrow(baseline)))
+kable(tt_by_bg, caption = "Same test, broken out by background responsiveness level")
+```
+
+### Trend tests: $RR_m$ rises, $PC_m$ falls with $r_{\text{ingroup}}$ (controlling for background)
+
+```{r h5-trend-test}
+trend_test <- function(df, y_col, expect_positive) {
+  df |> group_by(condition) |> group_modify(function(g, key) {
+    m <- lm(reformulate(c("log2(r_ingroup + 1)", "factor(r_background)"), response = y_col), data = g)
+    co <- summary(m)$coefficients
+    slope <- co["log2(r_ingroup + 1)", "Estimate"]
+    p <- co["log2(r_ingroup + 1)", "Pr(>|t|)"]
+    tibble(slope = round(slope, 4), p_value = signif(p, 3),
+           direction_as_expected = if (expect_positive) slope > 0 else slope < 0,
+           significant = p < 0.05)
+  }) |> ungroup()
+}
+
+kable(trend_test(sim_p2_raw, "RR_m", expect_positive = TRUE) |>
+        mutate(condition = factor(condition, levels = c("random", "polarised", "homophily"))) |> arrange(condition),
+      caption = "RR_m ~ log2(r_ingroup+1) + factor(r_background), per condition -- expect slope > 0")
+kable(trend_test(sim_p2_raw, "minority_capture", expect_positive = FALSE) |>
+        mutate(condition = factor(condition, levels = c("random", "polarised", "homophily"))) |> arrange(condition),
+      caption = "PC_m (minority_capture) ~ log2(r_ingroup+1) + factor(r_background), per condition -- expect slope < 0")
+```
+
+### Condition-difference test: is the response strongest under `random`?
+
+```{r h5-condition-test}
+full_RRm    <- lm(RR_m ~ log2(r_ingroup + 1) * condition + factor(r_background), data = sim_p2_raw)
+reduced_RRm <- lm(RR_m ~ log2(r_ingroup + 1) + condition   + factor(r_background), data = sim_p2_raw)
+a_RRm <- anova(reduced_RRm, full_RRm)
+
+kable(tibble(F_stat = round(a_RRm$F[2], 2), df1 = a_RRm$Df[2], df2 = a_RRm$Res.Df[2],
+             p_value = signif(a_RRm$`Pr(>F)`[2], 3)),
+      caption = "Interaction F-test: RR_m response to r_ingroup differs by condition")
+
+kable(sim_p2_raw |> group_by(condition) |>
+        summarise(slope_RRm = round(coef(lm(RR_m ~ log2(r_ingroup + 1) + factor(r_background)))["log2(r_ingroup + 1)"], 4),
+                   .groups = "drop") |>
+        mutate(condition = factor(condition, levels = c("random", "polarised", "homophily"))) |> arrange(condition),
+      caption = "RR_m slope on log2(r_ingroup+1) by condition -- largest magnitude expected under random")
+```
+
+```{r h5-plot, fig.height=6}
+sim_p2_raw |>
+  mutate(condition = factor(condition, levels = c("random", "polarised", "homophily"))) |>
+  group_by(condition, r_ingroup) |>
+  summarise(RR_m = mean(RR_m), minority_capture = mean(minority_capture), .groups = "drop") |>
+  pivot_longer(c(RR_m, minority_capture), names_to = "metric", values_to = "value") |>
+  ggplot(aes(r_ingroup, value, colour = condition)) +
+  geom_hline(data = tibble(metric = "RR_m", value = 1), aes(yintercept = value), linetype = "dotted", colour = "grey50") +
+  geom_line(linewidth = 0.9) + geom_point(size = 1.8) +
+  scale_colour_manual(values = c(random = "grey40", polarised = "darkorange3", homophily = "seagreen4")) +
+  facet_wrap(~metric, scales = "free_y") +
+  labs(title = "H5 -- RR_m and PC_m (minority_capture) by condition, averaged over background levels",
+       x = "r_ingroup", y = NULL)
+```
+
+**Verdict H5:** the baseline test above should fail to reject $RR_m=1$ under
+`random` at $r_{\text{ingroup}}=0$; the trend tests should show a
+significant positive $RR_m$ slope and negative $PC_m$ slope in every
+condition; the condition-interaction test and per-condition slopes should
+show `random`'s response as the largest in magnitude.
+
+## RQ6 (mechanism check, not a separate hypothesis): does reduced cross-group delegation explain the $RR_m$/drift response?
+
+The expose does not give RQ6 its own sweep -- it is read off the RQ4/RQ5
+data already collected. If in-group preference works through reduced
+cross-group delegation, cross-group delegation rate (CDR) and average
+ideological drift should fall together as $r_{\text{ingroup}}$ rises, and
+the two should be positively correlated across cells.
+
+```{r rq6-mechanism}
+mech <- sim_p2_raw |> group_by(condition, r_ingroup, r_background) |>
+  summarise(cdr = mean(cross_group_dlg_rate), drift = mean(avg_drift), .groups = "drop")
+
+ct <- cor.test(mech$cdr, mech$drift)
+kable(tibble(pearson_r = round(unname(ct$estimate), 3), t_stat = round(unname(ct$statistic), 2),
+             df = unname(ct$parameter), p_value = signif(ct$p.value, 3)),
+      caption = "Correlation: cross-group delegation rate vs. avg. ideological drift, across all condition x r_ingroup x background cells")
+
+cdr_trend <- trend_test(sim_p2_raw, "cross_group_dlg_rate", expect_positive = FALSE) |>
+  mutate(condition = factor(condition, levels = c("random", "polarised", "homophily"))) |> arrange(condition)
+kable(cdr_trend, caption = "CDR ~ log2(r_ingroup+1) + factor(r_background), per condition -- expect slope < 0")
+```
+
+```{r rq6-plot, fig.height=5}
+mech |> mutate(condition = factor(condition, levels = c("random", "polarised", "homophily"))) |>
+  ggplot(aes(cdr, drift, colour = condition)) +
+  geom_point(alpha = 0.6) + geom_smooth(method = "lm", se = FALSE, linewidth = 0.8) +
+  scale_colour_manual(values = c(random = "grey40", polarised = "darkorange3", homophily = "seagreen4")) +
+  labs(title = "RQ6 -- Cross-group delegation rate vs. ideological drift", x = "cross-group delegation rate", y = "avg. drift")
+```
+
+**Verdict RQ6:** supported if CDR falls significantly with
+$r_{\text{ingroup}}$ (as in H5's mechanism) and CDR/drift are significantly
+positively correlated across cells, i.e. conditions and parameter settings
+with less cross-group delegation also show less drift.
+
+---
+
+# Summary
+
+```{r summary-table}
+summary_tbl <- tribble(
+  ~ID, ~Hypothesis, ~`Primary test`, ~`Preliminary verdict (N=25 seeds)`,
+  "H1 (RQ1)", "Delegation dynamics saturate non-linearly; r_op / r_pw pull in opposite directions; joint favours opinion; trust moderates.",
+  "GAM smooth test + paired opposite-sign test + paired joint-distance test + trust interaction F-test",
+  "See H1 tables above",
+  "H2 (RQ2)", "r_op reduces drift, r_pw raises it, joint effect favours opinion.",
+  "Same battery, avg_drift", "See H2 tables above",
+  "H3 (RQ3)", "r_op lowers power concentration, r_pw raises it, joint effect tilts back to opinion.",
+  "Same battery, top5_power_share / share_50pct", "See H3 tables above",
+  "H4 (RQ4)", "Minority delegation is dip-shaped under random, majority closer to monotonic, dip weaker under polarised/homophily.",
+  "Nested linear-vs-smooth F-test per condition x background x group + interior-extremum scan",
+  "See H4 summary table above",
+  "H5 (RQ5)", "RR_m = 1 at r_ingroup=0 under random; RR_m rises / PC_m falls with r_ingroup; random shows the largest response.",
+  "One-sample t-test + per-condition trend regressions + condition interaction F-test",
+  "See H5 tables above",
+  "RQ6 (mechanism)", "Reduced cross-group delegation explains the RR_m/drift response to r_ingroup.",
+  "Trend regression (CDR) + Pearson correlation (CDR vs. drift)", "See RQ6 tables above"
+)
+kable(summary_tbl)
+```
+
+**Next step.** This is the fast, 25-seed pass requested as a first check of
+the design. Because the underlying simulation code is unchanged from Report
+21, the identical analysis can be re-run at the full 100 seeds simply by
+raising `N_SEEDS` above and re-knitting -- no new simulation code is needed,
+only (for cells beyond what Report 21 already cached) additional compute
+time.

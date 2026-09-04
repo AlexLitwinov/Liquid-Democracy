@@ -74,6 +74,54 @@ find_roots_vectorized <- function(n, delegate_of) {
 }
 
 # =============================================================
+# CYCLE LENGTH BREAKDOWN (RQ1 -- how many agents are stuck in a 2-cycle
+# specifically, vs. longer cycles)
+#
+# in_cycle (see find_roots_vectorized above) flags every agent whose chain
+# never reaches a root -- that includes genuine cycle MEMBERS but also
+# "tail" agents who merely feed into a cycle without looping back to
+# themselves (e.g. 1 -> 29 -> 26 -> 23 -> [23<->24<->25 cycle], forever --
+# 1/29/26 never revisit themselves). Naively following delegate_of from
+# such a tail agent until it equals `start` again never terminates. Fixed
+# here by bounding each traversal at n_cand steps (more than enough to
+# complete any genuine cycle, since a cycle can involve at most all
+# candidates) and only recording a cycle_length when the walk actually
+# closes back on `start`; tail agents get NA (their vote is still lost --
+# counted in lost_vote_rate as before -- they're just not a cycle member,
+# so no single cycle_length applies to them).
+#
+# Returns an integer vector of length n: cycle length for genuine cycle
+# members, NA for everyone else (roots, direct voters, and tail agents).
+# =============================================================
+
+compute_cycle_lengths <- function(n, delegate_of, in_cycle) {
+  cyc_len <- rep(NA_integer_, n)
+  visited <- rep(FALSE, n)
+  cand    <- which(in_cycle)
+  n_cand  <- length(cand)
+  for (start in cand) {
+    if (visited[start]) next
+    path  <- start
+    cur   <- delegate_of[start]
+    steps <- 1L
+    closed <- FALSE
+    while (steps <= n_cand) {
+      if (cur == start) { closed <- TRUE; break }
+      path  <- c(path, cur)
+      cur   <- delegate_of[cur]
+      steps <- steps + 1L
+    }
+    if (closed) {
+      visited[path] <- TRUE
+      cyc_len[path] <- length(path)
+    } else {
+      visited[start] <- TRUE   # tail agent -- leave cyc_len[start] = NA
+    }
+  }
+  cyc_len
+}
+
+# =============================================================
 # POWER COMPUTATION (vectorized)
 # Every agent starts with power = 1 (their own vote).
 # Agents who receive delegations accumulate power transitively:
@@ -95,6 +143,20 @@ compute_power <- function(n, edge_from, edge_to) {
   if (length(valid)) {
     root_counts <- tabulate(roots[valid], nbins = n)
     power <- power + root_counts
+  }
+
+  # Sec 2.2.7: for a delegation cycle, the recursion never terminates, so
+  # "each agent in a loop is... assigned a voting power equal to the number
+  # of agents in the corresponding subgraph" -- overwrite genuine cycle
+  # members' power with their cycle's size (tail agents that merely feed
+  # into a cycle without looping back to themselves keep the baseline
+  # power = 1, since the Expose only specifies the rule for agents actually
+  # "involved in the loop"; see compute_cycle_lengths()'s docstring).
+  in_cycle <- is.na(roots)
+  if (any(in_cycle)) {
+    cyc_len <- compute_cycle_lengths(n, delegate_of, in_cycle)
+    has_len <- !is.na(cyc_len)
+    power[has_len] <- cyc_len[has_len]
   }
   power
 }
@@ -129,10 +191,11 @@ propagate_votes <- function(opinion, n, edge_from, edge_to) {
 # =============================================================
 
 compute_power_and_votes <- function(opinion, n, edge_from, edge_to) {
-  power <- rep(1L, n)
-  votes <- opinion
-  roots <- seq_len(n)  # no delegations: everyone is their own root
-  if (!length(edge_from)) return(list(power = power, votes = votes, roots = roots))
+  power   <- rep(1L, n)
+  votes   <- opinion
+  roots   <- seq_len(n)  # no delegations: everyone is their own root
+  cyc_len <- rep(NA_integer_, n)
+  if (!length(edge_from)) return(list(power = power, votes = votes, roots = roots, cyc_len = cyc_len))
 
   delegate_of <- integer(n)
   delegate_of[edge_from] <- edge_to
@@ -146,7 +209,17 @@ compute_power_and_votes <- function(opinion, n, edge_from, edge_to) {
   votes[edge_from[ok]]  <- opinion[r[ok]]
   votes[edge_from[!ok]] <- NA_real_
 
-  list(power = power, votes = votes, roots = roots)
+  # Sec 2.2.7 cycle-power rule -- see compute_power() above for the full
+  # rationale. cyc_len is also returned so callers (the main round loop)
+  # don't need to recompute it a second time for cycle-length diagnostics.
+  in_cycle <- is.na(roots)
+  if (any(in_cycle)) {
+    cyc_len <- compute_cycle_lengths(n, delegate_of, in_cycle)
+    has_len <- !is.na(cyc_len)
+    power[has_len] <- cyc_len[has_len]
+  }
+
+  list(power = power, votes = votes, roots = roots, cyc_len = cyc_len)
 }
 
 # =============================================================
@@ -193,34 +266,58 @@ setup_agents <- function(n_per_community, n_communities, seed = 1,
 # =============================================================
 
 setup_friendship_network <- function(agents, n_communities, node_degree,
-                                     p_rewire = 0.05, seed = 1) {
+                                     p_rewire = 0.05, seed = 1,
+                                     network_type = "ws") {
+  # network_type = "ws" (default, unchanged behaviour): Watts-Strogatz ring
+  #   + rewiring, as above.
+  # network_type = "ba": Barabasi-Albert preferential attachment (RQ1 --
+  #   tests the "rich-gets-richer" dynamic against r_pw, which WS cannot
+  #   produce regardless of p_rewire since its degree distribution stays
+  #   narrow/homogeneous). p_rewire is ignored in this branch -- BA's
+  #   growth process is itself the source of degree heterogeneity, there
+  #   is no "rewire" analogue. Mean degree still targets node_degree via
+  #   m = node_degree/2 edges attached per new vertex, for comparability
+  #   with the WS variant.
   stopifnot(node_degree %% 2 == 0)
+  stopifnot(network_type %in% c("ws", "ba"))
   set.seed(seed)
 
   lay_ids <- which(agents$type == "lay")
   k       <- node_degree %/% 2L
 
-  # Build regular ring per community
-  edge_list <- do.call(rbind, lapply(0:(n_communities - 1), function(com) {
-    nc  <- sort(lay_ids[agents$community[lay_ids] == com])
-    n_c <- length(nc)
-    if (n_c < 2) return(NULL)
-    from <- rep(nc, each = k)
-    step <- rep(seq_len(k), times = n_c)
-    to   <- nc[((match(from, nc) - 1L + step) %% n_c) + 1L]
-    cbind(from, to)
-  }))
+  if (network_type == "ba") {
+    edge_list <- do.call(rbind, lapply(0:(n_communities - 1), function(com) {
+      nc  <- sort(lay_ids[agents$community[lay_ids] == com])
+      n_c <- length(nc)
+      if (n_c < 2) return(NULL)
+      m     <- max(1L, min(k, n_c - 1L))
+      g_ba  <- sample_pa(n_c, power = 1, m = m, directed = FALSE)
+      el    <- as_edgelist(g_ba, names = FALSE)
+      cbind(nc[el[, 1]], nc[el[, 2]])
+    }))
+  } else {
+    # Build regular ring per community
+    edge_list <- do.call(rbind, lapply(0:(n_communities - 1), function(com) {
+      nc  <- sort(lay_ids[agents$community[lay_ids] == com])
+      n_c <- length(nc)
+      if (n_c < 2) return(NULL)
+      from <- rep(nc, each = k)
+      step <- rep(seq_len(k), times = n_c)
+      to   <- nc[((match(from, nc) - 1L + step) %% n_c) + 1L]
+      cbind(from, to)
+    }))
 
-  # Watts-Strogatz rewiring (within lay nodes only)
-  if (p_rewire > 0) {
-    for (i in seq_len(nrow(edge_list))) {
-      if (runif(1) < p_rewire) {
-        u        <- edge_list[i, 1]
-        existing <- c(edge_list[edge_list[, 1] == u, 2],
-                      edge_list[edge_list[, 2] == u, 1], u)
-        cands    <- lay_ids[!lay_ids %in% existing]
-        if (length(cands)) {
-          edge_list[i, 2] <- sample(cands, 1)
+    # Watts-Strogatz rewiring (within lay nodes only)
+    if (p_rewire > 0) {
+      for (i in seq_len(nrow(edge_list))) {
+        if (runif(1) < p_rewire) {
+          u        <- edge_list[i, 1]
+          existing <- c(edge_list[edge_list[, 1] == u, 2],
+                        edge_list[edge_list[, 2] == u, 1], u)
+          cands    <- lay_ids[!lay_ids %in% existing]
+          if (length(cands)) {
+            edge_list[i, 2] <- sample(cands, 1)
+          }
         }
       }
     }
@@ -249,14 +346,30 @@ setup_friendship_network <- function(agents, n_communities, node_degree,
 #   3. Propose swapping op[i] <-> op[j]
 #   4. Accept if disagreement decreases; otherwise accept with
 #      probability exp(-delta_E * homophily_t)
-#   5. Every 100 steps: check assortativity; stop if target reached
+#   5. Every 100 steps: check GROUP-SPECIFIC assortativity; stop only
+#      once BOTH the minority-only and majority-only subgraphs have
+#      individually reached target_homophily (see note below)
 #
 # Parameters:
-#   target_homophily : target opinion assortativity to reach;
-#                      NULL disables the step entirely
+#   target_homophily : target opinion assortativity to reach, checked
+#                      separately within each group's own induced
+#                      subgraph; NULL disables the step entirely
 #   homophily_t      : Metropolis temperature — higher = more greedy,
 #                      faster convergence (default 5)
-#   homophily_steps  : safety cap on proposed swaps (default 100 000)
+#   homophily_steps  : safety cap on proposed swaps (default 400 000)
+#
+# Why group-specific, not pooled: stopping once the POOLED assortativity
+# (all lay agents together) reaches target_homophily was found to satisfy
+# the pooled target almost entirely on the back of the majority group,
+# leaving the minority far short of it -- e.g. at target_homophily = 0.8,
+# 30 diagnostic seeds gave pooled r ≈ 0.80 and majority-only r ≈ 0.75, but
+# minority-only r ≈ 0.36. Majority-majority edges vastly outnumber
+# minority-minority ones under an 80/20 split, so the pooled statistic is
+# dominated by the majority and can hit target while the minority
+# subgraph is left substantially less homophilous. Checking both groups'
+# own assortativity directly fixes this at the cost of more steps, since
+# minority-relevant swaps are proposed less often under uniform sampling
+# over all lay agents (see scripts/diagnose_group_homophily.R).
 #
 # Returns: agents tibble with (possibly) reshuffled opinions
 # =============================================================
@@ -264,7 +377,7 @@ setup_friendship_network <- function(agents, n_communities, node_degree,
 shuffle_opinions_homophily <- function(agents, gF,
                                        target_homophily,
                                        homophily_t     = 5,
-                                       homophily_steps = 100000,
+                                       homophily_steps = 400000,
                                        seed            = 1) {
   if (is.null(target_homophily)) return(agents)
   set.seed(seed)
@@ -275,11 +388,39 @@ shuffle_opinions_homophily <- function(agents, gF,
   grp     <- agents$group   # moved together with op below -- see note
   gF_lay  <- induced_subgraph(gF, lay_ids)   # lay-only subgraph for assortativity
 
+  # Precompute each lay agent's lay-only neighbour list ONCE. Network
+  # topology (gF) is fixed for the rest of this function -- only opinions
+  # and group are being reshuffled across existing positions -- so
+  # re-querying igraph's neighbors() twice per step, for up to
+  # homophily_steps (default 400 000) steps, was pure repeated overhead
+  # for a value that never changes. Purely deterministic (no RNG
+  # involved), so this changes none of the random draws below.
+  nb_list <- vector("list", max(lay_ids))
+  for (v in lay_ids) {
+    nb_list[[v]] <- intersect(as.integer(neighbors(gF, v, mode = "out")), lay_ids)
+  }
+
+  # Group-specific assortativity, checked against gF_lay's LOCAL vertex
+  # numbering (vertex k of gF_lay == lay_ids[k], since induced_subgraph
+  # preserves the order of the vids argument) -- avoids rebuilding a
+  # lay_ids lookup table on every check.
+  group_targets_met <- function() {
+    grp_lay <- grp[lay_ids]
+    op_lay  <- op[lay_ids]
+    min_pos <- which(grp_lay == "minority")
+    maj_pos <- which(grp_lay == "majority")
+    if (length(min_pos) < 2 || length(maj_pos) < 2) return(TRUE)  # nothing to check
+    a_min <- assortativity(induced_subgraph(gF_lay, min_pos), op_lay[min_pos], directed = FALSE)
+    a_maj <- assortativity(induced_subgraph(gF_lay, maj_pos), op_lay[maj_pos], directed = FALSE)
+    !is.nan(a_min) && !is.nan(a_maj) && a_min >= target_homophily && a_maj >= target_homophily
+  }
+
   for (step in seq_len(homophily_steps)) {
 
-    # Check assortativity every 100 steps; stop when target is reached
+    # Check group-specific assortativity every 100 steps; stop once both
+    # groups individually reach the target
     if (step %% 100L == 0L) {
-      if (assortativity(gF_lay, op[lay_ids], directed = FALSE) >= target_homophily)
+      if (group_targets_met())
         break
     }
 
@@ -288,8 +429,8 @@ shuffle_opinions_homophily <- function(agents, gF,
     j   <- lay_ids[idx[2]]
 
     # Lay neighbours of i and j, excluding the i-j edge (cancels in delta_E)
-    nb_i <- setdiff(intersect(as.integer(neighbors(gF, i, mode = "out")), lay_ids), j)
-    nb_j <- setdiff(intersect(as.integer(neighbors(gF, j, mode = "out")), lay_ids), i)
+    nb_i <- setdiff(nb_list[[i]], j)
+    nb_j <- setdiff(nb_list[[j]], i)
 
     E_before <- sum(abs(op[i] - op[nb_i])) + sum(abs(op[j] - op[nb_j]))
     E_after  <- sum(abs(op[j] - op[nb_i])) + sum(abs(op[i] - op[nb_j]))
@@ -310,11 +451,10 @@ shuffle_opinions_homophily <- function(agents, gF,
 
   agents$opinion <- op
   agents$group   <- grp
-  if (assortativity(gF_lay, op[lay_ids], directed = FALSE) < target_homophily)
+  if (!group_targets_met())
     message(sprintf(
-      "shuffle_opinions_homophily(): did not reach target r=%.3f within %d steps (achieved r=%.3f)",
-      target_homophily, homophily_steps,
-      assortativity(gF_lay, op[lay_ids], directed = FALSE)))
+      "shuffle_opinions_homophily(): group-specific target r=%.3f not reached by both groups within %d steps",
+      target_homophily, homophily_steps))
   agents
 }
 
@@ -376,6 +516,16 @@ compute_network_homophily <- function(gF, agents) {
 #             "confidence" additionally blends it toward "always vote
 #             for yourself" at low total responsiveness (see below).
 #
+#   decision_model switches the whole attractiveness + self-weight
+#   formula set with a single argument (trust below is unaffected):
+#     "legacy"          (default, Report 17/18/19): dual-sigmoid
+#                       attractiveness_fn + dual-sigmoid self-weight
+#                       (self_weight_mode/confidence_agg apply here).
+#     "gaussian_mobius" (Report 20): Gaussian-opinion x logistic-power
+#                       attractiveness (attractiveness_gaussian_log) +
+#                       Mobius self-vote probability (p_self_mobius,
+#                       knob self_reliance_c). See FunctionVersions.R.
+#
 #   AFTER EACH ROUND:
 #     Power is computed transitively.
 #     Votes propagate along chains to the root.
@@ -386,6 +536,7 @@ simulate_liquid_democracy <- function(
     n_communities           = 1,
     node_degree             = 6,
     p_rewire                = 0.05,
+    network_type            = "ws",    # "ws" (default, unchanged) | "ba" -- see setup_friendship_network()
     r_op                    = 1,
     r_pw                    = 1,
     T                       = 200,
@@ -402,25 +553,99 @@ simulate_liquid_democracy <- function(
     majority_opinion_min    = 0,       # lower bound for clustered majority opinions ("uniform" only)
     majority_opinion_max    = 1,       # upper bound for clustered majority opinions ("uniform" only)
     r_ingroup               = 0,       # ingroup responsiveness (0 = no preference)
-    self_weight_mode        = "raw",   # "raw" | "confidence" — see delegation-decision block
-    confidence_agg          = "sum",   # "sum" | "mean" — how "confidence" combines r_op/r_pw/r_ingroup (Report 18)
-    lambda                  = 0,       # trust decay/momentum  (0 = no trust)
-    gamma                   = 0,       # trust sensitivity     (0 = trust disabled)
-    trust_mode              = "punish_only", # "punish_only" | "reward_punish" — see trust-update block
+    decision_model          = "expose", # "legacy" (dual-sigmoid attractiveness + self-weight, Report 18/19) |
+                                        # "gaussian_mobius" (Gaussian-opinion x logistic-power attractiveness +
+                                        # Mobius self-vote probability, Report 20) |
+                                        # "calib" (Report 21 calibration pipeline: exp-opinion x log-ratio-power
+                                        # attractiveness + Mobius self-vote M=4) |
+                                        # "expose" (default: exact match to the Expose's Sec 2.2 formulas --
+                                        # same as "calib" but with the power term as a linear ratio-minus-one,
+                                        # a_pw = 2*L(r_pw*(p_j/p_i - 1)), per Expose Eq. 7, instead of calib's
+                                        # log-ratio) — one switch to swap the whole delegation-decision formula
+                                        # set; trust (lambda/gamma/tau) below is unaffected either way. See
+                                        # FunctionVersions.R sections (A)/(C).
+    self_reliance_c         = 0.5,     # c in the Mobius P_self curve ("gaussian_mobius" only, ignored otherwise):
+                                        # self-vote probability when the best neighbour is exactly as attractive
+                                        # as agent i itself
+    self_weight_mode        = "raw",   # "raw" | "confidence" — see delegation-decision block ("legacy" only)
+    confidence_agg          = "sum",   # "sum" | "mean" — how "confidence" combines r_op/r_pw/r_ingroup (Report 18; "legacy" only)
+    lambda                  = 0,       # trust decay/momentum ("punish_only"/"reward_punish") OR
+                                        # adaptation RATE toward the round's target ("relaxation" --
+                                        # opposite role: lambda=1 fully adopts the new target each
+                                        # round, lambda=0 never updates). (0 = no trust, any mode)
+    gamma                   = 0,       # trust sensitivity r_tr in a_tr = 2*L(gamma*(tau-1 or tau))
+    trust_mode              = "punish_only", # "punish_only" | "reward_punish" | "relaxation" — see trust-update block
     cycle_penalty           = 1,       # kappa_cyc: penalty for a non-delivering (cyclic) neighbour, "reward_punish" only
+    k1                      = 1,       # "relaxation" only: scales the agreement signal s = k1*(1-2|o_i-v_j|)
+    k2                      = 1,       # "relaxation" only: penalty magnitude s = -k2 when j's vote is lost to a cycle
     cycle_fallback          = "none",  # "none" | "direct" | "redelegate"
     target_homophily        = NULL,    # target assortativity; NULL disables shuffle
     homophily_t             = 5,       # Metropolis temperature (higher = more greedy)
-    homophily_steps         = 100000,  # safety cap on proposed swaps
-    snap_rounds             = NULL     # rounds to record full snapshots; NULL = last 5
+    homophily_steps         = 400000,  # safety cap on proposed swaps (raised from 100k: the
+                                        # group-aware stopping criterion in shuffle_opinions_homophily()
+                                        # needs more steps since minority-relevant swaps are proposed
+                                        # less often under uniform sampling -- see that function's docstring)
+    snap_rounds             = NULL,    # rounds to record full snapshots; NULL = last 5
+    fast_path               = FALSE,   # opt-in vectorised delegation-decision step (see
+                                        # "Delegation decision" block below). Default FALSE
+                                        # preserves the exact original per-agent loop --
+                                        # and therefore exact reproducibility of every
+                                        # existing report's cached results -- for any
+                                        # caller that doesn't explicitly ask for it. Only
+                                        # takes effect when cycle_fallback == "none" and
+                                        # decision_model %in% c("gaussian_mobius", "calib",
+                                        # "expose"); otherwise silently falls back to the
+                                        # original loop.
+    n_voting_rounds         = NULL     # Expose Sec 1.4.1: T rounds split into "delegating
+                                        # rounds" (decision + power/vote resolution only) and
+                                        # "voting rounds" (same, PLUS the trust update, Sec
+                                        # 2.2.2 -- trust only ever changes at a voting round).
+                                        # NULL (default): every round is a voting round, i.e.
+                                        # the ORIGINAL behaviour (trust updates every round,
+                                        # unchanged for any existing caller that doesn't pass
+                                        # this). Set to an integer n <= T to instead treat only
+                                        # n rounds, evenly spaced with the last one always at
+                                        # round T, as voting rounds; trust is frozen on the
+                                        # other T - n "delegating/adaptation" rounds. Never
+                                        # hard-wired: pass n_voting_rounds = 20 with T = 60 for
+                                        # the 60/20/40 standard case.
 ) {
+  sim_time_start <- Sys.time()  # covers the whole call: network/agent setup + all T rounds
+
+  # decision_model = "gaussian_mobius" / "calib" swap in the Report 20 / 21
+  # attractiveness formula by default, unless the caller explicitly passed
+  # their own attractiveness_fn (in which case that override wins).
+  if (missing(attractiveness_fn)) {
+    if (decision_model == "gaussian_mobius") attractiveness_fn <- attractiveness_gaussian_log
+    if (decision_model == "calib")           attractiveness_fn <- attractiveness_calib
+    if (decision_model == "expose")          attractiveness_fn <- attractiveness_expose
+  }
+
+  # ---------------------------------------------------------
+  # Delegating rounds vs. voting rounds (Expose Sec 1.4.1).
+  # n_voting_rounds = NULL: every round is a voting round -- exactly the
+  # original behaviour, so any existing caller that doesn't pass this gets
+  # identical results to before. Otherwise: n_voting_rounds rounds, evenly
+  # spaced with the last one always landing on round T (so the simulation
+  # always ends on a "locked in" vote, not mid-adaptation), are voting
+  # rounds; trust is only updated on those (see trust-update block below).
+  # ---------------------------------------------------------
+  voting_rounds <- if (is.null(n_voting_rounds)) {
+    seq_len(T)
+  } else {
+    stopifnot(n_voting_rounds >= 1, n_voting_rounds <= T)
+    sort(unique(round(seq(T / n_voting_rounds, T, length.out = n_voting_rounds))))
+  }
+  is_voting_round <- logical(T)
+  is_voting_round[voting_rounds] <- TRUE
+
   st     <- setup_agents(n_per_community, n_communities, seed,
                          minority_share = minority_share)
   agents <- st$agents
   n_all  <- st$n_all
 
   gF <- setup_friendship_network(agents, n_communities, node_degree,
-                                 p_rewire, seed)
+                                 p_rewire, seed, network_type)
 
   # Condition B: clustered minority/majority opinions -- applied BEFORE the
   # homophily shuffle below (not after), so the shuffle rearranges these
@@ -462,6 +687,10 @@ simulate_liquid_democracy <- function(
                     \(v) as.integer(neighbors(gF, v, mode = "out")))
   lay_ids <- which(agents$type == "lay")
   op      <- agents$opinion
+  grp     <- agents$group  # hoisted out of the round loop: group never changes
+                            # over T, so re-deriving it from the tibble every
+                            # agent every round (agents$group[nb]) was pure
+                            # repeated overhead for an unchanging plain vector.
 
   # Trust state — only allocated when trust is active (gamma > 0 or lambda > 0)
   trust_active <- (lambda != 0 || gamma != 0)
@@ -470,9 +699,48 @@ simulate_liquid_democracy <- function(
   # neighbour id, since adj (and therefore each agent's neighbour order) is
   # fixed for the whole simulation. Avoids character-vector hash lookups in
   # the hot loop below.
+  # Initial value: 0 for "punish_only"/"reward_punish" (neutral point of the
+  # OLD a_trust = 2*sig(gamma*tau)); 1 for "relaxation" (neutral point of
+  # a_tr = 2*sig(gamma*(tau-1)) -- see attractiveness_calib()'s docstring).
+  tau_init <- if (identical(trust_mode, "relaxation")) 1.0 else 0.0
   tau <- if (trust_active)
-    lapply(adj, function(nb) rep(0.0, length(nb)))
+    lapply(adj, function(nb) rep(tau_init, length(nb)))
   else NULL
+
+  # ---------------------------------------------------------
+  # One-off precomputation of the flattened (agent, neighbour) edge list.
+  # adj is fixed for the whole simulation, so this is built once here
+  # rather than once per round. Used by:
+  #  - the vectorised trust update below (whenever trust_active) -- this
+  #    is a purely deterministic computation (no RNG involved at all),
+  #    so vectorising it changes nothing about the random draws anywhere
+  #    in the simulation -- it's a strict speedup with no caveat.
+  #  - the delegation-decision fast_path (see that block for the
+  #    reproducibility caveat, which does NOT apply to the trust update).
+  # ---------------------------------------------------------
+  all_lay   <- identical(lay_ids, seq_len(n_all))
+  fast_path <- fast_path && cycle_fallback == "none" &&
+    decision_model %in% c("gaussian_mobius", "calib", "expose") && all_lay
+
+  # trust_vectorized also requires all_lay: the original trust-update
+  # loop below only updates tau[[i]] for i in lay_ids, and the flattened
+  # edge list is built over all n_all agents -- only equivalent when
+  # every agent is lay (true for every current report; guarded rather
+  # than assumed in case that ever changes).
+  trust_vectorized <- trust_active && all_lay
+
+  need_edge_flat <- fast_path || trust_vectorized
+  if (need_edge_flat) {
+    deg     <- lengths(adj)
+    edge_i  <- rep(seq_len(n_all), times = deg)
+    edge_j  <- unlist(adj, use.names = FALSE)
+    n_edges <- length(edge_i)
+  }
+
+  if (fast_path) {
+    has_nb     <- deg > 0
+    edge_split <- if (n_edges > 0) split(seq_len(n_edges), edge_i) else list()
+  }
 
   prev_lost_ids <- integer(0L)   # lay agents whose vote was NA last round
   prev_lost_set <- logical(n_all)
@@ -490,6 +758,7 @@ simulate_liquid_democracy <- function(
   history_drift      <- numeric(T)
   history_delegation <- numeric(T)
   history_stability  <- numeric(T)
+  cycle_breakdown_list <- vector("list", T)  # RQ1: per-round (cycle_length -> n_agents) table
 
   snapshot_list     <- vector("list", length(snapshot_rounds))
   names(snapshot_list) <- as.character(snapshot_rounds)
@@ -523,91 +792,175 @@ simulate_liquid_democracy <- function(
 
     # --------------------------------------------------
     # Delegation decision
+    #
+    # fast_path (opt-in, see simulate_liquid_democracy() argument doc):
+    # computes attractiveness for every (agent, neighbour) edge in the
+    # network in one vectorised pass instead of one R-level function
+    # call per agent -- the same maths as the loop below, applied
+    # elementwise across all ~N*node_degree edges at once. Aggregates
+    # per agent (best-neighbour attractiveness, total attractiveness)
+    # via tapply() grouped by agent, then does self-vote/delegate-choice
+    # sampling. REPRODUCIBILITY NOTE: this draws rnorm()/runif() for all
+    # edges/agents up front rather than interleaved per agent, so it
+    # consumes the RNG stream in a different order than the loop below --
+    # statistically equivalent, not bit-identical for a given seed.
     # --------------------------------------------------
-    targets <- vapply(lay_ids, function(i) {
-      nb    <- adj[[i]]
-      tau_i <- tau[[i]]  # positionally aligned with adj[[i]]; kept in sync with nb below
+    if (fast_path) {
+      op_i_e  <- op[edge_i]
+      op_j_e  <- op[edge_j]
+      pow_i_e <- pow[edge_i]
+      pow_j_e <- pow[edge_j]
 
-      # Between-round fallback: if vote was lost last round, adjust choice
-      if (cycle_fallback != "none" && prev_lost_set[i]) {
-        if (cycle_fallback == "direct") return(i)
-        if (cycle_fallback == "redelegate") {
-          # exclude the specific delegate that caused the cycle last round
-          keep <- nb != prev_target[i]
-          nb   <- nb[keep]
-          if (trust_active) tau_i <- tau_i[keep]
-        } else if (cycle_fallback == "informed") {
-          # only consider neighbours whose vote was represented last round
-          keep <- !is.na(prev_my_vote[nb])
-          nb   <- nb[keep]
-          if (trust_active) tau_i <- tau_i[keep]
-          if (!length(nb)) return(i)
-        }
+      if (sigma_opinion > 0) {
+        eps      <- rnorm(n_edges, 0, sigma_opinion)
+        op_j_obs <- plogis(qlogis(op_j_e) + eps)
+      } else {
+        op_j_obs <- op_j_e
       }
 
-      # No neighbours → always vote directly
-      if (!length(nb)) return(i)
-
-      # ── Endogenous self-weight ────────────────────────────────────────────
-      # Compute neighbour attractiveness first (needed for best-neighbour j*)
-      op_nb  <- perceive_opinion(op[nb],  sigma_opinion)
-      pow_nb <- pow[nb]
-      w_nb   <- attractiveness_fn(op[i], op_nb, pow[i], pow_nb, r_op, r_pw)
+      w_e <- attractiveness_fn(op_i_e, op_j_obs, pow_i_e, pow_j_e, r_op, r_pw)
 
       if (trust_active && gamma != 0) {
-        trust_mod <- 2 * .sig(gamma * tau_i)
-        w_nb <- w_nb * trust_mod
+        tau_e   <- unlist(tau, use.names = FALSE)  # positionally aligned with edge_i/edge_j
+        tau_arg <- if (identical(trust_mode, "relaxation")) tau_e - 1 else tau_e
+        w_e     <- w_e * (2 * .sig(gamma * tau_arg))
       }
       if (r_ingroup != 0) {
-        same_g <- as.integer(agents$group[nb] == agents$group[i]) * 2L - 1L
-        w_nb   <- w_nb * .sig(r_ingroup * same_g)
+        # Expose Eq. 10: a_ig = exp(-r_ig*(1-delta)) -- delta=1 (same group)
+        # forces a_ig = 1 regardless of r_ig; only cross-group pairs decay.
+        delta_g_e <- as.integer(grp[edge_j] == grp[edge_i])
+        w_e       <- w_e * exp(-r_ingroup * (1 - delta_g_e))
       }
-      w <- pmax(w_nb, 0)
+      w_e <- pmax(w_e, 0)
 
-      # If no attractive neighbour exists, vote directly
-      if (sum(w) == 0) return(i)
+      # Best-neighbour and total attractiveness per agent, aggregated
+      # from the flat edge list (agents with zero neighbours never
+      # appear here and correctly stay at the 0 default -- forced to
+      # self-vote below via always_self regardless).
+      m_all   <- numeric(n_all)
+      sum_all <- numeric(n_all)
+      if (n_edges > 0) {
+        m_by_agent   <- tapply(w_e, edge_i, max)
+        sum_by_agent <- tapply(w_e, edge_i, sum)
+        idx_agent    <- as.integer(names(m_by_agent))
+        m_all[idx_agent]   <- m_by_agent
+        sum_all[idx_agent] <- sum_by_agent
+      }
 
-      # Best neighbour j* by attractiveness
-      j_idx <- which.max(w)
+      w_self_all  <- if (decision_model %in% c("calib", "expose")) p_self_mobius_M(m_all, self_reliance_c, M = 4)
+                     else p_self_mobius(m_all, self_reliance_c)
+      always_self <- (!has_nb) | (sum_all == 0)
+      w_self_all[always_self] <- 1
 
-      # Self-weight as probability:
-      #   high when best neighbour is ideologically far  → prefer own vote
-      #   high when own power exceeds j*'s power        → prefer own vote
-      w_self_raw <- .sig(r_op * (2 * abs(op[i] - op_nb[j_idx]) - 1)) *
-                    .sig(r_pw * log(max(pow[i], 1e-9) / max(pow_nb[j_idx], 1e-9)))
+      votes_self <- always_self | (runif(n_all) < w_self_all)
 
-      # "confidence" mode: blends w_self_raw with "always vote for yourself"
-      # using a weight that saturates from 0 (r_tot = 0) to 1 (r_tot -> inf),
-      # so the global delegation rate can span the full 0-1 range instead of
-      # floor-ing at w_self_raw's r=0 value (sig(0)*sig(0) = 0.25). r_ingroup
-      # is included in r_tot so ingroup preference alone can still induce
-      # delegation when r_op = r_pw = 0.
-      #   confidence_agg = "sum"  (default, Report 17): r_tot = r_op+r_pw+r_ingroup
-      #     -- confidence rises with the *number* of active dimensions, not
-      #     just their strength (e.g. two dimensions at 0.5 give more
-      #     confidence than one at 0.5, even if nothing individually changed).
-      #   confidence_agg = "mean" (Report 18): r_tot = average of the
-      #     *active* (non-zero) dimensions -- fixes the artefact above by
-      #     dividing by the count of active dimensions rather than a fixed 3,
-      #     so a permanently-zero dimension (e.g. r_ingroup in Report 17/18's
-      #     diagnostic sweeps) doesn't dilute confidence for no reason.
-      w_self <- if (self_weight_mode == "confidence") {
-        active_r <- c(r_op, r_pw, r_ingroup)
-        r_tot <- if (confidence_agg == "mean") {
-          sum(active_r) / max(1, sum(active_r > 0))
-        } else {
-          sum(active_r)
+      targets    <- seq_len(n_all)
+      delegating <- which(!votes_self)
+      for (i in delegating) {
+        idx        <- edge_split[[as.character(i)]]
+        targets[i] <- edge_j[idx][sample.int(length(idx), 1L, prob = w_e[idx])]
+      }
+    } else {
+      targets <- vapply(lay_ids, function(i) {
+        nb    <- adj[[i]]
+        tau_i <- tau[[i]]  # positionally aligned with adj[[i]]; kept in sync with nb below
+
+        # Between-round fallback: if vote was lost last round, adjust choice
+        if (cycle_fallback != "none" && prev_lost_set[i]) {
+          if (cycle_fallback == "direct") return(i)
+          if (cycle_fallback == "redelegate") {
+            # exclude the specific delegate that caused the cycle last round
+            keep <- nb != prev_target[i]
+            nb   <- nb[keep]
+            if (trust_active) tau_i <- tau_i[keep]
+          } else if (cycle_fallback == "informed") {
+            # only consider neighbours whose vote was represented last round
+            keep <- !is.na(prev_my_vote[nb])
+            nb   <- nb[keep]
+            if (trust_active) tau_i <- tau_i[keep]
+            if (!length(nb)) return(i)
+          }
         }
-        conf  <- r_tot / (1 + r_tot)
-        (1 - conf) + conf * w_self_raw
-      } else {
-        w_self_raw
-      }
 
-      if (runif(1) < w_self) return(i)
+        # No neighbours → always vote directly
+        if (!length(nb)) return(i)
 
-      nb[sample.int(length(w), 1L, prob = w)]
-    }, integer(1L))
+        # ── Endogenous self-weight ────────────────────────────────────────────
+        # Compute neighbour attractiveness first (needed for best-neighbour j*)
+        op_nb  <- perceive_opinion(op[nb],  sigma_opinion)
+        pow_nb <- pow[nb]
+        w_nb   <- attractiveness_fn(op[i], op_nb, pow[i], pow_nb, r_op, r_pw)
+
+        if (trust_active && gamma != 0) {
+          tau_i_arg <- if (identical(trust_mode, "relaxation")) tau_i - 1 else tau_i
+          trust_mod <- 2 * .sig(gamma * tau_i_arg)
+          w_nb <- w_nb * trust_mod
+        }
+        if (r_ingroup != 0) {
+          # Expose Eq. 10: a_ig = exp(-r_ig*(1-delta)) -- delta=1 (same group)
+          # forces a_ig = 1 regardless of r_ig; only cross-group pairs decay.
+          delta_g <- as.integer(grp[nb] == grp[i])
+          w_nb    <- w_nb * exp(-r_ingroup * (1 - delta_g))
+        }
+        w <- pmax(w_nb, 0)
+
+        # If no attractive neighbour exists, vote directly
+        if (sum(w) == 0) return(i)
+
+        # Best neighbour j* by attractiveness
+        j_idx <- which.max(w)
+
+        # Self-vote probability.
+        #   "gaussian_mobius" (Report 20): Mobius curve through
+        #     (m=0 -> 1, m=1 -> c, m=2 -> 0) applied to m = w[j_idx], the best
+        #     neighbour's attractiveness AFTER trust/ingroup modifiers --
+        #     see FunctionVersions.R section (C).
+        #   "legacy" (Report 17/18/19, default): dual-sigmoid self-weight,
+        #     optionally blended toward "confidence" mode (see below).
+        w_self <- if (decision_model == "gaussian_mobius") {
+          p_self_mobius(w[j_idx], self_reliance_c)
+        } else if (decision_model %in% c("calib", "expose")) {
+          p_self_mobius_M(w[j_idx], self_reliance_c, M = 4)
+        } else {
+          # high when best neighbour is ideologically far  → prefer own vote
+          # high when own power exceeds j*'s power        → prefer own vote
+          w_self_raw <- .sig(r_op * (2 * abs(op[i] - op_nb[j_idx]) - 1)) *
+                        .sig(r_pw * log(max(pow[i], 1e-9) / max(pow_nb[j_idx], 1e-9)))
+
+          # "confidence" mode: blends w_self_raw with "always vote for yourself"
+          # using a weight that saturates from 0 (r_tot = 0) to 1 (r_tot -> inf),
+          # so the global delegation rate can span the full 0-1 range instead of
+          # floor-ing at w_self_raw's r=0 value (sig(0)*sig(0) = 0.25). r_ingroup
+          # is included in r_tot so ingroup preference alone can still induce
+          # delegation when r_op = r_pw = 0.
+          #   confidence_agg = "sum"  (default, Report 17): r_tot = r_op+r_pw+r_ingroup
+          #     -- confidence rises with the *number* of active dimensions, not
+          #     just their strength (e.g. two dimensions at 0.5 give more
+          #     confidence than one at 0.5, even if nothing individually changed).
+          #   confidence_agg = "mean" (Report 18): r_tot = average of the
+          #     *active* (non-zero) dimensions -- fixes the artefact above by
+          #     dividing by the count of active dimensions rather than a fixed 3,
+          #     so a permanently-zero dimension (e.g. r_ingroup in Report 17/18's
+          #     diagnostic sweeps) doesn't dilute confidence for no reason.
+          if (self_weight_mode == "confidence") {
+            active_r <- c(r_op, r_pw, r_ingroup)
+            r_tot <- if (confidence_agg == "mean") {
+              sum(active_r) / max(1, sum(active_r > 0))
+            } else {
+              sum(active_r)
+            }
+            conf  <- r_tot / (1 + r_tot)
+            (1 - conf) + conf * w_self_raw
+          } else {
+            w_self_raw
+          }
+        }
+
+        if (runif(1) < w_self) return(i)
+
+        nb[sample.int(length(w), 1L, prob = w)]
+      }, integer(1L))
+    }
 
     # --------------------------------------------------
     # Build delegation graph
@@ -627,35 +980,107 @@ simulate_liquid_democracy <- function(
     if (length(edge_from)) delegated_vec[edge_from] <- TRUE
     agents$delegated <- delegated_vec
 
+    # Cycle length breakdown (RQ1): agents with a lost (NA) vote are
+    # exactly the ones stuck in a cycle -- cyc_len already computed once by
+    # compute_power_and_votes() above (also the source of the corrected
+    # cycle-member power, Sec 2.2.7), reused here rather than recomputed.
+    # Purely diagnostic, doesn't affect anything above.
+    in_cycle_t <- is.na(agents$my_vote)
+    if (any(in_cycle_t)) {
+      cyc_len_t <- pv$cyc_len
+      cycle_breakdown_list[[t]] <- tibble(round = t, cycle_length = cyc_len_t[in_cycle_t]) |>
+        dplyr::count(cycle_length, name = "n_agents")
+    }
+
     # --------------------------------------------------
-    # Trust update.
+    # Trust update -- Expose Sec 2.2.2: happens only on a VOTING round (see
+    # n_voting_rounds/is_voting_round above); frozen on delegating/adaptation
+    # rounds. Eq. 4's signal s_ij is defined only for the neighbour i
+    # actually delegated to last round (prev_target[i]) -- s_ij = 0 for
+    # every other neighbour ("0 if i did not delegate to j"), so under
+    # "relaxation" (below) their trust simply drifts back toward the tau=1
+    # baseline each voting round ("the trust of agent i towards ALL of its
+    # neighbours is slightly restored", Sec 2.2.2), while only the delegate
+    # gets the outcome-dependent signal.
     #   "punish_only" (default, Report 17/18 Sec 2.4): tau_ij(t) =
-    #     lambda*tau_ij(t-1) - (1-lambda)*|o_i - v_j(t-1)|, only when
-    #     neighbour j delivered a vote last round. A neighbour whose vote
-    #     was lost (stuck in a cycle) is skipped entirely -- tau simply
-    #     doesn't update for that pair, so cycling carries no trust penalty
-    #     at all and tau <= 0 always (trust can only ever shrink
-    #     attractiveness, never boost it).
+    #     lambda*tau_ij(t-1) - (1-lambda)*|o_i - v_j(t-1)|, only for the
+    #     delegate, and only when that delegate's vote was delivered last
+    #     round. If the delegate's vote was lost (stuck in a cycle), or i
+    #     voted directly, tau is left unchanged for that pair -- this mode
+    #     has no baseline-relaxation term.
     #   "reward_punish" (Report 18 Sec 3): tau_ij(t) = lambda*tau_ij(t-1) +
-    #     (1-lambda)*s, with s = 1-2|o_i-v_j(t-1)| when j delivered a vote
-    #     (positive for agreement, negative for disagreement -- same
-    #     2|.|-1 convention as the attractiveness formula) and s =
-    #     -cycle_penalty when j's vote was lost. tau can now be positive,
-    #     so trust_mod = 2*sigmoid(gamma*tau) can exceed 1 for a
-    #     consistently well-agreeing neighbour, and cycling is punished
-    #     explicitly rather than passed over.
-    if (trust_active) {
+    #     (1-lambda)*s, with s = 1-2|o_i-v_j(t-1)| when the delegate
+    #     delivered a vote (positive for agreement, negative for
+    #     disagreement -- same 2|.|-1 convention as the attractiveness
+    #     formula), s = -cycle_penalty when the delegate's vote was lost,
+    #     and s = 0 (tau drifts toward its own baseline 0) for every
+    #     neighbour that wasn't the chosen delegate.
+    if (is_voting_round[t] && trust_vectorized) {
+      if (n_edges > 0) {
+        tau_e_old   <- unlist(tau, use.names = FALSE)
+        vj_e        <- prev_my_vote[edge_j]
+        # Eq. 4: the signal applies only to the neighbour i actually
+        # delegated to last round -- everyone else gets s_ij = 0.
+        is_target_e <- (prev_target[edge_i] != 0L) & (edge_j == prev_target[edge_i])
+        valid_e     <- is_target_e & !is.na(vj_e)  # delegate delivered a vote
+        lost_e      <- is_target_e & is.na(vj_e)   # delegate's vote lost to a cycle
+
+        if (trust_mode == "reward_punish") {
+          s_e <- numeric(n_edges)
+          s_e[valid_e] <- 1 - 2 * abs(op[edge_i[valid_e]] - vj_e[valid_e])
+          s_e[lost_e]  <- -cycle_penalty
+          tau_e <- lambda * tau_e_old + (1 - lambda) * s_e
+        } else if (trust_mode == "relaxation") {
+          # tau_ij(t) = (1-lambda)*tau_ij(t-1) + lambda*(1 + s_ij(t-1)),
+          # s = k1*(1-2|o_i-v_j|) if the delegate delivered a vote, -k2 if
+          # lost to a cycle, 0 otherwise -- lambda here is an ADAPTATION
+          # RATE (opposite role from "reward_punish"/"punish_only" above),
+          # tau neutral at 1.
+          s_e <- numeric(n_edges)
+          s_e[valid_e] <- k1 * (1 - 2 * abs(op[edge_i[valid_e]] - vj_e[valid_e]))
+          s_e[lost_e]  <- -k2
+          tau_e <- (1 - lambda) * tau_e_old + lambda * (1 + s_e)
+        } else {
+          tau_e <- tau_e_old
+          tau_e[valid_e] <- lambda * tau_e_old[valid_e] -
+            (1 - lambda) * abs(op[edge_i[valid_e]] - vj_e[valid_e])
+        }
+
+        # Regroup the flat per-edge values back into tau[[i]] (one vector
+        # per agent, in the same order as adj[[i]]) -- split() is stable
+        # (preserves within-group order) and groups come out in ascending
+        # agent-id order since edge_i is numeric, so this exactly matches
+        # tau's original list-of-vectors shape. Agents with zero
+        # neighbours never appear as an edge_i group and are filled back
+        # in as empty vectors so tau stays indexed by agent i.
+        tau_grouped   <- split(tau_e, edge_i)
+        idx_has_edges <- as.integer(names(tau_grouped))
+        tau <- vector("list", n_all)
+        tau[idx_has_edges] <- tau_grouped
+        empty_ids <- setdiff(seq_len(n_all), idx_has_edges)
+        for (e in empty_ids) tau[[e]] <- numeric(0)
+      }
+    } else if (is_voting_round[t] && trust_active) {
       for (i in lay_ids) {
-        nb    <- adj[[i]]
+        nb <- adj[[i]]
         if (!length(nb)) next
-        vj    <- prev_my_vote[nb]
-        valid <- !is.na(vj)
+        vj <- prev_my_vote[nb]
+        # Eq. 4: the signal applies only to the neighbour i actually
+        # delegated to last round -- everyone else gets s_ij = 0.
+        is_target <- (prev_target[i] != 0L) & (nb == prev_target[i])
+        valid <- is_target & !is.na(vj)  # delegate delivered a vote
+        lost  <- is_target & is.na(vj)   # delegate's vote lost to a cycle
 
         if (trust_mode == "reward_punish") {
           s          <- numeric(length(nb))
           s[valid]   <- 1 - 2 * abs(op[i] - vj[valid])
-          s[!valid]  <- -cycle_penalty
+          s[lost]    <- -cycle_penalty
           tau[[i]] <- lambda * tau[[i]] + (1 - lambda) * s
+        } else if (trust_mode == "relaxation") {
+          s          <- numeric(length(nb))
+          s[valid]   <- k1 * (1 - 2 * abs(op[i] - vj[valid]))
+          s[lost]    <- -k2
+          tau[[i]] <- (1 - lambda) * tau[[i]] + lambda * (1 + s)
         } else {
           if (!any(valid)) next
           tau[[i]][valid] <- lambda * tau[[i]][valid] -
@@ -874,6 +1299,14 @@ simulate_liquid_democracy <- function(
         largest_voting_bloc_share   = largest_voting_bloc,
         total_components            = total_components,
         delegation_stability        = stab,
+        flickerness                 = stab,  # F(t) = 1(d_i(t)=d_i(t-1)) averaged over i;
+                                              # NA on round 1 (no prior decision to compare
+                                              # against). Delegation decisions are made every
+                                              # round (voting and delegating alike, Sec 1.4.1),
+                                              # so no gating on is_voting_round is needed here --
+                                              # same value as delegation_stability, kept under
+                                              # both names for callers expecting either.
+        is_voting_round             = is_voting_round[t],
         minority_power              = minority_power,
         majority_power              = majority_power,
         minority_power_share        = min_pwr_shr,
@@ -911,14 +1344,18 @@ simulate_liquid_democracy <- function(
   }
 
   list(
-    agents             = agents,
-    history_lost       = history_lost,
-    history_drift      = history_drift,
-    history_delegation = history_delegation,
-    history_stability  = history_stability,
-    snapshots          = bind_rows(snapshot_list),
-    delegation_graphs  = delegation_graphs,
-    final_graph        = delegation_graphs[[T]],
-    friendship_graph   = gF
+    agents               = agents,
+    history_lost         = history_lost,
+    history_drift        = history_drift,
+    history_delegation   = history_delegation,
+    history_stability    = history_stability,
+    history_flickerness  = history_stability,  # alias -- see snapshot_list's "flickerness" column
+    voting_rounds        = voting_rounds,      # which of the T rounds had a trust update (Sec 1.4.1)
+    cycle_breakdown      = bind_rows(cycle_breakdown_list),  # tibble: round, cycle_length, n_agents
+    snapshots            = bind_rows(snapshot_list),
+    delegation_graphs    = delegation_graphs,
+    final_graph          = delegation_graphs[[T]],
+    friendship_graph     = gF,
+    sim_time_sec         = as.numeric(difftime(Sys.time(), sim_time_start, units = "secs"))
   )
 }
