@@ -124,10 +124,41 @@ compute_cycle_lengths <- function(n, delegate_of, in_cycle) {
 # =============================================================
 # POWER COMPUTATION (vectorized)
 # Every agent starts with power = 1 (their own vote).
-# Agents who receive delegations accumulate power transitively:
-#   power[root] += number of agents in their chain
-# Cycles: agents in a cycle keep power = 1 (Christoff & Grossi 2017)
+# Expose Sec 2.2.7: p_i = 1 + sum_{j->i} p_j -- power accumulates
+# transitively along the WHOLE chain, so every ancestor of a delegator
+# gains, not just the chain's terminal root (e.g. i -> j -> k gives
+# p_i=1, p_j=2, p_k=3; see accumulate_chain_power() below).
+# Cycles: members' power is overwritten with their cycle's size below.
 # =============================================================
+
+# =============================================================
+# CHAIN POWER ACCUMULATION (vectorized)
+#
+# Credits +1 to EVERY ancestor along each valid (non-cycle) delegator's
+# path to its root -- not just the terminal root -- via the same
+# pointer-jumping technique as find_roots_vectorized() above. This is
+# what makes an intermediate node (one who delegates further themselves)
+# show accumulated power to whoever evaluates it as a delegation target
+# next round, matching the Expose's recursive p_i = 1 + sum_{j->i} p_j
+# exactly (verified against the i->j->k worked example: p_i=1, p_j=2,
+# p_k=3, and against branching trees).
+# =============================================================
+accumulate_chain_power <- function(n, delegate_of, valid, power) {
+  if (!length(valid)) return(power)
+  pointer <- delegate_of[valid]
+  active  <- rep(TRUE, length(valid))
+  for (iter in seq_len(n)) {
+    if (!any(active)) break
+    contrib <- tabulate(pointer[active], nbins = n)
+    power   <- power + contrib
+    nxt        <- delegate_of[pointer[active]]
+    still      <- nxt != 0L
+    idx_active <- which(active)
+    active[idx_active[!still]] <- FALSE
+    pointer[idx_active[still]] <- nxt[still]
+  }
+  power
+}
 
 compute_power <- function(n, edge_from, edge_to) {
   power <- rep(1L, n)
@@ -138,12 +169,10 @@ compute_power <- function(n, edge_from, edge_to) {
 
   roots <- find_roots_vectorized(n, delegate_of)
 
-  # For each delegating agent: add 1 to their root's power
+  # Expose Sec 2.2.7: every ancestor along a valid (non-cycle) delegator's
+  # chain accumulates power, not just the chain's terminal root.
   valid <- edge_from[!is.na(roots[edge_from])]
-  if (length(valid)) {
-    root_counts <- tabulate(roots[valid], nbins = n)
-    power <- power + root_counts
-  }
+  power <- accumulate_chain_power(n, delegate_of, valid, power)
 
   # Sec 2.2.7: for a delegation cycle, the recursion never terminates, so
   # "each agent in a loop is... assigned a voting power equal to the number
@@ -201,8 +230,11 @@ compute_power_and_votes <- function(opinion, n, edge_from, edge_to) {
   delegate_of[edge_from] <- edge_to
   roots <- find_roots_vectorized(n, delegate_of)
 
+  # Expose Sec 2.2.7: every ancestor along a valid (non-cycle) delegator's
+  # chain accumulates power, not just the chain's terminal root -- see
+  # accumulate_chain_power() above compute_power().
   valid <- edge_from[!is.na(roots[edge_from])]
-  if (length(valid)) power <- power + tabulate(roots[valid], nbins = n)
+  power <- accumulate_chain_power(n, delegate_of, valid, power)
 
   r  <- roots[edge_from]
   ok <- !is.na(r)
@@ -503,28 +535,20 @@ compute_network_homophily <- function(gF, agents) {
 #   Each agent observes the opinion of all neighbours from t-1,
 #   subject to optional perception noise (sigma_opinion).
 #
-#   Two-step decision (endogenous self-weight):
+#   Two-step decision (endogenous self-weight), exact match to the
+#   Expose's Sec 2.2 formulas (attractiveness_fn defaults to
+#   attractiveness_expose; Mobius self-vote p_self_mobius_M with M = 4;
+#   see FunctionVersions.R sections (A)/(D) -- other, older formula
+#   versions are kept there for reference/testing but are no longer
+#   switchable via a decision_model argument):
 #     Step 1: find the most attractive neighbour j* by
 #             attractiveness(i,j) = proximity x competence
 #             (trust and ingroup modifiers applied here);
 #             if no neighbours exist, always vote directly.
-#     Step 2: derive a self-weight from how j* compares to i
-#             (ideological distance, relative power) and vote
-#             directly with that probability; otherwise delegate
-#             to a neighbour sampled proportional to attractiveness.
-#             self_weight_mode = "raw" uses this self-weight as-is;
-#             "confidence" additionally blends it toward "always vote
-#             for yourself" at low total responsiveness (see below).
-#
-#   decision_model switches the whole attractiveness + self-weight
-#   formula set with a single argument (trust below is unaffected):
-#     "legacy"          (default, Report 17/18/19): dual-sigmoid
-#                       attractiveness_fn + dual-sigmoid self-weight
-#                       (self_weight_mode/confidence_agg apply here).
-#     "gaussian_mobius" (Report 20): Gaussian-opinion x logistic-power
-#                       attractiveness (attractiveness_gaussian_log) +
-#                       Mobius self-vote probability (p_self_mobius,
-#                       knob self_reliance_c). See FunctionVersions.R.
+#     Step 2: derive a self-vote probability from j*'s attractiveness
+#             (p_self_mobius_M, knob self_reliance_c) and vote directly
+#             with that probability; otherwise delegate to a neighbour
+#             sampled proportional to attractiveness.
 #
 #   AFTER EACH ROUND:
 #     Power is computed transitively.
@@ -540,7 +564,13 @@ simulate_liquid_democracy <- function(
     r_op                    = 1,
     r_pw                    = 1,
     T                       = 200,
-    attractiveness_fn       = attractiveness_dual_sigmoid,
+    attractiveness_fn       = attractiveness_expose, # advanced override for tests/comparisons only --
+                                        # the active model is always the Expose-Sec-2.2 self-vote
+                                        # formula (p_self_mobius_M(..., M = 4)) below regardless of
+                                        # what's plugged in here; see FunctionVersions.R section (A)
+                                        # for the other archived formulas (no longer switchable via
+                                        # a decision_model argument -- removed, see git history for
+                                        # the "legacy"/"gaussian_mobius"/"calib" branches this once had)
     sigma_opinion           = 0,       # SD of logit-space noise on perceived opinion; 0 = exact, "auto" = sd(agents$opinion) for this run
     minority_share          = 0,       # fraction of lay agents in minority group
     opinion_dist            = "normal", # "normal" | "uniform" -- distribution family for clustered group opinions below
@@ -553,22 +583,9 @@ simulate_liquid_democracy <- function(
     majority_opinion_min    = 0,       # lower bound for clustered majority opinions ("uniform" only)
     majority_opinion_max    = 1,       # upper bound for clustered majority opinions ("uniform" only)
     r_ingroup               = 0,       # ingroup responsiveness (0 = no preference)
-    decision_model          = "expose", # "legacy" (dual-sigmoid attractiveness + self-weight, Report 18/19) |
-                                        # "gaussian_mobius" (Gaussian-opinion x logistic-power attractiveness +
-                                        # Mobius self-vote probability, Report 20) |
-                                        # "calib" (Report 21 calibration pipeline: exp-opinion x log-ratio-power
-                                        # attractiveness + Mobius self-vote M=4) |
-                                        # "expose" (default: exact match to the Expose's Sec 2.2 formulas --
-                                        # same as "calib" but with the power term as a linear ratio-minus-one,
-                                        # a_pw = 2*L(r_pw*(p_j/p_i - 1)), per Expose Eq. 7, instead of calib's
-                                        # log-ratio) — one switch to swap the whole delegation-decision formula
-                                        # set; trust (lambda/gamma/tau) below is unaffected either way. See
-                                        # FunctionVersions.R sections (A)/(C).
-    self_reliance_c         = 0.5,     # c in the Mobius P_self curve ("gaussian_mobius" only, ignored otherwise):
+    self_reliance_c         = 0.5,     # c in the Mobius P_self curve (p_self_mobius_M, M = 4):
                                         # self-vote probability when the best neighbour is exactly as attractive
                                         # as agent i itself
-    self_weight_mode        = "raw",   # "raw" | "confidence" — see delegation-decision block ("legacy" only)
-    confidence_agg          = "sum",   # "sum" | "mean" — how "confidence" combines r_op/r_pw/r_ingroup (Report 18; "legacy" only)
     lambda                  = 0,       # trust decay/momentum ("punish_only"/"reward_punish") OR
                                         # adaptation RATE toward the round's target ("relaxation" --
                                         # opposite role: lambda=1 fully adopts the new target each
@@ -592,10 +609,8 @@ simulate_liquid_democracy <- function(
                                         # and therefore exact reproducibility of every
                                         # existing report's cached results -- for any
                                         # caller that doesn't explicitly ask for it. Only
-                                        # takes effect when cycle_fallback == "none" and
-                                        # decision_model %in% c("gaussian_mobius", "calib",
-                                        # "expose"); otherwise silently falls back to the
-                                        # original loop.
+                                        # takes effect when cycle_fallback == "none";
+                                        # otherwise silently falls back to the original loop.
     n_voting_rounds         = NULL     # Expose Sec 1.4.1: T rounds split into "delegating
                                         # rounds" (decision + power/vote resolution only) and
                                         # "voting rounds" (same, PLUS the trust update, Sec
@@ -611,15 +626,6 @@ simulate_liquid_democracy <- function(
                                         # the 60/20/40 standard case.
 ) {
   sim_time_start <- Sys.time()  # covers the whole call: network/agent setup + all T rounds
-
-  # decision_model = "gaussian_mobius" / "calib" swap in the Report 20 / 21
-  # attractiveness formula by default, unless the caller explicitly passed
-  # their own attractiveness_fn (in which case that override wins).
-  if (missing(attractiveness_fn)) {
-    if (decision_model == "gaussian_mobius") attractiveness_fn <- attractiveness_gaussian_log
-    if (decision_model == "calib")           attractiveness_fn <- attractiveness_calib
-    if (decision_model == "expose")          attractiveness_fn <- attractiveness_expose
-  }
 
   # ---------------------------------------------------------
   # Delegating rounds vs. voting rounds (Expose Sec 1.4.1).
@@ -719,8 +725,7 @@ simulate_liquid_democracy <- function(
   #    reproducibility caveat, which does NOT apply to the trust update).
   # ---------------------------------------------------------
   all_lay   <- identical(lay_ids, seq_len(n_all))
-  fast_path <- fast_path && cycle_fallback == "none" &&
-    decision_model %in% c("gaussian_mobius", "calib", "expose") && all_lay
+  fast_path <- fast_path && cycle_fallback == "none" && all_lay
 
   # trust_vectorized also requires all_lay: the original trust-update
   # loop below only updates tau[[i]] for i in lay_ids, and the flattened
@@ -778,12 +783,15 @@ simulate_liquid_democracy <- function(
     sum(sort(x, decreasing = TRUE)[1:n_top]) / sum(x)
   }
 
-  # Helper: minimum fraction of agents (by power desc) to reach 50% of total
+  # Helper: minimum fraction of agents (by power desc) to reach 50% of total.
+  # Denominator is length(x) -- the FULL agent population passed in, zeros
+  # (delegators) included -- not length(pv), which would divide only by the
+  # count of agents with nonzero power and badly understate concentration.
   share_50pct_fn <- function(x) {
     pv <- sort(x[x > 0], decreasing = TRUE)
     if (!length(pv)) return(NA_real_)
     k <- which(cumsum(pv) / sum(pv) >= 0.5)[1]
-    k / length(pv)
+    k / length(x)
   }
 
   for (t in seq_len(T)) {
@@ -847,8 +855,7 @@ simulate_liquid_democracy <- function(
         sum_all[idx_agent] <- sum_by_agent
       }
 
-      w_self_all  <- if (decision_model %in% c("calib", "expose")) p_self_mobius_M(m_all, self_reliance_c, M = 4)
-                     else p_self_mobius(m_all, self_reliance_c)
+      w_self_all  <- p_self_mobius_M(m_all, self_reliance_c, M = 4)
       always_self <- (!has_nb) | (sum_all == 0)
       w_self_all[always_self] <- 1
 
@@ -910,51 +917,11 @@ simulate_liquid_democracy <- function(
         # Best neighbour j* by attractiveness
         j_idx <- which.max(w)
 
-        # Self-vote probability.
-        #   "gaussian_mobius" (Report 20): Mobius curve through
-        #     (m=0 -> 1, m=1 -> c, m=2 -> 0) applied to m = w[j_idx], the best
-        #     neighbour's attractiveness AFTER trust/ingroup modifiers --
-        #     see FunctionVersions.R section (C).
-        #   "legacy" (Report 17/18/19, default): dual-sigmoid self-weight,
-        #     optionally blended toward "confidence" mode (see below).
-        w_self <- if (decision_model == "gaussian_mobius") {
-          p_self_mobius(w[j_idx], self_reliance_c)
-        } else if (decision_model %in% c("calib", "expose")) {
-          p_self_mobius_M(w[j_idx], self_reliance_c, M = 4)
-        } else {
-          # high when best neighbour is ideologically far  → prefer own vote
-          # high when own power exceeds j*'s power        → prefer own vote
-          w_self_raw <- .sig(r_op * (2 * abs(op[i] - op_nb[j_idx]) - 1)) *
-                        .sig(r_pw * log(max(pow[i], 1e-9) / max(pow_nb[j_idx], 1e-9)))
-
-          # "confidence" mode: blends w_self_raw with "always vote for yourself"
-          # using a weight that saturates from 0 (r_tot = 0) to 1 (r_tot -> inf),
-          # so the global delegation rate can span the full 0-1 range instead of
-          # floor-ing at w_self_raw's r=0 value (sig(0)*sig(0) = 0.25). r_ingroup
-          # is included in r_tot so ingroup preference alone can still induce
-          # delegation when r_op = r_pw = 0.
-          #   confidence_agg = "sum"  (default, Report 17): r_tot = r_op+r_pw+r_ingroup
-          #     -- confidence rises with the *number* of active dimensions, not
-          #     just their strength (e.g. two dimensions at 0.5 give more
-          #     confidence than one at 0.5, even if nothing individually changed).
-          #   confidence_agg = "mean" (Report 18): r_tot = average of the
-          #     *active* (non-zero) dimensions -- fixes the artefact above by
-          #     dividing by the count of active dimensions rather than a fixed 3,
-          #     so a permanently-zero dimension (e.g. r_ingroup in Report 17/18's
-          #     diagnostic sweeps) doesn't dilute confidence for no reason.
-          if (self_weight_mode == "confidence") {
-            active_r <- c(r_op, r_pw, r_ingroup)
-            r_tot <- if (confidence_agg == "mean") {
-              sum(active_r) / max(1, sum(active_r > 0))
-            } else {
-              sum(active_r)
-            }
-            conf  <- r_tot / (1 + r_tot)
-            (1 - conf) + conf * w_self_raw
-          } else {
-            w_self_raw
-          }
-        }
+        # Self-vote probability: Mobius curve through (m=0 -> 1, m=1 -> c,
+        # m=M -> 0), M = 4, applied to m = w[j_idx], the best neighbour's
+        # attractiveness AFTER trust/ingroup modifiers -- see
+        # FunctionVersions.R section (D).
+        w_self <- p_self_mobius_M(w[j_idx], self_reliance_c, M = 4)
 
         if (runif(1) < w_self) return(i)
 
@@ -1119,6 +1086,15 @@ simulate_liquid_democracy <- function(
     if (t %in% snapshot_rounds) {
 
       roots_snap <- which(degree(gD, mode = "out") == 0)
+      # NA (not 0) when there are no delegators this round -- a genuine
+      # delegator's chain length is always >= 1 by construction (shortest
+      # distance to a root, excluding roots themselves and cycle members),
+      # so 0 used to be a sentinel for "nobody delegated", stored in the
+      # same column as real chain lengths. Averaging that 0 in alongside
+      # genuine >=1 values (e.g. across a last-5-round window) could pull
+      # the reported mean below 1, which is not a real chain length -- just
+      # contamination from the sentinel. NA lets callers' mean(., na.rm=TRUE)
+      # correctly skip these rounds instead.
       if (length(roots_snap) > 0 && ecount(gD) > 0) {
         dist_mat      <- distances(gD, mode = "out", to = roots_snap)
         chain_lengths <- apply(dist_mat, 1, function(d) {
@@ -1126,9 +1102,9 @@ simulate_liquid_democracy <- function(
         })
         delegating_lengths          <- chain_lengths[!is.na(chain_lengths) & chain_lengths > 0]
         avg_chain_length_delegators <- if (length(delegating_lengths) > 0)
-          mean(delegating_lengths) else 0
+          mean(delegating_lengths) else NA_real_
       } else {
-        avg_chain_length_delegators <- 0
+        avg_chain_length_delegators <- NA_real_
       }
 
       active_nodes <- which(degree(gD, mode = "all") > 0)
@@ -1144,8 +1120,6 @@ simulate_liquid_democracy <- function(
       }
 
       stab <- history_stability[t]
-
-      rep_power <- represented$power
 
       # ---- Minority metrics ------------------------------------------------
       min_ids_s   <- which(agents$group == "minority")
@@ -1163,6 +1137,21 @@ simulate_liquid_democracy <- function(
       # not 1, since their vote is cast by their root, not by them.
       root_power <- numeric(n_all)
       if (length(roots_snap) > 0) root_power[roots_snap] <- agents$power[roots_snap]
+
+      # Population-wide power-concentration metrics (gini_power,
+      # top5_power_share, share_50pct below) use root_power directly --
+      # full n_all length, zero-padded for delegators (see root_power
+      # above) -- so "top 5%"/"50% of agents" are taken against the WHOLE
+      # population, per the Expose's Table-1 definitions. rep_power used to
+      # be `represented$power` (every represented agent, delegators
+      # included), which pads the distribution with a spurious "1" per
+      # delegator and understates real concentration; a later fix narrowed
+      # it to `root_power[roots_snap]` (roots only), which instead shrank
+      # the denominator these three metrics divide by down to the number
+      # of roots -- silently changing what "5%"/"agents" means and badly
+      # UNDERstating concentration whenever most agents delegate (the norm
+      # here). Both bugs are fixed by using the full zero-padded vector.
+      rep_power <- root_power
 
       minority_power <- sum(root_power[min_ids_s])
       majority_power <- sum(root_power[maj_ids_s])
@@ -1256,8 +1245,13 @@ simulate_liquid_democracy <- function(
       else NA_real_
 
       min_vtr <- min_ids_s[!is.na(agents$my_vote[min_ids_s])]
-      min_enp <- if (length(min_vtr) > 0) {
-        pm <- agents$power[min_vtr]
+      # Same root-restriction fix as rep_power above -- min_enp used to
+      # include every represented minority agent's power (agents$power[min_vtr]),
+      # padding the distribution with delegators' spurious baseline-1 power
+      # and understating true concentration among the minority's own roots.
+      min_root_ids_s <- intersect(min_ids_s, roots_snap)
+      min_enp <- if (length(min_root_ids_s) > 0) {
+        pm <- root_power[min_root_ids_s]
         if (sum(pm) > 0) 1 / sum((pm / sum(pm))^2) else NA_real_
       } else NA_real_
 
@@ -1356,6 +1350,11 @@ simulate_liquid_democracy <- function(
     delegation_graphs    = delegation_graphs,
     final_graph          = delegation_graphs[[T]],
     friendship_graph     = gF,
+    tau_final            = tau,  # final trust state (list, one vector per agent, positionally aligned
+                                  # with neighbors(gF, v, mode="out")); NULL if trust was never active
+                                  # (lambda==0 && gamma==0). Output-only addition -- does not affect any
+                                  # model equation, purely exposes existing internal state for
+                                  # post-hoc attractiveness recomputation (Report_22 Sec 1).
     sim_time_sec         = as.numeric(difftime(Sys.time(), sim_time_start, units = "secs"))
   )
 }
