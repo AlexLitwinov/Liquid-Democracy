@@ -1,0 +1,405 @@
+---
+title: "Report 22, Part 4 -- Chain-length distribution and lost-vote cycle structure"
+output: github_document
+date: "2026-09-05"
+---
+
+> **Split note:** Split out of `Report_22.Rmd` so each part can be knit
+> independently. See `Report_22_2_KDecision.Rmd` and
+> `Report_22_3_RSaturation.Rmd` for the rest (a context-only
+> `Report_22_1_KContext.Rmd` was dropped -- nothing downstream depends on
+> it). This part needs `CHOSEN_K_22` (from Part 2) and the shared/isolated r-grid
+> definitions (from Part 3, Sec 3.1) -- both are silently reproduced below
+> via the same `run_cached()` disk caches those parts use, so if Parts 2/3
+> have already been knit once this hits the cache and is fast. This part's
+> own simulations (the chain/cycle detail runs) are separate cache entries
+> from Part 3's -- Part 3's raw sweep results are not needed here, only its
+> grid *definitions*.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 13, fig.height = 8)
+library(tidyverse)
+library(here)
+library(knitr)
+library(furrr)
+library(digest)
+library(igraph)
+library(mgcv)
+
+theme_set(theme_minimal(base_size = 12))
+source(here::here("scripts/Network.R"))
+dir.create(here::here("reports/Report_22_4_ChainCycles_files/figure-gfm"), recursive = TRUE, showWarnings = FALSE)
+dir.create(here::here("data"), showWarnings = FALSE)
+
+N_WORKERS <- max(1L, parallel::detectCores() - 1)
+
+run_cached <- function(cache_name, fn, hash_obj) {
+  hash       <- digest::digest(hash_obj)
+  cache_file <- here::here(paste0("data/", cache_name, "_cache.rds"))
+  if (file.exists(cache_file)) {
+    cc <- readRDS(cache_file)
+    if (identical(cc$hash, hash)) return(cc$data)
+  }
+  out <- fn()
+  saveRDS(list(hash = hash, data = out), cache_file)
+  out
+}
+
+FACET_SPACING <- theme(panel.spacing.y = unit(1, "cm"))
+
+# Context-sweep constants (same values as Report_22.Rmd's original Sec 1
+# p1-config -- kept here directly since the split-out context-only part
+# was dropped; only the subset Part 4 itself needs).
+N_BASE <- 1000L
+T_CONTEXT  <- 30L
+NV_CONTEXT <- 10L
+LAMBDA_CONTEXT <- 0.1
+```
+
+```{r reused-k-decision, include=FALSE}
+# Reproduces Report 22 Part 2 (Sec 2.2-2.6) exactly, to obtain CHOSEN_K_22.
+# Hits Part 2's own run_cached() disk cache when available -- see
+# Report_22_2_KDecision.Rmd for the full annotated version.
+# FAST-RUN / design change: must match Report_22_2's copy of this chunk --
+# 5 shared r_op=r_pw=r_tr dial levels, not 10 random independent triples.
+N_R_TRIPLES     <- 5L
+R_SHARED_LEVELS <- c(0, 1, 4, 16, 32)
+r_triples <- tibble(
+  triple_id = seq_along(R_SHARED_LEVELS),
+  r_op = R_SHARED_LEVELS,
+  r_pw = R_SHARED_LEVELS,
+  r_tr = R_SHARED_LEVELS
+)
+
+WARMUP_CONFIGS <- tribble(
+  ~warmup_label, ~T_warmup, ~nv_warmup,
+  "T=30, nv=10",  30L,       10L,
+  "T=60, nv=20",  60L,       20L
+) |> slice(1)  # FAST-RUN: must match Report_22_2's copy of this chunk
+LAMBDA_WARMUP <- 0.1
+
+K_SWEEP_THRESH <- seq(10, 150, by = 20)  # FAST-RUN: must match Report_22_2's copy of this chunk
+A_THRESHOLD <- 1
+TARGET_QUALIFYING <- 12
+N_SEEDS_K <- 5L  # FAST-RUN: must match Report_22_2's copy of this chunk
+N_THRESH  <- 2000L
+
+count_qualifying_cell <- function(seed, K, triple_id, r_op, r_pw, r_tr, T_warmup, nv_warmup) {
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = N_THRESH, n_communities = 1, node_degree = K, T = T_warmup,
+    n_voting_rounds = nv_warmup,
+    r_op = r_op, r_pw = r_pw, gamma = r_tr, lambda = LAMBDA_WARMUP, k1 = 1, k2 = 1,
+    self_reliance_c = 0.5, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05
+  )
+  gF  <- res$friendship_graph
+  op  <- res$agents$opinion
+  pow <- res$agents$power
+  tau_list <- res$tau_final
+  n_all <- nrow(res$agents)
+
+  qualifying_counts <- vapply(seq_len(n_all), function(i) {
+    nb <- as.integer(neighbors(gF, i, mode = "out"))
+    if (!length(nb)) return(0L)
+    a_op_pw   <- attractiveness_expose(op[i], op[nb], pow[i], pow[nb], r_op, r_pw)
+    trust_mod <- if (!is.null(tau_list)) 2 * .sig(r_tr * (tau_list[[i]] - 1)) else 1
+    sum(a_op_pw * trust_mod >= A_THRESHOLD)
+  }, integer(1L))
+
+  tibble(seed = seed, K = K, triple_id = triple_id, mean_qualifying = mean(qualifying_counts))
+}
+
+grid_thresh <- tidyr::crossing(K = K_SWEEP_THRESH, triple_id = r_triples$triple_id, seed = seq_len(N_SEEDS_K)) |>
+  left_join(r_triples, by = "triple_id")
+
+run_warmup_pass <- function(T_warmup, nv_warmup, cache_suffix) {
+  run_cached(paste0("r22k_thresh_raw_", cache_suffix), function() {
+    plan(multisession, workers = N_WORKERS)
+    out <- future_pmap_dfr(grid_thresh, function(K, triple_id, seed, r_op, r_pw, r_tr)
+      count_qualifying_cell(seed, K, triple_id, r_op, r_pw, r_tr, T_warmup, nv_warmup),
+      .options = furrr_options(seed = NULL))
+    plan(sequential)
+    out
+  }, list(grid_thresh, T_warmup, nv_warmup, A_THRESHOLD, N_THRESH, v = 1))
+}
+
+thresh_raw_all <- WARMUP_CONFIGS |>
+  purrr::pmap(function(warmup_label, T_warmup, nv_warmup) {
+    run_warmup_pass(T_warmup, nv_warmup, gsub("[^A-Za-z0-9]", "", warmup_label)) |>
+      mutate(warmup_label = warmup_label)
+  }) |>
+  bind_rows() |>
+  mutate(warmup_label = factor(warmup_label, levels = WARMUP_CONFIGS$warmup_label))
+
+thresh_per_triple <- thresh_raw_all |>
+  group_by(warmup_label, K, triple_id) |>
+  summarise(mean_over_seeds = mean(mean_qualifying), .groups = "drop")
+
+thresh_summary <- thresh_per_triple |>
+  group_by(warmup_label, K) |>
+  summarise(mean_val = mean(mean_over_seeds),
+            min_val  = min(mean_over_seeds),
+            max_val  = max(mean_over_seeds),
+            sd_val   = sd(mean_over_seeds), .groups = "drop")
+
+decision_by_warmup <- thresh_summary |>
+  group_by(warmup_label) |>
+  group_modify(~ {
+    clearing <- .x |> filter(mean_val >= TARGET_QUALIFYING) |> pull(K)
+    reached  <- length(clearing) > 0
+    tibble(target_reached  = reached,
+           chosen_k        = if (reached) min(clearing) else max(K_SWEEP_THRESH),
+           max_qualifying  = max(.x$mean_val))
+  }) |>
+  ungroup()
+
+WARMUPS_AGREE <- length(unique(decision_by_warmup$chosen_k)) == 1 &&
+  all(decision_by_warmup$target_reached)
+CHOSEN_K_22 <- if (WARMUPS_AGREE) decision_by_warmup$chosen_k[1] else max(decision_by_warmup$chosen_k)
+```
+
+```{r reused-r-grid, include=FALSE}
+# Reproduces Report 22 Part 3's Sec 3.1 grid *definitions* only (not its
+# sweep results -- this part's own simulations are independent cache
+# entries, see run_shared_cell_detail/run_isolated_cell_detail below).
+R_OPTR_MAX     <- c(0, 2^(0:15))
+R_SHARED_MAX   <- R_OPTR_MAX
+R_PW_MAX       <- R_OPTR_MAX
+
+R_ISOLATED_GRID <- bind_rows(
+  tibble(dim = "op", r_val = R_OPTR_MAX),
+  tibble(dim = "pw", r_val = R_PW_MAX),
+  tibble(dim = "tr", r_val = R_OPTR_MAX)
+)
+
+N_SEEDS_R <- 5L
+
+grid_r_shared   <- tidyr::crossing(r_shared = R_SHARED_MAX, seed = seq_len(N_SEEDS_R))
+grid_r_isolated <- R_ISOLATED_GRID |> tidyr::crossing(seed = seq_len(N_SEEDS_R))
+```
+
+# 4. Chain-length distribution and lost-vote cycle structure
+
+Report 22 Part 3, Sections 3.2-3.5, show only the *mean* chain length per
+condition, which can hide a distribution that is heavily skewed by a
+large cluster of very short chains. This section re-runs the same
+shared/isolated grids (same seeds, same K, same T/n_voting_rounds design)
+capturing the actual per-agent chain-length distribution and each
+round's lost-vote cycle-length breakdown -- neither of which the Part 3
+mean-only pipeline retains -- rather than just their means.
+
+```{r p4-config}
+LAST5_CONTEXT <- (T_CONTEXT - 4L):T_CONTEXT
+
+# res$cycle_breakdown is bind_rows() of a per-round list that stays NULL
+# whenever a round has zero lost votes -- if that's true for EVERY round in
+# a simulation, bind_rows(all-NULL) yields a 0-column tibble; filtering
+# `round %in% ...` on that then fails, since dplyr's NSE falls back to the
+# calling environment and finds base::round (a function, not a vector)
+# instead of a missing column. Guarded the same way as elsewhere in this
+# report: return a properly-typed empty tibble rather than filtering blind.
+empty_cycle_dist <- tibble(round = integer(0), cycle_length = integer(0), n_agents = integer(0))
+filter_cycle_breakdown <- function(cb, rounds) {
+  if (nrow(cb) == 0 || !"round" %in% names(cb)) return(empty_cycle_dist)
+  dplyr::filter(cb, round %in% rounds)
+}
+
+chain_lengths_this_cell <- function(res, rounds) {
+  purrr::map_dfr(rounds, function(t) {
+    gD      <- res$delegation_graphs[[t]]
+    roots_t <- which(igraph::degree(gD, mode = "out") == 0)
+    if (!length(roots_t) || igraph::ecount(gD) == 0)
+      return(tibble(round = t, chain_length = numeric(0)))
+    dist_mat <- igraph::distances(gD, mode = "out", to = roots_t)
+    cl <- apply(dist_mat, 1, function(d) { fd <- d[is.finite(d)]; if (length(fd)) min(fd) else NA_real_ })
+    tibble(round = t, chain_length = cl[!is.na(cl) & cl > 0])
+  })
+}
+```
+
+```{r p4-run}
+run_shared_cell_detail <- function(seed, r_shared) {
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = N_BASE, n_communities = 1, node_degree = CHOSEN_K_22, T = T_CONTEXT,
+    n_voting_rounds = NV_CONTEXT,
+    r_op = r_shared, r_pw = r_shared, gamma = r_shared, lambda = LAMBDA_CONTEXT, k1 = 1, k2 = 1,
+    self_reliance_c = 0.5, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05,
+    snap_rounds = seq_len(T_CONTEXT)
+  )
+  list(
+    chain = chain_lengths_this_cell(res, LAST5_CONTEXT) |> mutate(r_shared = r_shared, seed = seed, .before = 1),
+    cyc   = filter_cycle_breakdown(res$cycle_breakdown, LAST5_CONTEXT) |> mutate(r_shared = r_shared, seed = seed, .before = 1)
+  )
+}
+
+run_isolated_cell_detail <- function(seed, dim, r_val) {
+  r_op <- if (dim == "op") r_val else 0
+  r_pw <- if (dim == "pw") r_val else 0
+  r_tr <- if (dim == "tr") r_val else 0
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = N_BASE, n_communities = 1, node_degree = CHOSEN_K_22, T = T_CONTEXT,
+    n_voting_rounds = NV_CONTEXT,
+    r_op = r_op, r_pw = r_pw, gamma = r_tr, lambda = LAMBDA_CONTEXT, k1 = 1, k2 = 1,
+    self_reliance_c = 0.5, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05,
+    snap_rounds = seq_len(T_CONTEXT)
+  )
+  cl_df <- chain_lengths_this_cell(res, LAST5_CONTEXT)
+  # 37 x-levels x 10 seeds = 370 cells for the isolated grid -- too many to
+  # keep raw per-agent values (a violin would be unreadable and the cache
+  # would bloat); a compact per-cell min/median/max summary instead (the
+  # box-style fallback), one row per cell rather than one row per agent.
+  chain_summary <- if (nrow(cl_df) > 0) {
+    tibble(min    = min(cl_df$chain_length),
+           median = median(cl_df$chain_length),
+           max    = max(cl_df$chain_length),
+           n      = nrow(cl_df))
+  } else {
+    tibble(min = NA_real_, median = NA_real_, max = NA_real_, n = 0L)
+  }
+  list(
+    chain = chain_summary |> mutate(dim = dim, r_val = r_val, seed = seed, .before = 1),
+    cyc   = filter_cycle_breakdown(res$cycle_breakdown, LAST5_CONTEXT) |> mutate(dim = dim, r_val = r_val, seed = seed, .before = 1)
+  )
+}
+
+detail_shared_list <- run_cached("r22r_shared_detail", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap(grid_r_shared, function(r_shared, seed) run_shared_cell_detail(seed, r_shared),
+                      .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(R_SHARED_MAX, N_SEEDS_R, CHOSEN_K_22, T_CONTEXT, NV_CONTEXT, LAMBDA_CONTEXT, v = 1))
+
+detail_isolated_list <- run_cached("r22r_isolated_detail", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap(grid_r_isolated, function(dim, r_val, seed) run_isolated_cell_detail(seed, dim, r_val),
+                      .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(R_ISOLATED_GRID, N_SEEDS_R, CHOSEN_K_22, T_CONTEXT, NV_CONTEXT, LAMBDA_CONTEXT, v = 1))
+
+chain_raw_shared       <- bind_rows(lapply(detail_shared_list,   `[[`, "chain"))
+cyc_raw_shared         <- bind_rows(lapply(detail_shared_list,   `[[`, "cyc"))
+chain_summary_isolated <- bind_rows(lapply(detail_isolated_list, `[[`, "chain"))
+cyc_raw_isolated       <- bind_rows(lapply(detail_isolated_list, `[[`, "cyc"))
+```
+
+## 4.1 Chain-length distribution, shared dial (violin)
+
+Only 9 conditions on the shared dial -- few enough for a legible violin
+per facet-free single plot (tried first, per the brief; the isolated grid
+below has 37 x-levels, which would make overlapping violins unreadable,
+so it gets the box-style min/median/max fallback instead).
+
+```{r p4-violin-shared, fig.height=7}
+chain_raw_shared |>
+  ggplot(aes(factor(r_shared, levels = R_SHARED_MAX), chain_length)) +
+  geom_violin(fill = "grey85", colour = "grey40", scale = "width") +
+  geom_boxplot(width = 0.12, outlier.shape = NA, colour = "grey20") +
+  labs(title = "Delegation chain-length distribution -- shared dial",
+       subtitle = sprintf("K=%d, N=%d -- %d seeds x last-5 rounds pooled per r (delegators only)",
+                           CHOSEN_K_22, N_BASE, N_SEEDS_R),
+       x = "r_op = r_pw = r_tr", y = "Chain length") +
+  FACET_SPACING
+```
+
+## 4.2 Chain-length distribution, isolated dimensions (min/median/max)
+
+```{r p4-box-isolated, fig.height=9}
+chain_summary_isolated_agg <- chain_summary_isolated |>
+  filter(n > 0) |>
+  group_by(dim, r_val) |>
+  summarise(min = mean(min), median = mean(median), max = mean(max), .groups = "drop")
+
+chain_summary_isolated_agg |>
+  ggplot(aes(r_val)) +
+  geom_ribbon(aes(ymin = min, ymax = max), alpha = 0.15) +
+  geom_line(aes(y = median), linewidth = 0.8, colour = "grey20") +
+  geom_point(aes(y = median), size = 1.6, colour = "grey20") +
+  scale_x_continuous(trans = "log1p", breaks = c(0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768)) +
+  facet_wrap(~dim, ncol = 1, scales = "free_x",
+             labeller = as_labeller(c(op = "r_op", pw = "r_pw", tr = "r_tr"))) +
+  labs(title = "Delegation chain-length distribution -- isolated dimensions",
+       subtitle = sprintf("K=%d, N=%d -- %d seeds per point; ribbon = min-max, line = median (per-seed cell summaries averaged)",
+                           CHOSEN_K_22, N_BASE, N_SEEDS_R),
+       x = "r value (log1p scale)", y = "Chain length") +
+  FACET_SPACING
+```
+
+Cells where nobody delegated in any of the last 5 rounds (`n == 0`,
+possible at extreme $r_{op}$/$r_{tr}$, see the `chain_length` NA fix in
+`Network.R`) are excluded from this aggregate rather than contributing an
+undefined min/median/max.
+
+## 4.3 Are lost votes dominated by short (2-agent) cycles?
+
+Raised earlier but never actually checked: is vote loss mostly caused by
+short back-and-forth cycles ($i\to j\to i$) specifically, or by longer
+cycles? `Network.R` already tracks exactly this
+(`cycle_breakdown`: round, cycle\_length, n\_agents; `NA` cycle\_length =
+a "tail" agent who delegates *into* a cycle without being a cycle member
+itself, per that field's own docstring) -- reused here rather than
+re-derived.
+
+```{r p4-cycle-breakdown}
+cyc_all <- bind_rows(
+  cyc_raw_shared   |> transmute(dim = "shared", r_val = r_shared, cycle_length, n_agents),
+  cyc_raw_isolated |> transmute(dim, r_val, cycle_length, n_agents)
+)
+HAS_ANY_CYCLES <- nrow(cyc_all) > 0
+
+if (HAS_ANY_CYCLES) {
+  cyc_all <- cyc_all |>
+    mutate(cyc_class = case_when(
+      is.na(cycle_length) ~ "tail (delegates into a cycle, not a member)",
+      cycle_length == 2    ~ "2-cycle (i <-> j)",
+      TRUE                 ~ "longer cycle (>=3)"
+    ))
+  cyc_summary <- cyc_all |>
+    group_by(dim, r_val, cyc_class) |>
+    summarise(n_agents = sum(n_agents), .groups = "drop") |>
+    group_by(dim, r_val) |>
+    mutate(share_of_lost = n_agents / sum(n_agents)) |>
+    ungroup()
+}
+```
+
+```{r p4-cycle-empty-prose, results = "asis"}
+if (!HAS_ANY_CYCLES) cat(sprintf(
+  "**No lost votes at all were observed anywhere in this section** -- across all %d (dimension, r) conditions x %d seeds x the last 5 of %d rounds, the cycle-breakdown data came back empty every single time. At the calibrated K=%d, agents have enough alternative delegation targets that a circular chain (nobody among a small closed loop able to reach a root) essentially never forms in steady state within this r-range -- so the 2-cycle-vs-longer question has no data to answer *at this K*; it would need either a much lower K (as used in earlier reports/RQ1, before the Part 2 K re-calibration) or a longer observation window to find any lost votes to break down.",
+  length(R_SHARED_MAX) + nrow(R_ISOLATED_GRID), N_SEEDS_R, T_CONTEXT, CHOSEN_K_22
+))
+```
+
+```{r p4-cycle-plot, fig.height=8, eval=HAS_ANY_CYCLES}
+cyc_summary |>
+  ggplot(aes(r_val, share_of_lost, fill = cyc_class)) +
+  geom_col(position = "stack", width = 0.6) +
+  scale_x_continuous(trans = "log1p", breaks = c(0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768)) +
+  scale_fill_viridis_d(name = NULL, end = 0.85) +
+  facet_wrap(~dim, ncol = 1, scales = "free_x",
+             labeller = as_labeller(c(op = "r_op", pw = "r_pw", tr = "r_tr", shared = "r_op=r_pw=r_tr"))) +
+  labs(title = "Composition of lost votes by cycle length",
+       subtitle = sprintf("K=%d, N=%d -- %d seeds x last-5 rounds pooled per condition",
+                           CHOSEN_K_22, N_BASE, N_SEEDS_R),
+       x = "r value (log1p scale)", y = "Share of lost-vote agents") +
+  theme(legend.position = "top") + FACET_SPACING
+```
+
+```{r p4-cycle-prose, results = "asis", eval=HAS_ANY_CYCLES}
+overall <- cyc_all |>
+  group_by(cyc_class) |>
+  summarise(n_agents = sum(n_agents), .groups = "drop") |>
+  mutate(share = n_agents / sum(n_agents))
+two_cyc_share <- overall$share[overall$cyc_class == "2-cycle (i <-> j)"]
+if (!length(two_cyc_share)) two_cyc_share <- 0
+cat(sprintf(
+  "Pooled across every condition and seed in this section, **%.1f%%** of all lost-vote agent-rounds are 2-cycles specifically -- %s.",
+  100 * two_cyc_share,
+  if (two_cyc_share > 0.5) "confirming lost votes are indeed dominated by short back-and-forth cycles, not longer ones"
+  else "so lost votes are **not** predominantly short 2-cycles here; longer cycles and/or tail agents feeding into a cycle make up the larger share"
+))
+```

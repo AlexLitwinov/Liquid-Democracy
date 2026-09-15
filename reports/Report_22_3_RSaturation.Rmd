@@ -1,0 +1,559 @@
+---
+title: "Report 22, Part 3 -- Responsiveness-range saturation"
+output: github_document
+date: "2026-09-05"
+---
+
+> **Split note:** Split out of `Report_22.Rmd` so each part can be knit
+> independently. See `Report_22_2_KDecision.Rmd` and
+> `Report_22_2b_TCalibration.Rmd` (also `Report_22_4_ChainCycles.Rmd`, not yet
+> wired to this pipeline) for the rest (a context-only
+> `Report_22_1_KContext.Rmd` was dropped -- nothing downstream depends on
+> it). This part needs `CHOSEN_K_22` from Part 2 and `CHOSEN_T_22`/
+> `CHOSEN_NV_22` from Part 2b, so the hidden `reused-k-decision` and
+> `reused-t-calibration` chunks below silently re-run those parts' full
+> computations -- via the same `run_cached()` disk caches those parts
+> populate, so if they've already been knit once this hits the cache and is
+> fast, not a full re-simulation. See `Report_22_2_KDecision.Rmd` and
+> `Report_22_2b_TCalibration.Rmd` for the annotated versions of this same
+> computation.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 13, fig.height = 8)
+library(tidyverse)
+library(here)
+library(knitr)
+library(furrr)
+library(digest)
+library(igraph)
+
+theme_set(theme_minimal(base_size = 12))
+source(here::here("scripts/Network.R"))
+dir.create(here::here("reports/Report_22_3_RSaturation_files/figure-gfm"), recursive = TRUE, showWarnings = FALSE)
+dir.create(here::here("data"), showWarnings = FALSE)
+
+N_WORKERS <- max(1L, parallel::detectCores() - 1)
+
+run_cached <- function(cache_name, fn, hash_obj) {
+  hash       <- digest::digest(hash_obj)
+  cache_file <- here::here(paste0("data/", cache_name, "_cache.rds"))
+  if (file.exists(cache_file)) {
+    cc <- readRDS(cache_file)
+    if (identical(cc$hash, hash)) return(cc$data)
+  }
+  out <- fn()
+  saveRDS(list(hash = hash, data = out), cache_file)
+  out
+}
+
+metrics_core   <- c("flickerness", "delegation_rate", "lost_vote_rate", "chain_length")
+metric_labels  <- c(flickerness = "flickerness", delegation_rate = "Delegation rate",
+                     lost_vote_rate = "Lost-vote rate", chain_length = "Avg. chain length",
+                     top5_power_share = "Top-5% voting-power share")
+
+metrics_r <- c("delegation_rate", "flickerness", "lost_vote_rate", "top5_power_share")
+
+RATE_METRICS_01 <- c("flickerness", "Delegation rate", "Lost-vote rate", "Top-5% voting-power share")
+
+y_anchor_01 <- function(metric_factor_levels, x_val) {
+  present <- intersect(RATE_METRICS_01, metric_factor_levels)
+  if (!length(present)) return(tibble(metric = factor(character(0), levels = metric_factor_levels), y = numeric(0), x = numeric(0)))
+  tidyr::crossing(metric = factor(present, levels = metric_factor_levels), y = c(0, 1), x = x_val)
+}
+
+FACET_SPACING <- theme(panel.spacing.y = unit(1, "cm"))
+
+steady_state_per_seed <- function(raw_df, round_max, window, id_cols, metrics = metrics_core) {
+  raw_df |>
+    filter(round > round_max - window) |>
+    pivot_longer(all_of(metrics), names_to = "metric", values_to = "value") |>
+    group_by(across(all_of(c(id_cols, "metric")))) |>
+    summarise(steady_val = mean(value, na.rm = TRUE), .groups = "drop")
+}
+steady_state_summary <- function(per_seed_df, group_cols) {
+  per_seed_df |>
+    group_by(across(all_of(c(group_cols, "metric")))) |>
+    summarise(mean_val = mean(steady_val, na.rm = TRUE),
+              sd_val   = sd(steady_val, na.rm = TRUE),
+              n_val    = sum(!is.na(steady_val)),
+              se_val   = sd_val / sqrt(n_val), .groups = "drop")
+}
+
+# Context-sweep constants this part itself needs. T_CONTEXT/NV_CONTEXT are
+# NOT hardcoded here anymore -- they're set right after the
+# reused-t-calibration chunk below, from Part 2b's CHOSEN_T_22/CHOSEN_NV_22.
+N_BASE <- 1000L
+LAMBDA_CONTEXT <- 0.1
+```
+
+```{r reused-k-decision, include=FALSE}
+R_SHARED_LEVELS <- c(0, 1, 4, 16, 32)
+
+r_triples <- tibble(
+  triple_id = seq_along(R_SHARED_LEVELS),
+  r_op = R_SHARED_LEVELS,
+  r_pw = R_SHARED_LEVELS,
+  r_tr = R_SHARED_LEVELS
+)
+N_R_TRIPLES <- nrow(r_triples)
+
+WARMUP_CONFIGS <- tribble(
+  ~warmup_label, ~T_warmup, ~nv_warmup,
+  "T=30, nv=10",  30L,       10L,
+  "T=60, nv=20",  60L,       20L
+) |> slice(1)  # FAST-RUN: must match Report_22_2's copy of this chunk
+LAMBDA_WARMUP <- 0.1
+
+K_SWEEP_THRESH <- seq(10, 150, by = 20)  # FAST-RUN: must match Report_22_2's copy of this chunk
+A_THRESHOLD <- 1
+TARGET_QUALIFYING <- 12
+N_SEEDS_K <- 5L
+N_THRESH  <- 1000L # FAST-RUN: lowest possible -- must match Report_22_2's copy of this chunk
+
+count_qualifying_cell <- function(seed, K, triple_id, r_op, r_pw, r_tr, T_warmup, nv_warmup) {
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = N_THRESH, n_communities = 1, node_degree = K, T = T_warmup,
+    n_voting_rounds = nv_warmup,
+    r_op = r_op, r_pw = r_pw, gamma = r_tr, lambda = LAMBDA_WARMUP, k1 = 1, k2 = 1,
+    self_reliance_c = 0.5, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05
+  )
+  gF  <- res$friendship_graph
+  op  <- res$agents$opinion
+  pow <- res$agents$power
+  tau_list <- res$tau_final
+  n_all <- nrow(res$agents)
+
+  qualifying_counts <- vapply(seq_len(n_all), function(i) {
+    nb <- as.integer(neighbors(gF, i, mode = "out"))
+    if (!length(nb)) return(0L)
+    a_op_pw   <- attractiveness_expose(op[i], op[nb], pow[i], pow[nb], r_op, r_pw)
+    trust_mod <- if (!is.null(tau_list)) 2 * .sig(r_tr * (tau_list[[i]] - 1)) else 1
+    sum(a_op_pw * trust_mod >= A_THRESHOLD)
+  }, integer(1L))
+
+  tibble(seed = seed, K = K, triple_id = triple_id, mean_qualifying = mean(qualifying_counts))
+}
+
+grid_thresh <- tidyr::crossing(K = K_SWEEP_THRESH, triple_id = r_triples$triple_id, seed = seq_len(N_SEEDS_K)) |>
+  left_join(r_triples, by = "triple_id")
+
+run_warmup_pass <- function(T_warmup, nv_warmup, cache_suffix) {
+  run_cached(paste0("r22k_thresh_raw_", cache_suffix), function() {
+    plan(multisession, workers = N_WORKERS)
+    out <- future_pmap_dfr(grid_thresh, function(K, triple_id, seed, r_op, r_pw, r_tr)
+      count_qualifying_cell(seed, K, triple_id, r_op, r_pw, r_tr, T_warmup, nv_warmup),
+      .options = furrr_options(seed = NULL))
+    plan(sequential)
+    out
+  }, list(grid_thresh, T_warmup, nv_warmup, A_THRESHOLD, N_THRESH, v = 1))
+}
+
+thresh_raw_all <- WARMUP_CONFIGS |>
+  purrr::pmap(function(warmup_label, T_warmup, nv_warmup) {
+    run_warmup_pass(T_warmup, nv_warmup, gsub("[^A-Za-z0-9]", "", warmup_label)) |>
+      mutate(warmup_label = warmup_label)
+  }) |>
+  bind_rows() |>
+  mutate(warmup_label = factor(warmup_label, levels = WARMUP_CONFIGS$warmup_label))
+
+thresh_per_triple <- thresh_raw_all |>
+  group_by(warmup_label, K, triple_id) |>
+  summarise(mean_over_seeds = mean(mean_qualifying), .groups = "drop")
+
+thresh_summary <- thresh_per_triple |>
+  group_by(warmup_label, K) |>
+  summarise(mean_val = mean(mean_over_seeds),
+            min_val  = min(mean_over_seeds),
+            max_val  = max(mean_over_seeds),
+            sd_val   = sd(mean_over_seeds), .groups = "drop")
+
+decision_by_warmup <- thresh_summary |>
+  group_by(warmup_label) |>
+  group_modify(~ {
+    clearing <- .x |> filter(mean_val >= TARGET_QUALIFYING) |> pull(K)
+    reached  <- length(clearing) > 0
+    tibble(target_reached  = reached,
+           chosen_k        = if (reached) min(clearing) else max(K_SWEEP_THRESH),
+           max_qualifying  = max(.x$mean_val))
+  }) |>
+  ungroup()
+
+WARMUPS_AGREE <- length(unique(decision_by_warmup$chosen_k)) == 1 &&
+  all(decision_by_warmup$target_reached)
+CHOSEN_K_22 <- if (WARMUPS_AGREE) decision_by_warmup$chosen_k[1] else max(decision_by_warmup$chosen_k)
+```
+
+```{r reused-t-calibration, include=FALSE}
+# Reproduces Report 22 Part 2b (Sec 2b.1-2b.4) exactly, to obtain
+# CHOSEN_NV_22/CHOSEN_DT_22/CHOSEN_T_22. Hits Part 2b's own run_cached() disk
+# cache when available -- see Report_22_2b_TCalibration.Rmd for the full
+# annotated version. Must match Report_22_2b's copy of this chunk.
+DT_CANDIDATES  <- c(1, 2, 3, 5, 10)
+NV_MAX         <- 50L
+N_SEEDS_T      <- 1L  # FAST-RUN: lowest possible -- must match Report_22_2b's copy of this chunk
+SAT_DELTA_FRAC <- 0.01
+NV_BUFFER_FRAC <- 0.10
+
+r_levels_t <- tibble(
+  r_label = factor(as.character(R_SHARED_LEVELS), levels = as.character(R_SHARED_LEVELS)),
+  r_val   = R_SHARED_LEVELS
+)
+
+run_t_cell <- function(seed, dt, r_val) {
+  T_max <- NV_MAX * dt
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = N_BASE, n_communities = 1, node_degree = CHOSEN_K_22, T = T_max,
+    n_voting_rounds = NV_MAX,
+    r_op = r_val, r_pw = r_val, gamma = r_val, lambda = LAMBDA_CONTEXT, k1 = 1, k2 = 1,
+    self_reliance_c = 0.5, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05,
+    snap_rounds = seq_len(T_max)
+  )
+  vr <- res$voting_rounds
+  chain_idx <- match(vr, res$snapshots$round)
+  tibble(
+    seed = seed, dt = dt, r_val = r_val, nv = seq_along(vr),
+    delegation_rate = res$history_delegation[vr],
+    lost_vote_rate  = res$history_lost[vr],
+    flickerness     = res$history_flickerness[vr],
+    chain_length    = res$snapshots$avg_chain_length_delegators[chain_idx]
+  )
+}
+
+grid_t <- tidyr::crossing(dt = DT_CANDIDATES, r_val = R_SHARED_LEVELS, seed = seq_len(N_SEEDS_T))
+
+t_raw <- run_cached("r22t_calib_raw", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_t, function(dt, r_val, seed) run_t_cell(seed, dt, r_val),
+                          .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(DT_CANDIDATES, R_SHARED_LEVELS, N_SEEDS_T, NV_MAX, CHOSEN_K_22, N_BASE, LAMBDA_CONTEXT, v = 1))
+
+t_summary <- t_raw |>
+  pivot_longer(all_of(metrics_core), names_to = "metric", values_to = "value") |>
+  group_by(dt, r_val, nv, metric) |>
+  summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop") |>
+  left_join(r_levels_t, by = "r_val") |>
+  mutate(metric = factor(metric_labels[metric], levels = unname(metric_labels[metrics_core])))
+
+saturation_nv <- function(sub) {
+  sub <- sub |> arrange(nv)
+  d <- abs(sub$mean_val - dplyr::lag(sub$mean_val))
+  peak <- suppressWarnings(max(d, na.rm = TRUE))
+  if (!is.finite(peak)) return(NA_integer_)
+  if (peak == 0) return(min(sub$nv, na.rm = TRUE))
+  thresh <- SAT_DELTA_FRAC * peak
+  idx <- which(d <= thresh)
+  if (!length(idx)) return(NA_integer_)
+  sub$nv[idx[1]]
+}
+
+sat_table <- t_summary |>
+  group_by(dt, r_label, metric) |>
+  group_modify(~ tibble(nv_sat = saturation_nv(.x))) |>
+  ungroup()
+
+sat_per_dt <- sat_table |>
+  mutate(nv_sat_capped = ifelse(is.na(nv_sat), NV_MAX, nv_sat)) |>
+  group_by(dt, r_label) |>
+  summarise(nv_over_metrics = max(nv_sat_capped), .groups = "drop") |>
+  group_by(dt) |>
+  summarise(nv_conservative = max(nv_over_metrics), .groups = "drop") |>
+  mutate(nv_buffered = pmin(NV_MAX, ceiling(nv_conservative * (1 + NV_BUFFER_FRAC))),
+         hit_nv_max  = nv_buffered >= NV_MAX,
+         T_total     = nv_buffered * dt)
+
+best_row <- sat_per_dt |> arrange(T_total, dt) |> slice(1)
+CHOSEN_DT_22 <- best_row$dt
+CHOSEN_NV_22 <- best_row$nv_buffered
+CHOSEN_T_22  <- best_row$T_total
+
+T_CONTEXT  <- CHOSEN_T_22
+NV_CONTEXT <- CHOSEN_NV_22
+```
+
+# 3. Responsiveness-range saturation ($r_{op}, r_{pw}, r_{tr}$)
+
+Where does each responsiveness parameter stop changing delegation behaviour
+as it grows? This runs in two passes. **Coarse pass** (Sec 3.1-3.2): each
+dimension is swept **in isolation** (the other two held at r=0) from 0 up to
+a shared ceiling of 32768 (doubling:
+$0,1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384,32768$), tracking
+`delegation_rate`, `flickerness`, `lost_vote_rate`, and `top5_power_share`.
+This coarse grid is far too sparse near the low end to resolve a
+fast-saturating dimension -- $r_{pw}$ in particular can already be fully
+saturated somewhere between r=0 and r=1 (a gap the doubling grid cannot see
+into at all), because power ratios are unbounded once delegation
+concentrates power on hub agents, unlike opinion/trust deviations, which stay
+bounded. **Fine pass** (Sec 3.3-3.6): a rough saturation estimate from the
+coarse pass is used to size a second, evenly-spaced grid for the
+fast-saturating dimensions -- the same point count $r_{op}$ needed on the
+coarse grid, spread linearly across each dimension's own coarse range -- and
+it is *that* fine pass which actually decides the final chosen r ceiling per
+dimension, based on **`delegation_rate` alone** (the most directly
+interpretable of the four metrics, and the one every other metric here is
+itself downstream of).
+
+K is fixed at `r CHOSEN_K_22` (the Part 2 result), and T/n_voting_rounds are
+taken from Part 2b's calibration (`r CHOSEN_T_22` rounds / `r CHOSEN_NV_22`
+voting rounds, $\Delta t=$ `r CHOSEN_DT_22`) rather than a placeholder -- see
+`Report_22_2b_TCalibration.Rmd`. $\lambda=$ `r LAMBDA_CONTEXT` remains a fixed
+illustrative value, unchanged.
+
+## 3.1 Grid and computation
+
+```{r p3-config}
+R_OPTR_MAX <- c(0, 2^(0:15))  # ceiling 32768, shared by all three isolated dimensions
+
+R_ISOLATED_GRID <- bind_rows(
+  tibble(dim = "op", r_val = R_OPTR_MAX),
+  tibble(dim = "pw", r_val = R_OPTR_MAX),
+  tibble(dim = "tr", r_val = R_OPTR_MAX)
+)
+
+N_SEEDS_R <- 1L  # FAST-RUN: lowest possible -- restore to 5+ once the pipeline is confirmed working
+```
+
+```{r p3-run}
+run_r_cell <- function(seed, N, K, r_op, r_pw, r_tr) {
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = N, n_communities = 1, node_degree = K, T = T_CONTEXT,
+    n_voting_rounds = NV_CONTEXT,
+    r_op = r_op, r_pw = r_pw, gamma = r_tr, lambda = LAMBDA_CONTEXT, k1 = 1, k2 = 1,
+    self_reliance_c = 0.5, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05,
+    snap_rounds = seq_len(T_CONTEXT)  # needed for top5_power_share, which lives in res$snapshots
+  )
+  tibble(
+    seed = seed, round = seq_len(T_CONTEXT),
+    delegation_rate  = res$history_delegation,
+    flickerness      = res$history_flickerness,
+    lost_vote_rate   = res$history_lost,
+    top5_power_share = res$snapshots$top5_power_share
+  )
+}
+
+run_isolated_cell <- function(seed, dim, r_val) {
+  r_op <- if (dim == "op") r_val else 0
+  r_pw <- if (dim == "pw") r_val else 0
+  r_tr <- if (dim == "tr") r_val else 0
+  run_r_cell(seed, N_BASE, CHOSEN_K_22, r_op, r_pw, r_tr) |>
+    mutate(dim = dim, r_val = r_val, .before = 1)
+}
+
+grid_r_isolated <- R_ISOLATED_GRID |> tidyr::crossing(seed = seq_len(N_SEEDS_R))
+
+r3_isolated_raw <- run_cached("r22r_isolated_raw", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_r_isolated, function(dim, r_val, seed) run_isolated_cell(seed, dim, r_val),
+                          .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(R_ISOLATED_GRID, N_SEEDS_R, CHOSEN_K_22, T_CONTEXT, NV_CONTEXT, LAMBDA_CONTEXT, v = 3))  # v=3: back to 4 metrics (delegation_rate, flickerness, lost_vote_rate, top5_power_share), deliberately busts the delegation_rate-only cache shape
+
+r3_isolated_summary <- steady_state_summary(
+  steady_state_per_seed(r3_isolated_raw, T_CONTEXT, 5L, c("dim", "r_val", "seed"), metrics = metrics_r),
+  c("dim", "r_val")
+) |> mutate(metric = factor(metric_labels[metric], levels = unname(metric_labels[metrics_r])))
+```
+
+## 3.2 Isolated dimensions ($r_{op}$, $r_{pw}$, $r_{tr}$ swept alone)
+
+```{r p3-isolated-plot, fig.height=9}
+r3_isolated_summary |>
+  ggplot(aes(r_val, mean_val, colour = dim, group = dim)) +
+  geom_blank(data = y_anchor_01(levels(r3_isolated_summary$metric), x_val = 1),
+             aes(x = x, y = y), inherit.aes = FALSE) +
+  geom_line(linewidth = 0.8) + geom_point(size = 1.8) +
+  scale_x_continuous(trans = "log1p", breaks = c(0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768)) +
+  scale_colour_viridis_d(name = "dimension", end = 0.85,
+                          labels = c(op = "r_op", pw = "r_pw", tr = "r_tr")) +
+  facet_wrap(~metric, scales = "free_y", ncol = 2) +
+  labs(title = "Isolated responsiveness dimensions -- other two held at r=0",
+       subtitle = sprintf("K=%d, N=%d, %d seeds per point; x on log1p scale", CHOSEN_K_22, N_BASE, N_SEEDS_R),
+       x = "r value (log1p scale)", y = NULL) +
+  theme(legend.position = "top") + FACET_SPACING
+```
+
+## 3.3 Fine, evenly-spaced grid for the fast-saturating dimensions
+
+$r_{op}$ already has ample near-origin resolution from the coarse doubling
+grid above across its own wide range, so its points are kept as-is below (up
+to its own coarse saturation estimate). $r_{pw}$ and $r_{tr}$, which Sec 3.2
+shows saturating far earlier, get a fresh, **evenly (linearly) spaced** grid
+instead -- the same point count $r_{op}$ needed on the coarse grid to reach
+its own coarse estimate, but spread across each of *their* own (much
+smaller) coarse range, so their fast transition near r=0 finally gets
+resolved instead of jumping straight from r=0 to r=1.
+
+A rough coarse estimate per dimension comes first -- same rule as Sec 3.5's
+final read-off below, applied here just to size the fine grid, not as the
+final answer:
+
+```{r p3-coarse-sat}
+SAT_ABS_THRESH <- 0.01  # 1 percentage point, absolute (not relative to peak)
+
+find_r_sat <- function(sub) {
+  sub <- sub |> arrange(r_val)
+  ok <- !is.na(sub$delta) & abs(sub$delta) < SAT_ABS_THRESH  # NA delta at r_val=0 counts as not-ok
+  n  <- length(ok)
+  for (i in seq_len(n)) {
+    if (all(ok[i:n])) return(sub$r_val[i])  # first point from which it STAYS below threshold to the end
+  }
+  NA_real_
+}
+
+r_sat_coarse <- r3_isolated_summary |>
+  filter(metric == "Delegation rate") |>
+  arrange(dim, r_val) |>
+  group_by(dim) |>
+  mutate(delta = mean_val - lag(mean_val)) |>
+  group_modify(~ tibble(r_sat = find_r_sat(.x))) |>
+  ungroup()
+
+r_sat_op_coarse <- r_sat_coarse$r_sat[r_sat_coarse$dim == "op"]
+r_sat_op_ref    <- if (is.na(r_sat_op_coarse)) max(R_OPTR_MAX) else r_sat_op_coarse
+N_FINE          <- sum(R_OPTR_MAX <= r_sat_op_ref)
+```
+
+$r_{op}$'s coarse estimate is `r round(r_sat_op_ref, 1)`, reached at the
+`r N_FINE`-th coarse grid point -- so $r_{pw}$ and $r_{tr}$ each get
+`r N_FINE` fresh points, evenly spaced from 0 to their own coarse estimate
+(falling back to the full coarse range if a dimension never coarse-saturated).
+
+```{r p3-fine-config}
+build_fine_grid <- function(dim_name) {
+  r_sat_d <- r_sat_coarse$r_sat[r_sat_coarse$dim == dim_name]
+  if (is.na(r_sat_d)) r_sat_d <- max(R_OPTR_MAX)
+  tibble(dim = dim_name, r_val = seq(0, r_sat_d, length.out = N_FINE))
+}
+
+R_ISOLATED_GRID_FINE <- bind_rows(build_fine_grid("pw"), build_fine_grid("tr"))
+```
+
+```{r p3-fine-run}
+grid_r_isolated_fine <- R_ISOLATED_GRID_FINE |> tidyr::crossing(seed = seq_len(N_SEEDS_R))
+
+r3_isolated_raw_fine <- run_cached("r22r_isolated_raw_fine", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_r_isolated_fine, function(dim, r_val, seed) run_isolated_cell(seed, dim, r_val),
+                          .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(R_ISOLATED_GRID_FINE, N_SEEDS_R, CHOSEN_K_22, T_CONTEXT, NV_CONTEXT, LAMBDA_CONTEXT, v = 1))
+
+r3_isolated_summary_fine <- steady_state_summary(
+  steady_state_per_seed(r3_isolated_raw_fine, T_CONTEXT, 5L, c("dim", "r_val", "seed"), metrics = metrics_r),
+  c("dim", "r_val")
+) |> mutate(metric = factor(metric_labels[metric], levels = unname(metric_labels[metrics_r])))
+
+# Final dataset used from Sec 3.4 onward: r_op keeps its original coarse
+# (doubling) points up to its own coarse estimate (no fine pass needed, see
+# prose above); r_pw/r_tr use their new evenly-spaced fine points instead.
+r3_isolated_final <- bind_rows(
+  r3_isolated_summary |> filter(dim == "op", r_val <= r_sat_op_ref),
+  r3_isolated_summary_fine
+)
+```
+
+## 3.4 Step-to-step deltas
+
+Delegation rate only -- the metric the chosen r ceiling (Sec 3.5) is
+actually based on. $r_{op}$'s rows below are its original coarse points;
+$r_{pw}$/$r_{tr}$'s are the new fine, evenly-spaced points from Sec 3.3.
+
+```{r p3-delta-table}
+r3_isolated_final |>
+  filter(metric == "Delegation rate") |>
+  arrange(dim, r_val) |>
+  group_by(dim) |>
+  mutate(delta = mean_val - lag(mean_val)) |>
+  ungroup() |>
+  select(dim, r_val, mean_val, delta) |>
+  mutate(r_val = round(r_val, 2), across(c(mean_val, delta), ~round(.x, 4))) |>
+  kable(caption = "Delegation rate and step-to-step delta per r-value, one block per isolated dimension")
+```
+
+## 3.5 Saturation point (change stays below 1 percentage point) + chosen r ceiling
+
+Same rule as Sec 3.3's coarse estimate, now applied to `r3_isolated_final`
+(op's coarse points + pw/tr's fine points) -- this is the actual final
+answer, not just a sizing estimate. Requiring the change to *stay* below
+threshold, not just dip below it once, still matters: a naive
+first-crossing read would latch onto an early quiet patch (r_op/r_pw/r_tr
+often barely move right around r=0, too small to have much effect yet, not
+because the curve has already flattened) and report an implausibly small r
+as "saturated" even when the curve keeps changing meaningfully afterwards.
+`NA` if the change never stays below threshold through to the end of that
+dimension's own range. This r-value becomes the **chosen r ceiling** for
+that dimension.
+
+```{r p3-saturation}
+r_sat_isolated <- r3_isolated_final |>
+  filter(metric == "Delegation rate") |>
+  arrange(dim, r_val) |>
+  group_by(dim) |>
+  mutate(delta = mean_val - lag(mean_val)) |>
+  group_modify(~ tibble(r_sat = find_r_sat(.x))) |>
+  ungroup()
+```
+
+```{r p3-sat-table}
+kable(r_sat_isolated |> mutate(r_sat = round(r_sat, 3)),
+      caption = "Chosen r ceiling per dimension (NA = change never stayed below 1 percentage point through to the end of that dimension's own range)")
+```
+
+```{r p3-readoff}
+r_sat_of <- function(d) r_sat_isolated$r_sat[r_sat_isolated$dim == d]
+fmt_readoff <- function(d) {
+  r <- r_sat_of(d)
+  if (is.na(r)) sprintf("**r_%s: not reached** -- delegation_rate still changes by >=1 percentage point per step even at the top of its own range; widen that dimension's range (or re-check the coarse estimate in Sec 3.3) before treating r_%s as final.", d, d)
+  else sprintf("**r_%s = %.2f**", d, r)
+}
+```
+
+- `r fmt_readoff("op")`
+- `r fmt_readoff("pw")`
+- `r fmt_readoff("tr")`
+
+`r if (N_SEEDS_R < 2) "**FAST-RUN note:** N_SEEDS_R=1 currently, so every point above is a single simulation run, not a seed-averaged mean -- a single noisy step could cross the 1-percentage-point threshold early or late by chance. Restore N_SEEDS_R to 5+ before treating the r ceilings above as final." else ""`
+
+## 3.6 Isolated dimensions rescaled to 10 equal steps of the chosen r ceiling
+
+Each dimension's r-axis (Sec 3.4) is rescaled here to **11 evenly spaced
+steps of that dimension's own chosen r ceiling** from Sec 3.5 above -- 0 =
+r=0, 10 = 10% of the ceiling, 20 = 20%, ..., 100 = the ceiling itself -- so
+all three dimensions, despite reaching saturation at very different raw r
+values, land on exactly the same x-positions and become directly comparable.
+The value plotted at each mark is **linearly interpolated** between the two
+nearest actually-computed r values (`stats::approx()`) -- not a new
+simulation. Dimensions where no ceiling was found (`r_sat` is `NA`) are
+dropped from this plot (there is nothing to rescale by).
+
+```{r p3-rescaled-plot, fig.height=6}
+r3_rescaled_10 <- r_sat_isolated |>
+  filter(!is.na(r_sat)) |>
+  group_by(dim) |>
+  group_modify(~ {
+    r_sat_d  <- .x$r_sat
+    sub      <- r3_isolated_final |> filter(dim == .y$dim, metric == "Delegation rate") |> arrange(r_val)
+    pct      <- seq(0, 100, by = 10)
+    r_target <- pct / 100 * r_sat_d
+    y        <- approx(sub$r_val, sub$mean_val, xout = r_target, rule = 2)$y
+    tibble(pct = pct, mean_val = y)
+  }) |>
+  ungroup()
+
+r3_rescaled_10 |>
+  ggplot(aes(pct, mean_val, colour = dim, group = dim)) +
+  geom_line(linewidth = 0.8) + geom_point(size = 2) +
+  scale_x_continuous(breaks = seq(0, 100, by = 10)) +
+  scale_colour_viridis_d(name = "dimension", end = 0.85,
+                          labels = c(op = "r_op", pw = "r_pw", tr = "r_tr")) +
+  labs(title = "Isolated dimensions, rescaled to 10 equal steps of each dimension's own chosen r ceiling",
+       subtitle = "0 = r=0, 10 = 10% of the chosen r ceiling (Sec 3.5), ..., 100 = the ceiling itself; interpolated between computed r values",
+       x = "% of chosen r ceiling", y = "Delegation rate")
+```

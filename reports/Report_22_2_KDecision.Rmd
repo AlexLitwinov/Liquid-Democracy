@@ -1,0 +1,330 @@
+---
+title: "Report 22, Part 2 -- Attractiveness-threshold validation (the K decision)"
+output: github_document
+date: "2026-09-05"
+---
+
+> **Split note:** Split out of `Report_22.Rmd` so each part can be knit
+> independently. See `Report_22_3_RSaturation.Rmd` and
+> `Report_22_4_ChainCycles.Rmd` for the rest (a context-only
+> `Report_22_1_KContext.Rmd`, reconstructing Report 21's exploratory K=8-48
+> sweep, was dropped -- nothing downstream depends on it). This part is
+> fully self-contained and is the one that produces `CHOSEN_K_22` (reused,
+> recomputed via the same cache, by Parts 3 and 4).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 13, fig.height = 8)
+library(tidyverse)
+library(here)
+library(knitr)
+library(furrr)
+library(digest)
+library(igraph)
+library(mgcv)
+
+theme_set(theme_minimal(base_size = 12))
+source(here::here("scripts/Network.R"))
+dir.create(here::here("reports/Report_22_2_KDecision_files/figure-gfm"), recursive = TRUE, showWarnings = FALSE)
+dir.create(here::here("data"), showWarnings = FALSE)
+
+N_WORKERS <- max(1L, parallel::detectCores() - 1)
+
+run_cached <- function(cache_name, fn, hash_obj) {
+  hash       <- digest::digest(hash_obj)
+  cache_file <- here::here(paste0("data/", cache_name, "_cache.rds"))
+  if (file.exists(cache_file)) {
+    cc <- readRDS(cache_file)
+    if (identical(cc$hash, hash)) return(cc$data)
+  }
+  out <- fn()
+  saveRDS(list(hash = hash, data = out), cache_file)
+  out
+}
+
+metrics_core   <- c("flickerness", "delegation_rate", "lost_vote_rate", "chain_length")
+metric_labels  <- c(flickerness = "flickerness", delegation_rate = "Delegation rate",
+                     lost_vote_rate = "Lost-vote rate", chain_length = "Avg. chain length",
+                     top5_power_share = "Top-5% voting-power share")
+
+RATE_METRICS_01 <- c("flickerness", "Delegation rate", "Lost-vote rate", "Top-5% voting-power share")
+
+y_anchor_01 <- function(metric_factor_levels, x_val) {
+  present <- intersect(RATE_METRICS_01, metric_factor_levels)
+  if (!length(present)) return(tibble(metric = factor(character(0), levels = metric_factor_levels), y = numeric(0), x = numeric(0)))
+  tidyr::crossing(metric = factor(present, levels = metric_factor_levels), y = c(0, 1), x = x_val)
+}
+
+FACET_SPACING <- theme(panel.spacing.y = unit(1, "cm"))
+
+steady_state_per_seed <- function(raw_df, round_max, window, id_cols, metrics = metrics_core) {
+  raw_df |>
+    filter(round > round_max - window) |>
+    pivot_longer(all_of(metrics), names_to = "metric", values_to = "value") |>
+    group_by(across(all_of(c(id_cols, "metric")))) |>
+    summarise(steady_val = mean(value, na.rm = TRUE), .groups = "drop")
+}
+steady_state_summary <- function(per_seed_df, group_cols) {
+  per_seed_df |>
+    group_by(across(all_of(c(group_cols, "metric")))) |>
+    summarise(mean_val = mean(steady_val, na.rm = TRUE),
+              sd_val   = sd(steady_val, na.rm = TRUE),
+              n_val    = sum(!is.na(steady_val)),
+              se_val   = sd_val / sqrt(n_val), .groups = "drop")
+}
+```
+
+# 2. Attractiveness-threshold validation (the actual K decision)
+
+**This section replaces an earlier version of itself.** That version
+drifted from the actual task in three ways, corrected here: (a) it used
+Dunbar & Spoors' 16 midpoint instead of their 12 lower bound as the
+target; (b) it used 4 fixed $(r_{op}=r_{pw}=r_{tr})$ values applied as a
+*shared* dial, which only tests the diagonal of the 3-dimensional
+parameter space, not genuinely independent settings; (c) it silently
+picked one warm-up simulation length without acknowledging that
+T/n_voting_rounds haven't actually been calibrated yet, so K's
+calibration is implicitly running ahead of T's. All three are fixed
+below.
+
+## 2.1 Definition
+
+For agent $i$ and neighbour $j$, $j$ **qualifies** as a usable delegation
+target if $A_{ij}\geq 1$ -- at least as attractive to $i$ as $i$ itself
+(the self/no-delegation baseline; see Report 21's Model section, $M=4$
+ceiling, $A_{ij}=1$ at the identical-opinion/identical-power/neutral-trust
+point). $A_{ij}$ is computed with `Network.R`'s own
+`attractiveness_expose()` and the same trust-modifier factor used inside
+`simulate_liquid_democracy()`'s round loop -- not re-derived.
+
+## 2.2 Five shared $r_{op}=r_{pw}=r_{tr}$ dial levels
+
+```{r p2-triples}
+R_SHARED_LEVELS <- c(0, 1, 4, 16, 32)
+
+r_triples <- tibble(
+  triple_id = seq_along(R_SHARED_LEVELS),
+  r_op = R_SHARED_LEVELS,
+  r_pw = R_SHARED_LEVELS,
+  r_tr = R_SHARED_LEVELS
+)
+N_R_TRIPLES <- nrow(r_triples)
+
+kable(r_triples, caption = sprintf("The %d shared r_op=r_pw=r_tr dial levels used below", N_R_TRIPLES))
+```
+
+## 2.3 The warm-up-length problem
+
+Computing $A_{ij}$ needs agents to have non-trivial power and trust
+first: at pure initial state ($p_i=1$, $\tau_{ij}=1$ for everyone), both
+$a^{pw}_{ij}=2\mathcal L(r_{pw}(p_j/p_i-1))$ and
+$a^{tr}_{ij}=2\mathcal L(r_{tr}(\tau_{ij}-1))$ evaluate to **exactly 1
+regardless of $r_{pw}$ or $r_{tr}$** (the ratio/deviation inside each
+$\mathcal L(\cdot)$ is 0 for everyone), collapsing $A_{ij}$ to depend on
+$r_{op}$ alone -- trivially $A_{ij}=1$ for all $j$ at $r_{op}=0$
+(qualifying count = K, always), trivially $A_{ij}<1$ for virtually all
+$j$ at any $r_{op}>0$. Neither is informative, so a short warm-up
+simulation runs first.
+
+**But T/n_voting_rounds have not been calibrated yet** (a separate,
+not-yet-done task) -- any warm-up length used here is necessarily a
+placeholder, which means K's calibration is implicitly running ahead of
+T's. Rather than picking one arbitrary length and moving on silently,
+**two placeholder warm-up lengths are run and compared**:
+
+```{r p2-warmup-configs}
+WARMUP_CONFIGS <- tribble(
+  ~warmup_label, ~T_warmup, ~nv_warmup,
+  "T=30, nv=10",  30L,       10L,
+  "T=60, nv=20",  60L,       20L
+) |> slice(1)  # FAST-RUN: single warm-up length only, for a quick first knit.
+               # Drop this slice(1) to restore the full two-length robustness
+               # comparison Sec 2.3 describes (must match Report_22_3/4's copy
+               # of this same chunk so CHOSEN_K_22 stays consistent across parts).
+LAMBDA_WARMUP <- 0.1  # fixed illustrative value, same as the Sec 1 context sweep, for both warmup lengths
+kable(WARMUP_CONFIGS)
+```
+
+If the two give materially the same K read-off, that read-off is treated
+as robust to the (still uncalibrated) warm-up length below. If they
+disagree, that is reported plainly rather than resolved by picking one --
+it would mean K genuinely can't be finalised independently of T.
+
+## 2.4 Grid and computation
+
+```{r p2-config}
+K_SWEEP_THRESH <- seq(10, 150, by = 20)  # FAST-RUN: coarsened from by=10 (15->8 stages);
+                                         # restore by=10 for the final run -- must match
+                                         # Report_22_3/4's copy of this same chunk
+A_THRESHOLD <- 1
+TARGET_QUALIFYING <- 12  # Dunbar & Spoors' 12-20 sympathy-group LOWER bound (not their 16
+                         # midpoint, used by an earlier version of this section -- see the
+                         # note at the top of Sec 2)
+UPPER_BOUND_QUALIFYING <- 20  # Dunbar & Spoors' 12-20 sympathy-group UPPER bound -- shown on
+                              # the plot below for context only, not used in the K decision itself
+MEAN_QUALIFYING <- 16         # Dunbar & Spoors' 12-20 sympathy-group MIDPOINT -- likewise shown
+                              # for context only (this is the value an earlier version of this
+                              # section used as its target, before Sec 2's own rewrite switched
+                              # to the 12 lower bound; see the note at the top of Sec 2)
+
+N_SEEDS_K <- 5L
+N_THRESH  <- 1000L # FAST-RUN: lowest possible -- restore to 2000 (see the N >> K >> ln(N) >> 1 check
+                   # below, currently NOT comfortably met at this value) once the pipeline is confirmed
+                   # working; must match Report_22_2b/3's copy of this chunk
+```
+
+A comfortable "N $\gg$ K" margin at the sweep's top end (K=150) needs N well
+above the naive N=1000 baseline (N/K $\approx$ 6.7 there is not a comfortable
+margin). At N=`r N_THRESH`, K=150: $\ln(N)=$ `r round(log(N_THRESH), 2)`,
+$K/\ln(N)=$ `r round(max(K_SWEEP_THRESH)/log(N_THRESH), 1)`, $N/K=$
+`r round(N_THRESH/max(K_SWEEP_THRESH), 1)`.
+
+`r if (N_THRESH < 2000) sprintf("**FAST-RUN note:** N_THRESH is currently %d for a fast first pass -- at this value the N/K margin above is the same weak ~6.7 ratio this paragraph argues against, NOT a comfortable one; restore N_THRESH to 2000+ before treating the K read-off below as final.", N_THRESH) else "This margin is comfortably $\\gg 1$, so this N is used for this section."`
+
+```{r p2-run}
+count_qualifying_cell <- function(seed, K, triple_id, r_op, r_pw, r_tr, T_warmup, nv_warmup) {
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = N_THRESH, n_communities = 1, node_degree = K, T = T_warmup,
+    n_voting_rounds = nv_warmup,
+    r_op = r_op, r_pw = r_pw, gamma = r_tr, lambda = LAMBDA_WARMUP, k1 = 1, k2 = 1,
+    self_reliance_c = 0.5, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05
+  )
+  gF  <- res$friendship_graph
+  op  <- res$agents$opinion
+  pow <- res$agents$power
+  tau_list <- res$tau_final
+  n_all <- nrow(res$agents)
+
+  qualifying_counts <- vapply(seq_len(n_all), function(i) {
+    nb <- as.integer(neighbors(gF, i, mode = "out"))
+    if (!length(nb)) return(0L)
+    a_op_pw   <- attractiveness_expose(op[i], op[nb], pow[i], pow[nb], r_op, r_pw)
+    trust_mod <- if (!is.null(tau_list)) 2 * .sig(r_tr * (tau_list[[i]] - 1)) else 1
+    sum(a_op_pw * trust_mod >= A_THRESHOLD)
+  }, integer(1L))
+
+  tibble(seed = seed, K = K, triple_id = triple_id, mean_qualifying = mean(qualifying_counts))
+}
+
+grid_thresh <- tidyr::crossing(K = K_SWEEP_THRESH, triple_id = r_triples$triple_id, seed = seq_len(N_SEEDS_K)) |>
+  left_join(r_triples, by = "triple_id")
+
+run_warmup_pass <- function(T_warmup, nv_warmup, cache_suffix) {
+  run_cached(paste0("r22k_thresh_raw_", cache_suffix), function() {
+    plan(multisession, workers = N_WORKERS)
+    out <- future_pmap_dfr(grid_thresh, function(K, triple_id, seed, r_op, r_pw, r_tr)
+      count_qualifying_cell(seed, K, triple_id, r_op, r_pw, r_tr, T_warmup, nv_warmup),
+      .options = furrr_options(seed = NULL))
+    plan(sequential)
+    out
+  }, list(grid_thresh, T_warmup, nv_warmup, A_THRESHOLD, N_THRESH, v = 1))
+}
+
+thresh_raw_all <- WARMUP_CONFIGS |>
+  purrr::pmap(function(warmup_label, T_warmup, nv_warmup) {
+    run_warmup_pass(T_warmup, nv_warmup, gsub("[^A-Za-z0-9]", "", warmup_label)) |>
+      mutate(warmup_label = warmup_label)
+  }) |>
+  bind_rows() |>
+  mutate(warmup_label = factor(warmup_label, levels = WARMUP_CONFIGS$warmup_label))
+
+thresh_per_triple <- thresh_raw_all |>
+  group_by(warmup_label, K, triple_id) |>
+  summarise(mean_over_seeds = mean(mean_qualifying), .groups = "drop")
+
+thresh_summary <- thresh_per_triple |>
+  group_by(warmup_label, K) |>
+  summarise(mean_val = mean(mean_over_seeds),
+            min_val  = min(mean_over_seeds),
+            max_val  = max(mean_over_seeds),
+            sd_val   = sd(mean_over_seeds), .groups = "drop")
+```
+
+## 2.5 Plot
+
+```{r p2-plot, fig.height=10}
+thresh_summary |>
+  ggplot(aes(K, mean_val)) +
+  geom_ribbon(aes(ymin = min_val, ymax = max_val), alpha = 0.15) +
+  geom_line(linewidth = 0.8, colour = "grey20") + geom_point(size = 2.2, colour = "grey20") +
+  geom_hline(yintercept = TARGET_QUALIFYING, linetype = "dashed", colour = "firebrick") +
+  annotate("text", x = min(K_SWEEP_THRESH), y = TARGET_QUALIFYING, vjust = -0.6, hjust = 0,
+           label = sprintf("target: %d qualifying neighbours (Dunbar & Spoors lower bound)", TARGET_QUALIFYING),
+           colour = "firebrick", size = 3.2) +
+  geom_hline(yintercept = MEAN_QUALIFYING, linetype = "dotted", colour = "grey40") +
+  annotate("text", x = min(K_SWEEP_THRESH), y = MEAN_QUALIFYING, vjust = -0.6, hjust = 0,
+           label = sprintf("mean: %d (Dunbar & Spoors midpoint)", MEAN_QUALIFYING),
+           colour = "grey40", size = 3.2) +
+  geom_hline(yintercept = UPPER_BOUND_QUALIFYING, linetype = "dotted", colour = "grey40") +
+  annotate("text", x = min(K_SWEEP_THRESH), y = UPPER_BOUND_QUALIFYING, vjust = -0.6, hjust = 0,
+           label = sprintf("upper bound: %d (Dunbar & Spoors)", UPPER_BOUND_QUALIFYING),
+           colour = "grey40", size = 3.2) +
+  facet_wrap(~warmup_label, ncol = 1) +
+  labs(title = "Mean qualifying neighbours (A_ij >= 1) per agent, vs. K",
+       subtitle = sprintf("Averaged over %d seeds per r-level, then over %d shared r_op=r_pw=r_tr levels; ribbon = min-max across levels; one panel per warm-up length",
+                           N_SEEDS_K, N_R_TRIPLES),
+       x = "K", y = "Mean qualifying neighbours") +
+  coord_cartesian(ylim = c(0, 30)) +
+  FACET_SPACING
+```
+
+## 2.6 Read-off and decision
+
+```{r p2-decision}
+decision_by_warmup <- thresh_summary |>
+  group_by(warmup_label) |>
+  group_modify(~ {
+    clearing <- .x |> filter(mean_val >= TARGET_QUALIFYING) |> pull(K)
+    reached  <- length(clearing) > 0
+    tibble(target_reached  = reached,
+           chosen_k        = if (reached) min(clearing) else max(K_SWEEP_THRESH),
+           max_qualifying  = max(.x$mean_val))
+  }) |>
+  ungroup()
+
+WARMUPS_AGREE <- length(unique(decision_by_warmup$chosen_k)) == 1 &&
+  all(decision_by_warmup$target_reached)
+CHOSEN_K_22 <- if (WARMUPS_AGREE) decision_by_warmup$chosen_k[1] else max(decision_by_warmup$chosen_k)
+```
+
+```{r p2-decision-table}
+kable(decision_by_warmup |> mutate(max_qualifying = round(max_qualifying, 2)),
+      caption = "K read-off per warm-up length")
+```
+
+```{r p2-decision-prose, results = "asis"}
+if (nrow(WARMUP_CONFIGS) == 1) {
+  reached <- decision_by_warmup$target_reached[1]
+  cat(sprintf(
+    "**Single warm-up length used (`%s`) -- K = %d.** %s **This is a reduced fast-run configuration**: WARMUP_CONFIGS normally holds two rows (`T=30/nv=10` and `T=60/nv=20`) to check the K read-off is robust to the still-uncalibrated warm-up length (Sec 2.3) -- that comparison is skipped here. Restore both rows before treating this K as final.",
+    decision_by_warmup$warmup_label[1], CHOSEN_K_22,
+    if (reached) sprintf("The mean qualifying-neighbour count (averaged over %d seeds and %d shared r-dial levels) reaches the target of %d at this K.", N_SEEDS_K, N_R_TRIPLES, TARGET_QUALIFYING)
+    else sprintf("Target of %d qualifying neighbours was NOT reached anywhere in the swept range (max %.2f) -- the sweep ceiling K=%d is adopted as a placeholder.", TARGET_QUALIFYING, decision_by_warmup$max_qualifying[1], CHOSEN_K_22)
+  ))
+} else if (WARMUPS_AGREE) {
+  cat(sprintf(
+    "**Both warm-up lengths agree: K = %d.** The mean qualifying-neighbour count (averaged over %d seeds and %d shared r-dial levels) reaches the target of %d at the same K under both `T=30/nv=10` and `T=60/nv=20` -- the K read-off is robust to the (still uncalibrated) warm-up length, so either can be used; **K = %d** is adopted below.",
+    CHOSEN_K_22, N_SEEDS_K, N_R_TRIPLES, TARGET_QUALIFYING, CHOSEN_K_22
+  ))
+} else {
+  cat(sprintf(
+    "**The two warm-up lengths do NOT agree**, and this is reported plainly rather than silently resolved: %s. This means K's calibration is not actually independent of T/n_voting_rounds's (still not calibrated) value -- a dependency that needs to be flagged for the thesis text, not hidden here. For this report to still produce a usable K for Sec 3/4 below, **the more conservative (larger) of the two, K = %d, is adopted** as a pragmatic default -- not a resolution of the underlying disagreement.",
+    paste(sprintf("`%s` -> %s", decision_by_warmup$warmup_label,
+                  ifelse(decision_by_warmup$target_reached, paste0("K=", decision_by_warmup$chosen_k),
+                         sprintf("target NOT reached by K=%d (max %.2f)", max(K_SWEEP_THRESH), decision_by_warmup$max_qualifying))),
+          collapse = "; "),
+    CHOSEN_K_22
+  ))
+}
+```
+
+K is chosen as **the smallest network degree at which agents have, on
+average, at least `r TARGET_QUALIFYING` attractiveness-qualifying
+neighbours across `r N_R_TRIPLES` shared $r_{op}=r_{pw}=r_{tr}$ dial
+levels** -- a plot-anchored modelling assumption, in the same style Report 21 used for
+its own K choice, not a fitted or "true" value. Report 21's original
+K=8-48 sweep (reconstructed only as exploratory context in an earlier
+version of this split, since dropped) is not the basis for the final K
+choice; **this** plot, not that sweep and not the Dunbar citation alone,
+is what actually decides K here.
