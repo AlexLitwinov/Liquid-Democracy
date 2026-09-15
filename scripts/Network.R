@@ -931,14 +931,21 @@ simulate_liquid_democracy <- function(
 
     # --------------------------------------------------
     # Build delegation graph
+    # Only actually constructed on snapshot rounds -- gD is otherwise unused
+    # this round (compute_power_and_votes() below takes edge_from/edge_to
+    # directly, not gD; so does every metric/trust-update block after it).
+    # Building + storing an igraph object for every one of T rounds when
+    # typically only ~10-15 are ever read back was pure repeated overhead.
     # --------------------------------------------------
     mask      <- targets != lay_ids
     edge_from <- lay_ids[mask]
     edge_to   <- targets[mask]
 
-    gD <- make_empty_graph(n = n_all, directed = TRUE)
-    if (length(edge_from)) gD <- add_edges(gD, as.vector(rbind(edge_from, edge_to)))
-    delegation_graphs[[t]] <- gD
+    if (t %in% snapshot_rounds) {
+      gD <- make_empty_graph(n = n_all, directed = TRUE)
+      if (length(edge_from)) gD <- add_edges(gD, as.vector(rbind(edge_from, edge_to)))
+      delegation_graphs[[t]] <- gD
+    }
 
     pv             <- compute_power_and_votes(op, n_all, edge_from, edge_to)
     agents$power   <- pv$power
