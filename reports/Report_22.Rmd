@@ -1,588 +1,1837 @@
 ---
-title: "Report 22 -- Testing the Five Core Hypotheses of the Expose Design (RQ1-RQ5, 25 seeds)"
+title: "Report 22 -- K, T, and r calibration (relaxed qualifying-neighbour tolerance)"
 output: github_document
-date: "2026-08-19"
+date: "2026-09-10"
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
-                      fig.width = 12, fig.height = 6)
+                      fig.width = 13, fig.height = 8)
 library(tidyverse)
 library(here)
 library(knitr)
-library(mgcv)
+library(furrr)
+library(digest)
+library(igraph)
 
 theme_set(theme_minimal(base_size = 12))
-dir.create(here::here("reports/Report_22_files/figure-gfm"), recursive = TRUE, showWarnings = FALSE)
+source(here::here("scripts/Network.R"))
+dir.create(here::here("reports/Report_23_files/figure-gfm"), recursive = TRUE, showWarnings = FALSE)
+dir.create(here::here("data"), showWarnings = FALSE)
 
-N_SEEDS <- 25L   # preliminary pass -- see "Scope & Method" below
-```
+N_WORKERS <- max(1L, parallel::detectCores() - 1)
 
-# Scope & Method
+TIMING_LOG <- list()
 
-This report formally **tests** the five directional hypotheses that carry a
-dedicated experimental design in the expose (Sections 2.3-2.4): RQ1-RQ3
-(Part I -- delegation dynamics, representation, power concentration) and
-RQ4-RQ5 (Part II -- in-group delegation behaviour and minority
-representation). RQ6 is **not** a sixth independent hypothesis: the expose
-states it is answered "through which delegation mechanisms behavioural
-in-group preference influences minority representation" using the *same*
-sweep as RQ4/RQ5 (cross-group delegation rate and drift, already recorded
-alongside $RR_m$/$PC_m$), not a separate design. It is addressed here as a
-mechanism check appended after H5.
-
-**Data.** All simulations use `scripts/Network.R` /
-`scripts/FunctionVersions.R` exactly as currently checked out --
-`decision_model = "gaussian_mobius"` (Gaussian opinion kernel x logistic
-log-power attractiveness, Mobius self-vote curve) and `trust_mode =
-"reward_punish"`, which match the expose's Section 2 formulas
-term-for-term (attractiveness $A_{ij}=a^{op}_{ij}a^{pw}_{ij}a^{trust}_{ij}$,
-trust update $\tau_{ij}(t)=\lambda\tau_{ij}(t-1)+(1-\lambda)s$, in-group term
-$a^{\text{in-group}}_{ij}=2\sigma(r_{\text{ingroup}}S(g_i,g_j))$, logit-space
-perception noise, Watts-Strogatz network). No functional changes to the
-simulation code were needed for this report.
-
-**Why 25 seeds, and why no new simulations were run.** Report 21 already ran
-the identical RQ1-RQ6 grid (same model, same parameter values) at 100 seeds
-per cell and cached the raw per-seed output. Since `simulate_liquid_democracy()`
-is a deterministic function of its `seed` argument, the first 25 seeds of a
-100-seed run are *identical* to a fresh, independent 25-seed run -- there is
-no approximation involved in subsetting. This was verified directly: seed 1,
-$r_{op}=r_{pw}=0$, re-run against the current script version reproduces the
-cached row exactly (delegation rate 0.5080, lost-vote rate 0.0532). This
-report therefore reuses that cache, filtered to `seed <= 25`, as the fast
-"first pass" the user asked for; a full 100-seed confirmatory run can reuse
-the same code unchanged.
-
-**Testing approach.** Per the expose (Sec. 2.3): "fitting a GAM on
-$\log_2 r$ to locate the saturation point $r^*$". Every 1-D sweep below is
-fit with `mgcv::gam(y ~ s(log2(r+1)))` on the seed-level (not pre-averaged)
-data, giving a genuine test of the smooth term (F/chi-sq test, `method =
-"REML"`) plus an estimated saturation point $r^*$ (smallest $r$ beyond which
-the fitted derivative stays under 5% of its peak magnitude). Directional and
-comparative claims (opposite signs, "joint favours opinion", trust
-moderation, group/condition differences) are tested with paired t-tests,
-interaction F-tests (nested model ANOVA), and one-sample/one-sided t-tests,
-as specified in each section.
-
-```{r load-cache}
-load_cache <- function(name) readRDS(here::here(paste0("data/", name, "_cache.rds")))$data
-
-diag_A_raw <- load_cache("sim_report21_A")    |> filter(seed <= N_SEEDS)
-diag_B_raw <- load_cache("sim_report21_B")    |> filter(seed <= N_SEEDS)
-diag_C_raw <- load_cache("sim_report21_C")    |> filter(seed <= N_SEEDS)
-diag_D_raw <- load_cache("sim_report21_D")    |> filter(seed <= N_SEEDS)
-sim_p2_raw <- load_cache("sim_report21_partII") |> filter(seed <= N_SEEDS)
-
-stopifnot(n_distinct(diag_A_raw$seed) == N_SEEDS, n_distinct(sim_p2_raw$seed) == N_SEEDS)
-
-R_OP_PW_NARROW <- c(0, 1, 2, 4, 8, 16, 32)
-```
-
-```{r helpers}
-# ── GAM saturation test: y ~ s(log2(r+1)), seed-level data ─────────────────
-gam_saturation <- function(df, y, x = "r") {
-  d <- df |> transmute(log_r = log2(.data[[x]] + 1), y = .data[[y]]) |> drop_na()
-  k_use <- min(9L, n_distinct(d$log_r) - 1L)
-  mod <- gam(y ~ s(log_r, k = k_use), data = d, method = "REML")
-  s   <- summary(mod)
-
-  grid  <- seq(min(d$log_r), max(d$log_r), length.out = 300)
-  pred  <- predict(mod, newdata = tibble(log_r = grid))
-  deriv <- diff(pred) / diff(grid)
-  mx    <- max(abs(deriv))
-  below <- abs(deriv) < 0.05 * mx
-  # r* = first grid point after which the derivative NEVER again exceeds 5% of its peak
-  idx <- NA_integer_
-  for (i in seq_along(below)) if (all(below[i:length(below)])) { idx <- i; break }
-  r_star <- if (!is.na(idx)) round(2^grid[idx] - 1, 2) else NA_real_
-
-  tibble(edf = round(s$s.table[1, "edf"], 2), F_stat = round(s$s.table[1, "F"], 2),
-         p_value = signif(s$s.table[1, "p-value"], 3), r_sq = round(s$r.sq, 3),
-         r_star = r_star,
-         low_r_trend = if (pred[2] > pred[1]) "increasing" else "decreasing")
+run_cached <- function(cache_name, fn, hash_obj) {
+  hash       <- digest::digest(hash_obj)
+  cache_file <- here::here(paste0("data/", cache_name, "_cache.rds"))
+  if (file.exists(cache_file)) {
+    cc <- readRDS(cache_file)
+    if (identical(cc$hash, hash)) {
+      message(sprintf("[%s] cache hit", cache_name))
+      # n_rows = one row per (grid cell, seed) in every raw sweep this wraps,
+      # i.e. exactly the number of simulate_liquid_democracy() calls that
+      # cache represents -- tracked even on a cache hit (loaded, not
+      # recomputed) so Sec 11 can show "how many runs" alongside "how long",
+      # not just for freshly-computed rows.
+      n_rows <- if (is.data.frame(cc$data)) nrow(cc$data) else NA_integer_
+      TIMING_LOG[[length(TIMING_LOG) + 1]] <<- tibble(cache_name = cache_name, seconds = 0, status = "cached", n_rows = n_rows)
+      return(cc$data)
+    }
+  }
+  t0  <- Sys.time()
+  out <- fn()
+  dt  <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+  message(sprintf("[%s] computed in %.1fs", cache_name, dt))
+  n_rows <- if (is.data.frame(out)) nrow(out) else NA_integer_
+  TIMING_LOG[[length(TIMING_LOG) + 1]] <<- tibble(cache_name = cache_name, seconds = dt, status = "computed", n_rows = n_rows)
+  saveRDS(list(hash = hash, data = out), cache_file)
+  out
 }
 
-fmt_p <- function(p) ifelse(p < 0.001, "< .001", sprintf("%.3f", p))
+metrics_core   <- c("delegation_stability", "delegation_rate", "lost_vote_rate", "chain_length", "top5_power_share", "share_50pct")
+metric_labels  <- c(delegation_stability = "Delegation stability", delegation_rate = "Delegation rate",
+                     lost_vote_rate = "Lost-vote rate", chain_length = "Avg. chain length",
+                     top5_power_share = "Top-5% voting-power share", share_50pct = "Voters for 50% power")
+metrics_r <- c("delegation_rate", "delegation_stability", "lost_vote_rate", "top5_power_share", "share_50pct", "chain_length")
 
-# ── Paired comparison: does the joint (r_op=r_pw=r) curve sit closer to the
-# op-only or pw-only curve at matching r/seed? Same seeds are reused
-# identically across A/B/C, so this is a genuine paired comparison. ────────
-joint_vs_pure_test <- function(metric) {
-  joint <- diag_C_raw |> filter(r_op == r_pw, r_op %in% R_OP_PW_NARROW) |>
-    select(seed, r = r_op, joint = all_of(metric))
-  pureA <- diag_A_raw |> filter(r_op %in% R_OP_PW_NARROW) |>
-    select(seed, r = r_op, opOnly = all_of(metric))
-  pureB <- diag_B_raw |> filter(r_pw %in% R_OP_PW_NARROW) |>
-    select(seed, r = r_pw, pwOnly = all_of(metric))
+RATE_METRICS_01 <- c("Delegation stability", "Delegation rate", "Lost-vote rate", "Top-5% voting-power share", "Voters for 50% power")
 
-  m <- joint |> inner_join(pureA, by = c("seed", "r")) |> inner_join(pureB, by = c("seed", "r")) |>
-    filter(r > 0) |>
-    mutate(dist_op = abs(joint - opOnly), dist_pw = abs(joint - pwOnly))
-
-  tt <- t.test(m$dist_op, m$dist_pw, paired = TRUE)
-  tibble(mean_dist_to_op = round(mean(m$dist_op), 4), mean_dist_to_pw = round(mean(m$dist_pw), 4),
-         t_stat = round(unname(tt$statistic), 2), df = unname(tt$parameter),
-         p_value = signif(tt$p.value, 3),
-         closer_to = if (mean(m$dist_op) < mean(m$dist_pw)) "opinion (r_op)" else "power (r_pw)")
+y_anchor_01 <- function(metric_factor_levels, x_val) {
+  present <- intersect(RATE_METRICS_01, metric_factor_levels)
+  if (!length(present)) return(tibble(metric = factor(character(0), levels = metric_factor_levels), y = numeric(0), x = numeric(0)))
+  tidyr::crossing(metric = factor(present, levels = metric_factor_levels), y = c(0, 1), x = x_val)
 }
 
-# ── Trust moderation: does the r_trust effect on y strengthen as background
-# r_op = r_pw grows? Interaction F-test, lm(y ~ log_rtrust * factor(r_level)) ─
-trust_moderation_test <- function(metric) {
-  d <- diag_D_raw |> transmute(log_rt = log2(r_trust + 1), r_level = factor(r_op), y = .data[[metric]])
-  full    <- lm(y ~ log_rt * r_level, data = d)
-  reduced <- lm(y ~ log_rt + r_level, data = d)
-  a <- anova(reduced, full)
-  slopes <- d |> group_by(r_level) |> summarise(slope = coef(lm(y ~ log_rt))[2], .groups = "drop") |>
-    mutate(r_level = as.numeric(as.character(r_level))) |> arrange(r_level)
-  tibble(F_stat = round(a$F[2], 2), df1 = a$Df[2], df2 = a$Res.Df[2],
-         p_value = signif(a$`Pr(>F)`[2], 3),
-         slope_lowest_bg  = round(slopes$slope[1], 4),
-         slope_highest_bg = round(slopes$slope[nrow(slopes)], 4))
+FACET_SPACING <- theme(panel.spacing.y = unit(1, "cm"))
+
+steady_state_per_seed <- function(raw_df, round_max, window, id_cols, metrics = metrics_core) {
+  raw_df |>
+    filter(round > round_max - window) |>
+    pivot_longer(all_of(metrics), names_to = "metric", values_to = "value") |>
+    group_by(across(all_of(c(id_cols, "metric")))) |>
+    summarise(steady_val = mean(value, na.rm = TRUE), .groups = "drop")
+}
+steady_state_summary <- function(per_seed_df, group_cols) {
+  per_seed_df |>
+    group_by(across(all_of(c(group_cols, "metric")))) |>
+    summarise(mean_val = mean(steady_val, na.rm = TRUE),
+              sd_val   = sd(steady_val, na.rm = TRUE),
+              n_val    = sum(!is.na(steady_val)),
+              se_val   = sd_val / sqrt(n_val), .groups = "drop")
+}
+
+find_saturation_point <- function(sub, value_col, x_col, frac = 0.01, relative = FALSE, hold = 3) {
+  sub <- sub[order(sub[[x_col]]), ]
+  d <- abs(c(NA, diff(sub[[value_col]])))
+  if (relative) {
+    peak <- suppressWarnings(max(d, na.rm = TRUE))
+    if (!is.finite(peak)) return(NA_real_)
+    if (peak == 0) return(sub[[x_col]][1])
+    thresh <- frac * peak
+  } else {
+    thresh <- frac
+  }
+  ok <- !is.na(d) & d < thresh
+  n  <- length(ok)
+  for (i in seq_len(n)) {
+    window_end <- min(i + hold - 1, n)
+    if (all(ok[i:window_end])) return(sub[[x_col]][i])
+  }
+  NA_real_
+}
+
+# effect_pct_to_r() (automatic pct-of-saturated-effect -> r translation, via
+# a derivative/threshold-based curve search) is RETIRED. Three iterations of
+# automatic fixes each solved one failure mode and introduced another: (1) a
+# fixed absolute delta threshold was miscalibrated for metrics outside [0,1]
+# (e.g. Avg. chain length); (2) a short "hold for the next few points"
+# forward-crossing search was fooled by a genuine, SUSTAINED overshoot
+# spanning several consecutive grid points (r_pw's Avg. chain length in
+# [0.2, 2.0]); (3) requiring the crossing to hold all the way through to
+# r_sat instead became sensitive to a single late seed-noise blip anywhere
+# in [0, r_sat], pushing even low-percentage targets out to implausibly
+# large r.
+#
+# Replaced with a hybrid: a human picks r_sat AND which metric it's read off
+# (by eye, from the diagnostic table/plot after each isolated-dimension
+# sweep, Sec 2.2/4.2) -- the one genuinely ambiguous judgement call, now
+# made explicitly rather than by a threshold heuristic. Given that anchor,
+# pct_to_r_from_anchor() does a straightforward VALUE-based inverse
+# interpolation (target_val = y0 + pct/100*(y_sat-y0), then approx() finds
+# the r_val where the curve crosses target_val) restricted to r <= r_sat --
+# safe specifically because the human's own choice of r_sat is exactly the
+# claim "the curve behaves well (monotonic-enough) up to here", which is the
+# one thing the automatic version couldn't verify for itself. Percentages
+# are therefore genuine percentages of the metric's own value range (e.g.
+# "50%" means the metric is exactly halfway from its r=0 value to its
+# r_sat value), not a linear split of the r-axis.
+pct_to_r_from_anchor <- function(dim_name, pct, curve, anchor_tbl) {
+  r_sat_d  <- anchor_tbl$r_sat[anchor_tbl$dim == dim_name]
+  metric_d <- anchor_tbl$r_sat_metric[anchor_tbl$dim == dim_name]
+  sub <- curve |>
+    filter(dim == dim_name, metric == metric_d, r_val <= r_sat_d) |>
+    arrange(r_val)
+  if (nrow(sub) < 2) return(rep(NA_real_, length(pct)))
+  y0 <- sub$mean_val[1]; y_sat <- sub$mean_val[nrow(sub)]
+  # A completely flat curve (y0 == y_sat) has no well-posed "% of the way
+  # there" -- approx() would error on it directly (collapses to a single
+  # unique x value, needs >=2 to interpolate). Confirmed to actually happen
+  # in Report_23.Rmd (Delegation rate flat across the whole r_ig range at
+  # r_op=r_pw=r_tr=0); falls back to r=0 for every pct rather than crashing.
+  if (isTRUE(all.equal(y0, y_sat))) return(rep(sub$r_val[1], length(pct)))
+  target_val <- y0 + pct / 100 * (y_sat - y0)
+  sub_by_val <- sub |> arrange(mean_val)
+  approx(sub_by_val$mean_val, sub_by_val$r_val, xout = target_val, rule = 2)$y
+}
+
+# Compact diagnostic tables for the by-eye read-off (Sec 2.2, 4.2): one
+# table per dimension (own r_val grid -- pw's is denser near zero than
+# op/tr's), each metric abbreviated to keep 6 metrics x (value + delta)
+# readable as columns, delta shown right next to its value column instead
+# of as the separate step-to-step-delta section this replaces (former Sec
+# 4.3, retired -- its content now lives here instead of duplicated).
+METRIC_ABBR <- setNames(c("DR", "DS", "LV", "T5", "V50", "CL"),
+                        unname(metric_labels[metrics_r]))
+
+build_diag_tables <- function(summary_df) {
+  make_one <- function(dim_name) {
+    df <- summary_df |>
+      filter(dim == dim_name) |>
+      mutate(abbr = METRIC_ABBR[as.character(metric)]) |>
+      arrange(abbr, r_val) |>
+      group_by(abbr) |>
+      # Delta as % of the metric's OWN observed range (max-min across r_val),
+      # not an absolute difference -- the same scale-mismatch problem as the
+      # old fixed-0.01 saturation threshold: an absolute delta of, say,
+      # 0.01 is a huge step for a metric ranging 0-1 but negligible for one
+      # ranging 1-3.5 (e.g. Avg. chain length). Normalising by each metric's
+      # own range makes "has this basically stopped moving" comparable
+      # across metrics again.
+      mutate(rng   = diff(range(mean_val, na.rm = TRUE)),
+             delta = if_else(rng > 0, (mean_val - lag(mean_val)) / rng * 100, NA_real_)) |>
+      ungroup()
+    r_vals <- sort(unique(df$r_val))
+    out <- tibble(r_val = r_vals)
+    for (a in unname(METRIC_ABBR)) {
+      sub <- df |> filter(abbr == a) |> arrange(r_val)
+      out[[a]]              <- sub$mean_val[match(r_vals, sub$r_val)]
+      out[[paste0(a, "_d")]] <- sub$delta[match(r_vals, sub$r_val)]
+    }
+    out
+  }
+  list(op = make_one("op"), pw = make_one("pw"), tr = make_one("tr"))
+}
+
+# Readable display headers for a build_diag_tables() table -- kable's
+# col.names overrides only the DISPLAYED header, not the underlying (unique,
+# valid) column names the data frame itself still needs internally.
+METRIC_DISPLAY <- c(DR = "Del. Rate", DS = "Del. Stab.", LV = "Lost Votes",
+                    T5 = "Top 5%", V50 = "Voters 50%", CL = "Chain Len.")
+diag_col_names <- function(tbl) {
+  nm <- names(tbl)[-1]
+  disp <- vapply(nm, function(n) if (grepl("_d$", n)) "Delta %" else unname(METRIC_DISPLAY[n]), character(1))
+  c("r_val", disp)
+}
+
+# Value columns need more decimal places (metrics like CDR can sit at
+# 0.0003) than delta columns (now a %, 1 decimal is plenty).
+round_diag_table <- function(tbl) {
+  tbl |>
+    mutate(across(-c(r_val, ends_with("_d")), ~round(.x, 4)),
+           across(ends_with("_d"), ~round(.x, 1)))
+}
+
+N_BASE <- 1000L
+
+lambda_from_forget_rate <- function(forget_pct, h = 5) 1 - (1 - forget_pct / 100)^(1 / h)
+LAMBDA_FORGET_PCT_5 <- 50   # target: % of trust signal forgotten over 5 voting rounds
+LAMBDA_CONTEXT <- lambda_from_forget_rate(LAMBDA_FORGET_PCT_5, h = 5)
+```
+
+# 2. Attractiveness-threshold validation (the K decision)
+
+## 2.1 Definition
+
+For agent $i$ and neighbour $j$, $j$ qualifies as a usable delegation
+target if j is at least `tolerance` as attractive as i is to itself:
+$A_{ij} \geq \text{tolerance} \cdot A_{ii}$. Since `attractiveness_expose()`
+gives $A_{ii} \equiv 1$ always (opinion distance 0, power ratio 1), this is
+equivalent to $A_{ij} \geq \text{tolerance}$ directly. Report 22 used
+tolerance = 1 (j must be at least as attractive as i itself) -- here three
+looser tolerance levels are compared instead: 20%, 50%, 80%.
+
+```{r p2-rsweep-config}
+R_OPTR_MAX <- c(0, 2^(0:15))
+R_PW_VALS  <- c(seq(0, 2, by = 0.2), 2^(2:15))
+
+R_ISOLATED_GRID <- bind_rows(
+  tibble(dim = "op", r_val = R_OPTR_MAX),
+  tibble(dim = "pw", r_val = R_PW_VALS),
+  tibble(dim = "tr", r_val = R_OPTR_MAX)
+)
+
+N_SEEDS_R <- 25L
+SAT_ABS_THRESH         <- 0.01
+SAT_HOLD_POINTS        <- 3
+FINE_GRID_RATIO_THRESH <- 0.1
+```
+
+```{r p2-rsweep-fn}
+run_r_sweep <- function(K_val, T_val, NV_val, cache_tag) {
+  run_r_cell <- function(seed, N, K, r_op, r_pw, r_tr) {
+    window <- max(1, T_val - 4):T_val
+    res <- simulate_liquid_democracy(
+      seed = seed, n_per_community = N, n_communities = 1, node_degree = K, T = T_val,
+      n_voting_rounds = NV_val,
+      r_op = r_op, r_pw = r_pw, gamma = r_tr, lambda = LAMBDA_CONTEXT, k1 = 1, k2 = 1,
+      self_reliance_c = 0.5, trust_mode = "relaxation",
+      sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05,
+      snap_rounds = window
+    )
+    snap_idx <- match(window, res$snapshots$round)
+    tibble(
+      seed = seed, round = window,
+      delegation_rate      = res$history_delegation[window],
+      delegation_stability = res$history_stability[window],
+      lost_vote_rate       = res$history_lost[window],
+      top5_power_share     = res$snapshots$top5_power_share[snap_idx],
+      share_50pct          = res$snapshots$share_50pct[snap_idx],
+      chain_length         = res$snapshots$avg_chain_length_delegators[snap_idx]
+    )
+  }
+
+  run_isolated_cell <- function(seed, dim, r_val) {
+    r_op <- if (dim == "op") r_val else 0
+    r_pw <- if (dim == "pw") r_val else 0
+    r_tr <- if (dim == "tr") r_val else 0
+    run_r_cell(seed, N_BASE, K_val, r_op, r_pw, r_tr) |> mutate(dim = dim, r_val = r_val, .before = 1)
+  }
+
+  grid_r_isolated <- R_ISOLATED_GRID |> tidyr::crossing(seed = seq_len(N_SEEDS_R))
+
+  r3_isolated_raw <- run_cached(paste0("r23r_isolated_raw_", cache_tag), function() {
+    plan(multisession, workers = N_WORKERS)
+    out <- future_pmap_dfr(grid_r_isolated, function(dim, r_val, seed) run_isolated_cell(seed, dim, r_val),
+                            .options = furrr_options(seed = NULL))
+    plan(sequential)
+    out
+  }, list(R_ISOLATED_GRID, N_SEEDS_R, K_val, T_val, NV_val, LAMBDA_CONTEXT, v = 2))
+
+  r3_isolated_summary <- steady_state_summary(
+    steady_state_per_seed(r3_isolated_raw, T_val, 5L, c("dim", "r_val", "seed"), metrics = metrics_r),
+    c("dim", "r_val")
+  ) |> mutate(metric = factor(metric_labels[metric], levels = unname(metric_labels[metrics_r])))
+
+  # r_sat per dimension = MAX saturation point ACROSS ALL METRICS (Report 22
+  # only checked "Delegation rate"). A dimension counts as saturated only
+  # once EVERY tracked metric has individually stopped changing -- same
+  # "max across metrics" principle already used for nv/dt in run_t_sweep()
+  # (Sec 3). An un-saturated metric (NA) is capped at the max swept r-value
+  # rather than dropped by na.rm, so it correctly drives the ceiling up
+  # instead of being silently ignored.
+  # SAT_HOLD_POINTS (find_saturation_point()'s "hold" arg): a candidate point
+  # only needs the NEXT `hold` deltas to stay below SAT_ABS_THRESH, not every
+  # remaining point out to r=32768. Without this, a single noisy seed-driven
+  # blip anywhere in the tail (even between two irrelevantly-high r-values)
+  # makes the whole metric return NA -> gets capped to 32768 -> wins the
+  # slice_max() below against a genuinely-detected, much smaller r_sat.
+  # SAT_ABS_THRESH is scaled by each metric's OWN observed range (mean_val
+  # span within that dim x metric curve) before being passed to
+  # find_saturation_point() as an absolute frac. A single fixed absolute
+  # threshold (e.g. 0.01) is only meaningful for metrics bounded in [0,1]
+  # (delegation rate, lost-vote rate, stability, top5 share, share_50pct);
+  # "Avg. chain length" ranges ~1-3.5 (span ~2.5), so the same 0.01 delta is
+  # proportionally ~2.5x stricter there and gets defeated by ordinary
+  # seed-sampling noise, spuriously never satisfying the "flat" criterion.
+  # Since that made chain length win slice_max() below for every dimension
+  # regardless of whether it genuinely saturates latest, r_sat was landing
+  # on (or near) the grid's max value for pw/tr by construction rather than
+  # by finding, which this per-curve rescaling (same principle already
+  # used by effect_pct_to_r()'s pct-of-own-range target) corrects.
+  r_sat_per_metric <- function(df) {
+    df |>
+      group_by(dim, metric) |>
+      group_modify(~ {
+        span   <- diff(range(.x$mean_val, na.rm = TRUE))
+        thresh <- if (is.finite(span) && span > 0) SAT_ABS_THRESH * span else SAT_ABS_THRESH
+        tibble(r_sat = find_saturation_point(.x, "mean_val", "r_val", frac = thresh, relative = FALSE, hold = SAT_HOLD_POINTS))
+      }) |>
+      ungroup() |>
+      mutate(r_sat_capped = ifelse(is.na(r_sat), max(R_OPTR_MAX), r_sat)) |>
+      group_by(dim) |>
+      slice_max(r_sat_capped, n = 1, with_ties = FALSE) |>
+      ungroup() |>
+      transmute(dim, r_sat = r_sat_capped, r_sat_metric = as.character(metric))
+  }
+
+  r_sat_coarse <- r_sat_per_metric(r3_isolated_summary)
+
+  r_sat_ref   <- max(r_sat_coarse$r_sat, na.rm = TRUE)
+  dim_slowest <- r_sat_coarse$dim[which.max(r_sat_coarse$r_sat)]
+  N_FINE      <- sum(R_OPTR_MAX <= r_sat_ref)
+
+  dims_needing_fine <- r_sat_coarse |>
+    filter(dim != dim_slowest, r_sat < FINE_GRID_RATIO_THRESH * r_sat_ref) |>
+    pull(dim)
+  coarse_keep_dims <- setdiff(c("op", "pw", "tr"), dims_needing_fine)
+
+  build_fine_grid <- function(dim_name) {
+    r_sat_d <- r_sat_coarse$r_sat[r_sat_coarse$dim == dim_name]
+    if (is.na(r_sat_d)) r_sat_d <- max(R_OPTR_MAX)
+    tibble(dim = dim_name, r_val = seq(0, r_sat_d, length.out = N_FINE))
+  }
+
+  r3_isolated_final <- r3_isolated_summary |>
+    filter(dim %in% coarse_keep_dims) |>
+    left_join(r_sat_coarse, by = "dim") |>
+    filter(r_val <= ifelse(is.na(r_sat), max(R_OPTR_MAX), r_sat)) |>
+    select(-r_sat, -r_sat_metric)
+
+  if (length(dims_needing_fine) > 0) {
+    R_ISOLATED_GRID_FINE <- bind_rows(lapply(dims_needing_fine, build_fine_grid))
+    grid_r_isolated_fine <- R_ISOLATED_GRID_FINE |> tidyr::crossing(seed = seq_len(N_SEEDS_R))
+
+    r3_isolated_raw_fine <- run_cached(paste0("r23r_isolated_raw_fine_", cache_tag), function() {
+      plan(multisession, workers = N_WORKERS)
+      out <- future_pmap_dfr(grid_r_isolated_fine, function(dim, r_val, seed) run_isolated_cell(seed, dim, r_val),
+                              .options = furrr_options(seed = NULL))
+      plan(sequential)
+      out
+    }, list(R_ISOLATED_GRID_FINE, N_SEEDS_R, K_val, T_val, NV_val, LAMBDA_CONTEXT, v = 2))
+
+    r3_isolated_summary_fine <- steady_state_summary(
+      steady_state_per_seed(r3_isolated_raw_fine, T_val, 5L, c("dim", "r_val", "seed"), metrics = metrics_r),
+      c("dim", "r_val")
+    ) |> mutate(metric = factor(metric_labels[metric], levels = unname(metric_labels[metrics_r])))
+
+    r3_isolated_final <- bind_rows(r3_isolated_final, r3_isolated_summary_fine)
+  }
+
+  r_sat_isolated <- r_sat_per_metric(r3_isolated_final)
+
+  list(r_sat_coarse = r_sat_coarse, dims_needing_fine = dims_needing_fine,
+       coarse_keep_dims = coarse_keep_dims, dim_slowest = dim_slowest,
+       r3_isolated_summary = r3_isolated_summary, r3_isolated_final = r3_isolated_final,
+       r_sat_isolated = r_sat_isolated)
 }
 ```
 
----
+```{r p2-bootstrap-run}
+K_BOOTSTRAP  <- 40L
+T_BOOTSTRAP  <- 30L
+NV_BOOTSTRAP <- 10L
 
-# Part I: Delegation Dynamics & Power Concentration (H1-H3)
-
-In this model, an agent's delegation decision responds multiplicatively to
-opinion difference, power difference, and trust,
-$A_{ij}=a^{op}_{ij}a^{pw}_{ij}a^{trust}_{ij}$, each governed by its own
-responsiveness parameter $r_{op}$, $r_{pw}$, $r_{trust}$. Self-reliance is
-fixed at $c=0.5$ throughout, matching Report 21.
-
-## H1 (RQ1): Delegation dynamics respond non-linearly and saturate; $r_{op}$ and $r_{pw}$ pull in opposite directions
-
-**Expected (expose Sec. 2.3.1):** both $r_{op}$ and $r_{pw}$ have a
-non-linear, saturating effect on delegation rate / lost-vote rate / chain
-length, in **opposite** directions (higher $r_{op}$ -> less delegation,
-shorter chains; higher $r_{pw}$ -> more delegation, longer chains); the
-joint effect ($r_{op}\times r_{pw}$) resembles the $r_{op}$-only curve at
-high values; $r_{trust}$ acts as a further decentralising driver whose
-effect strengthens where background responsiveness is already high.
-
-```{r h1-metrics, include=FALSE}
-h1_metrics <- c("delegation_rate", "lost_vote_rate", "avg_chain_length_delegators")
-h1_labels  <- c(delegation_rate = "Delegation rate", lost_vote_rate = "Lost-vote rate",
-                avg_chain_length_delegators = "Avg. chain length")
+bootstrap_r_res <- run_r_sweep(K_BOOTSTRAP, T_BOOTSTRAP, NV_BOOTSTRAP, "bootstrap")
 ```
 
-### Saturation test (Conditions A / B)
+## 2.2 Independent effect-percentage r-triples
 
-```{r h1-gam-table}
-h1_gam <- bind_rows(
-  map_dfr(h1_metrics, \(m) gam_saturation(diag_A_raw, m, "r_op") |> mutate(metric = h1_labels[m], sweep = "r_op only (A)")),
-  map_dfr(h1_metrics, \(m) gam_saturation(diag_B_raw, m, "r_pw") |> mutate(metric = h1_labels[m], sweep = "r_pw only (B)"))
-) |> select(sweep, metric, edf, F_stat, p_value, r_sq, r_star, low_r_trend)
-kable(h1_gam, caption = "GAM y ~ s(log2(r+1)): smooth-term test + saturation point r*")
+```{r p2-bootstrap-isolated-plot, fig.height=9}
+bootstrap_r_res$r3_isolated_summary |>
+  ggplot(aes(r_val, mean_val, colour = dim, group = dim)) +
+  geom_blank(data = y_anchor_01(levels(bootstrap_r_res$r3_isolated_summary$metric), x_val = 1),
+             aes(x = x, y = y), inherit.aes = FALSE) +
+  geom_line(linewidth = 0.8) + geom_point(size = 1.8) +
+  scale_x_continuous(trans = "log1p", breaks = c(0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768)) +
+  scale_colour_viridis_d(name = "dimension", end = 0.85,
+                          labels = c(op = "r_op", pw = "r_pw", tr = "r_tr")) +
+  facet_wrap(~metric, scales = "free_y", ncol = 2) +
+  labs(title = "Isolated responsiveness dimensions (bootstrap r-sweep) -- other two held at r=0",
+       subtitle = sprintf("K=%d, T=%d, nv=%d, N=%d, %d seed(s) per point; r swept up to %d; x on log1p scale",
+                           K_BOOTSTRAP, T_BOOTSTRAP, NV_BOOTSTRAP, N_BASE, N_SEEDS_R, max(R_OPTR_MAX)),
+       x = "r value (log1p scale)", y = NULL) +
+  theme(legend.position = "top") + FACET_SPACING
 ```
 
-Every metric shows a significant, non-linear (edf > 1) smooth term in both
-conditions ($p<.001$ throughout), confirming the saturating relationship.
-The `low_r_trend` column already shows the expected sign flip between A and
-B for every metric (e.g. delegation rate falls with $r_{op}$, rises with
-$r_{pw}$); the paired test below formalises the "opposite direction" claim
-directly.
+"Delta %" columns = step-to-step change as a % of that metric's own
+observed range (max-min across all r_val), not an absolute difference --
+comparable across metrics regardless of their scale (replaces the former
+separate step-to-step-delta section).
 
-### Opposite-direction test
+```{r p2-diag-table}
+diag_bootstrap <- build_diag_tables(bootstrap_r_res$r3_isolated_summary)
 
-For each metric, at every $r\in\{1,2,4,8,16,32\}$ paired by seed, is the
-Condition-A response below its $r=0$ baseline while Condition-B's is above
-(or vice versa)? A paired t-test on (A response - A baseline) vs. (B
-response - B baseline) formalises this:
+kable(round_diag_table(diag_bootstrap$op), col.names = diag_col_names(diag_bootstrap$op),
+      caption = "r_op, bootstrap r-sweep -- read off by eye where the slowest metric stops changing further; use this to set R_SAT_ANCHOR_BOOTSTRAP below")
+kable(round_diag_table(diag_bootstrap$pw), col.names = diag_col_names(diag_bootstrap$pw),
+      caption = "r_pw, bootstrap r-sweep")
+kable(round_diag_table(diag_bootstrap$tr), col.names = diag_col_names(diag_bootstrap$tr),
+      caption = "r_tr, bootstrap r-sweep")
+```
 
-```{r h1-opposite-test}
-opposite_test <- function(metric) {
-  base_A <- diag_A_raw |> filter(r_op == 0) |> select(seed, base = all_of(metric))
-  base_B <- diag_B_raw |> filter(r_pw == 0) |> select(seed, base = all_of(metric))
-  dA <- diag_A_raw |> filter(r_op > 0) |> inner_join(base_A, by = "seed") |>
-    mutate(delta_A = .data[[metric]] - base) |> group_by(seed) |> summarise(delta_A = mean(delta_A), .groups = "drop")
-  dB <- diag_B_raw |> filter(r_pw > 0) |> inner_join(base_B, by = "seed") |>
-    mutate(delta_B = .data[[metric]] - base) |> group_by(seed) |> summarise(delta_B = mean(delta_B), .groups = "drop")
-  m <- inner_join(dA, dB, by = "seed")
-  tt <- t.test(m$delta_A, m$delta_B, paired = TRUE)
-  tibble(mean_delta_A = round(mean(m$delta_A), 4), mean_delta_B = round(mean(m$delta_B), 4),
-         t_stat = round(unname(tt$statistic), 2), p_value = signif(tt$p.value, 3),
-         opposite_signs = sign(mean(m$delta_A)) != sign(mean(m$delta_B)))
+```{r p2-sat-anchor-manual}
+# ANNAHME (read off by eye from the table/plot above): for each dimension,
+# the r_val at which ITS OWN slowest-to-settle metric stops changing further
+# (r_sat), and which metric that is. This is the one genuinely ambiguous
+# judgement call -- everything below (the pct_ref_table percentages) is then
+# a value-based interpolation ON that metric's own curve, restricted to
+# r <= r_sat, via pct_to_r_from_anchor() (see its comment above).
+R_SAT_ANCHOR_BOOTSTRAP <- tribble(
+  ~dim,  ~r_sat, ~r_sat_metric,
+  "op",  16384,  "Delegation rate",
+  "pw",  64,     "Top-5% voting-power share",
+  "tr",  128,    "Delegation rate"
+)
+
+pct_ref_table <- tibble(pct = seq(0, 100, by = 10)) |>
+  mutate(
+    r_op = pct_to_r_from_anchor("op", pct, bootstrap_r_res$r3_isolated_final, R_SAT_ANCHOR_BOOTSTRAP),
+    r_pw = pct_to_r_from_anchor("pw", pct, bootstrap_r_res$r3_isolated_final, R_SAT_ANCHOR_BOOTSTRAP),
+    r_tr = pct_to_r_from_anchor("tr", pct, bootstrap_r_res$r3_isolated_final, R_SAT_ANCHOR_BOOTSTRAP)
+  )
+
+kable(pct_ref_table |> mutate(across(starts_with("r_"), ~round(.x, 2))),
+      caption = "r needed to reach a given % of each dimension's own saturated effect (bootstrap r-sweep) -- percentages are of the anchor metric's own value range (R_SAT_ANCHOR_BOOTSTRAP), not a linear split of r")
+```
+
+```{r p2-pct-triples}
+# Full factorial over {0,50,100}% x 3 dimensions (3^3 = 27 combinations),
+# minus (0,0,0) -- that baseline is added separately wherever needed (e.g.
+# line ~558, ~885) as the literal triple_id = 0 row, so it's excluded here
+# to avoid a duplicate. The 2 "all-equal" diagonal combinations are placed
+# first as triple_id 1/2, since two call sites below (attract_triples, the
+# N-sensitivity r_label table) select them by literal triple_id %in% c(1,2).
+pct_levels   <- c(0, 50, 100)
+diag_triples <- tibble(pct_op = c(50, 100), pct_pw = c(50, 100), pct_tr = c(50, 100))
+other_triples <- tidyr::crossing(pct_op = pct_levels, pct_pw = pct_levels, pct_tr = pct_levels) |>
+  filter(!(pct_op == 0 & pct_pw == 0 & pct_tr == 0)) |>
+  anti_join(diag_triples, by = c("pct_op", "pct_pw", "pct_tr"))
+pct_triples <- bind_rows(diag_triples, other_triples) |>
+  mutate(triple_id = row_number(), .before = 1)
+
+r_triples <- pct_triples |>
+  mutate(
+    r_op = pct_to_r_from_anchor("op", pct_op, bootstrap_r_res$r3_isolated_final, R_SAT_ANCHOR_BOOTSTRAP),
+    r_pw = pct_to_r_from_anchor("pw", pct_pw, bootstrap_r_res$r3_isolated_final, R_SAT_ANCHOR_BOOTSTRAP),
+    r_tr = pct_to_r_from_anchor("tr", pct_tr, bootstrap_r_res$r3_isolated_final, R_SAT_ANCHOR_BOOTSTRAP)
+  )
+
+kable(r_triples |> mutate(across(starts_with(c("pct_", "r_")), ~round(.x, 2))),
+      caption = sprintf("The %d fixed effect-percentage combinations used below, translated to r via the bootstrap r-sweep (same per-dimension metric as the table above)", nrow(pct_triples)))
+```
+
+Each row is one $(pct_{op}, pct_{pw}, pct_{tr})$ combination from the full
+factorial over $\{0, 50, 100\}$% (3^3 = 27 combinations), minus
+$(0,0,0)$ -- that baseline is added separately wherever needed as its own
+row. Report 22 used only 10 hand-picked combinations from a finer
+$\{0,33,66,100\}$% cube; here all `r nrow(pct_triples)` remaining
+combinations of the coarser $\{0,50,100\}$% grid are swept instead, so the
+K-decision envelope (min/max across triples, Sec 2.3/2.5) reflects the
+true worst case across the full percentage space rather than a hand-picked
+subset of it, at a lower combinatorial cost than the finer grid.
+
+## 2.3 First calibration of K
+
+```{r p2-warmup-configs}
+# Hardcoded, not CHOSEN_T_FINAL/CHOSEN_NV_FINAL: those are only defined
+# later (Sec 3.2), after this K-decision step runs -- kept numerically in
+# sync with the current choice (T=80, nv=40) by hand instead.
+WARMUP_CONFIGS <- tribble(
+  ~warmup_label, ~T_warmup, ~nv_warmup,
+  "T=80, nv=40",  80L,       40L
+)
+LAMBDA_WARMUP <- 0.1
+kable(WARMUP_CONFIGS)
+```
+
+```{r p2-config}
+K_SWEEP_THRESH <- seq(30, 140, by = 10)
+A_THRESHOLD <- 1   # A_ii, always exactly 1 -- see 2.1
+QUALIFY_TOLERANCES <- c(0.2, 0.5, 0.8)   # A_ij >= tolerance * A_ii, compared side by side below
+
+# Placeholder used by the Sec 5 iteration loop and everywhere else only ONE
+# tolerance is needed (not the 3-way comparison). Review the 2.5 plot/2.6
+# table first, then update this by hand -- same "eyeball, then hardcode"
+# spirit as CHOSEN_NV_FINAL/CHOSEN_DT_FINAL in Sec 3.
+CHOSEN_TOLERANCE <- 0.5
+
+# Decision criterion switched from the Dunbar & Spoors lower bound (12) to
+# their mean (16) -- K now has to clear 16 qualifying neighbours, not 12.
+TARGET_QUALIFYING <- 16
+LOWER_BOUND_QUALIFYING <- 12
+UPPER_BOUND_QUALIFYING <- 20
+
+N_SEEDS_K <- 10L
+N_THRESH  <- 1000L
+```
+
+```{r p2-fn}
+count_qualifying_cell <- function(seed, K, triple_id, r_op, r_pw, r_tr, T_warmup, nv_warmup, tolerance) {
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = N_THRESH, n_communities = 1, node_degree = K, T = T_warmup,
+    n_voting_rounds = nv_warmup,
+    r_op = r_op, r_pw = r_pw, gamma = r_tr, lambda = LAMBDA_WARMUP, k1 = 1, k2 = 1,
+    self_reliance_c = 0.5, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05
+  )
+  gF  <- res$friendship_graph
+  op  <- res$agents$opinion
+  pow <- res$agents$power
+  tau_list <- res$tau_final
+  n_all <- nrow(res$agents)
+
+  qualifying_counts <- vapply(seq_len(n_all), function(i) {
+    nb <- as.integer(neighbors(gF, i, mode = "out"))
+    if (!length(nb)) return(0L)
+    a_op_pw   <- attractiveness_expose(op[i], op[nb], pow[i], pow[nb], r_op, r_pw)
+    trust_mod <- if (!is.null(tau_list)) 2 * .sig(r_tr * (tau_list[[i]] - 1)) else 1
+    sum(a_op_pw * trust_mod >= tolerance * A_THRESHOLD)
+  }, integer(1L))
+
+  tibble(seed = seed, K = K, triple_id = triple_id, tolerance = tolerance, mean_qualifying = mean(qualifying_counts))
 }
-kable(map_dfr(h1_metrics, \(m) opposite_test(m) |> mutate(metric = h1_labels[m], .before = 1)),
-      caption = "Paired test: mean change from r=0 baseline, Condition A vs. Condition B")
+
+run_k_decision <- function(r_triples_in, cache_tag) {
+  grid_thresh <- tidyr::crossing(K = K_SWEEP_THRESH, triple_id = r_triples_in$triple_id,
+                                  tolerance = QUALIFY_TOLERANCES, seed = seq_len(N_SEEDS_K)) |>
+    left_join(r_triples_in, by = "triple_id")
+
+  run_warmup_pass <- function(T_warmup, nv_warmup, cache_suffix) {
+    run_cached(paste0("r23k_thresh_", cache_tag, "_", cache_suffix), function() {
+      plan(multisession, workers = N_WORKERS)
+      out <- future_pmap_dfr(grid_thresh, function(K, triple_id, tolerance, seed, r_op, r_pw, r_tr, ...)
+        count_qualifying_cell(seed, K, triple_id, r_op, r_pw, r_tr, T_warmup, nv_warmup, tolerance),
+        .options = furrr_options(seed = NULL))
+      plan(sequential)
+      out
+    }, list(grid_thresh, T_warmup, nv_warmup, A_THRESHOLD, N_THRESH, v = 1))
+  }
+
+  thresh_raw_all <- WARMUP_CONFIGS |>
+    purrr::pmap(function(warmup_label, T_warmup, nv_warmup) {
+      run_warmup_pass(T_warmup, nv_warmup, gsub("[^A-Za-z0-9]", "", warmup_label)) |>
+        mutate(warmup_label = warmup_label)
+    }) |>
+    bind_rows() |>
+    mutate(warmup_label = factor(warmup_label, levels = WARMUP_CONFIGS$warmup_label))
+
+  thresh_per_triple <- thresh_raw_all |>
+    group_by(warmup_label, tolerance, K, triple_id) |>
+    summarise(mean_over_seeds = mean(mean_qualifying), .groups = "drop")
+
+  thresh_summary <- thresh_per_triple |>
+    group_by(warmup_label, tolerance, K) |>
+    summarise(mean_val = mean(mean_over_seeds), min_val = min(mean_over_seeds),
+              max_val = max(mean_over_seeds), sd_val = sd(mean_over_seeds), .groups = "drop")
+
+  # Full decision table across all 3 tolerances x 2 warm-up lengths -- for
+  # eyeballing/comparison (Sec 2.6).
+  decision_by_warmup <- thresh_summary |>
+    group_by(warmup_label, tolerance) |>
+    group_modify(~ {
+      clearing <- .x |> filter(mean_val >= TARGET_QUALIFYING) |> pull(K)
+      reached  <- length(clearing) > 0
+      tibble(target_reached = reached,
+             chosen_k = if (reached) min(clearing) else max(K_SWEEP_THRESH),
+             max_qualifying = max(.x$mean_val))
+    }) |>
+    ungroup()
+
+  # Single-K decision at CHOSEN_TOLERANCE only -- this is what actually
+  # feeds K forward (Sec 5 loop etc.), same logic as Report 22 otherwise.
+  decision_chosen_tol <- decision_by_warmup |> filter(tolerance == CHOSEN_TOLERANCE)
+  warmups_agree <- length(unique(decision_chosen_tol$chosen_k)) == 1 && all(decision_chosen_tol$target_reached)
+  chosen_k <- if (warmups_agree) decision_chosen_tol$chosen_k[1] else max(decision_chosen_tol$chosen_k)
+
+  triple_diagnostic <- thresh_per_triple |>
+    filter(tolerance == CHOSEN_TOLERANCE) |>
+    left_join(r_triples_in, by = "triple_id") |>
+    group_by(across(any_of(c("triple_id", "pct_op", "pct_pw", "pct_tr", "r_op", "r_pw", "r_tr")))) |>
+    summarise(reached_target = any(mean_over_seeds >= TARGET_QUALIFYING),
+              max_qualifying = max(mean_over_seeds), .groups = "drop")
+
+  list(CHOSEN_K = chosen_k, WARMUPS_AGREE = warmups_agree,
+       decision_table = decision_by_warmup, thresh_summary = thresh_summary,
+       thresh_per_triple = thresh_per_triple, triple_diagnostic = triple_diagnostic,
+       r_triples = r_triples_in, N_R_TRIPLES = nrow(r_triples_in))
+}
 ```
 
-### Joint effect test (Condition C): does it resemble the $r_{op}$-only curve?
-
-```{r h1-joint-test}
-kable(map_dfr(h1_metrics, \(m) joint_vs_pure_test(m) |> mutate(metric = h1_labels[m], .before = 1)),
-      caption = "Paired distance test: |joint - op-only| vs. |joint - pw-only|, matched r and seed")
+```{r p2-run}
+k_res0 <- run_k_decision(r_triples, "iter0")
+thresh_summary     <- k_res0$thresh_summary
+decision_by_warmup <- k_res0$decision_table
+WARMUPS_AGREE      <- k_res0$WARMUPS_AGREE
+CHOSEN_K_22        <- k_res0$CHOSEN_K
+N_R_TRIPLES        <- k_res0$N_R_TRIPLES
 ```
 
-### Trust moderation test (Condition D)
+## 2.4 Neighbour attractiveness distribution (diagnostic)
 
-```{r h1-trust-test}
-kable(map_dfr(h1_metrics, \(m) trust_moderation_test(m) |> mutate(metric = h1_labels[m], .before = 1)),
-      caption = "Interaction F-test: y ~ log2(r_trust+1) x factor(background r); slope at lowest vs. highest background")
+Distribution of $A_{ij} \times \text{trust\_mod}$ across a random sample of
+agents' out-neighbours, for two of the effect-percentage triples from 2.2 --
+this is what `tolerance` actually cuts against in 2.5/2.6.
+
+```{r p25-attract-fn}
+sample_attractiveness <- function(seed, K, r_op, r_pw, r_tr, T_warmup, nv_warmup, n_agents = 30) {
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = N_THRESH, n_communities = 1, node_degree = K, T = T_warmup,
+    n_voting_rounds = nv_warmup,
+    r_op = r_op, r_pw = r_pw, gamma = r_tr, lambda = LAMBDA_WARMUP, k1 = 1, k2 = 1,
+    self_reliance_c = 0.5, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05
+  )
+  gF       <- res$friendship_graph
+  op       <- res$agents$opinion
+  pow      <- res$agents$power
+  tau_list <- res$tau_final
+  n_all    <- nrow(res$agents)
+
+  set.seed(seed)
+  sample_ids <- sample.int(n_all, min(n_agents, n_all))
+
+  purrr::map_dfr(sample_ids, function(i) {
+    nb <- as.integer(neighbors(gF, i, mode = "out"))
+    if (!length(nb)) return(tibble())
+    a_op_pw   <- attractiveness_expose(op[i], op[nb], pow[i], pow[nb], r_op, r_pw)
+    trust_mod <- if (!is.null(tau_list)) 2 * .sig(r_tr * (tau_list[[i]] - 1)) else 1
+    tibble(agent = i, attractiveness = a_op_pw * trust_mod)
+  })
+}
 ```
 
-```{r h1-plot, fig.height=10}
-bind_rows(
-  diag_A_raw |> select(seed, r = r_op, all_of(h1_metrics)) |> mutate(sweep = "A: r_op only"),
-  diag_B_raw |> select(seed, r = r_pw, all_of(h1_metrics)) |> mutate(sweep = "B: r_pw only")
+```{r p25-attract-run, fig.height=10}
+attract_extra_pct <- tribble(
+  ~triple_id, ~pct_op, ~pct_pw, ~pct_tr,
+  11,         0,       0,       33,
+  12,         0,       33,      0,
+  13,         33,      0,       0
 ) |>
-  pivot_longer(all_of(h1_metrics), names_to = "metric", values_to = "value") |>
-  mutate(metric = factor(h1_labels[metric], levels = unname(h1_labels))) |>
-  ggplot(aes(r, value)) +
-  geom_jitter(width = 0.02, height = 0, alpha = 0.15, colour = "steelblue4") +
-  geom_smooth(method = "gam", formula = y ~ s(log2(x + 1), k = 9), colour = "firebrick3", linewidth = 1) +
-  scale_x_log10() + facet_grid(metric ~ sweep, scales = "free_y") +
-  labs(title = "H1 -- GAM fit (red) over per-seed observations (blue), N=25 seeds", x = "r (log scale)", y = NULL) +
-  theme(strip.background = element_rect(fill = "grey93", colour = NA), strip.text = element_text(face = "bold", size = 9))
+  mutate(
+    r_op = pct_to_r_from_anchor("op", pct_op, bootstrap_r_res$r3_isolated_final, R_SAT_ANCHOR_BOOTSTRAP),
+    r_pw = pct_to_r_from_anchor("pw", pct_pw, bootstrap_r_res$r3_isolated_final, R_SAT_ANCHOR_BOOTSTRAP),
+    r_tr = pct_to_r_from_anchor("tr", pct_tr, bootstrap_r_res$r3_isolated_final, R_SAT_ANCHOR_BOOTSTRAP)
+  )
+
+attract_triples <- bind_rows(
+  tibble(triple_id = 0, pct_op = 0, pct_pw = 0, pct_tr = 0, r_op = 0, r_pw = 0, r_tr = 0),
+  r_triples |> filter(triple_id %in% c(1, 2)),
+  attract_extra_pct
+)
+
+attract_sample <- attract_triples |>
+  purrr::pmap_dfr(function(triple_id, pct_op, pct_pw, pct_tr, r_op, r_pw, r_tr) {
+    sample_attractiveness(
+      seed = 1L, K = CHOSEN_K_22, r_op = r_op, r_pw = r_pw, r_tr = r_tr,
+      T_warmup = WARMUP_CONFIGS$T_warmup[1], nv_warmup = WARMUP_CONFIGS$nv_warmup[1]
+    ) |>
+      mutate(triple_label = sprintf("triple %d (op=%d%%, pw=%d%%, tr=%d%%)", triple_id, pct_op, pct_pw, pct_tr))
+  })
+
+tol_lines <- tibble(tolerance = QUALIFY_TOLERANCES)
+
+attract_sample |>
+  ggplot(aes(attractiveness)) +
+  geom_histogram(bins = 40, fill = "grey40", colour = "white") +
+  geom_vline(data = tol_lines, aes(xintercept = tolerance), linetype = "dashed", colour = "firebrick") +
+  facet_wrap(~triple_label, ncol = 1, scales = "free_y") +
+  labs(title = "Distribution of neighbour attractiveness (A_ij x trust_mod)",
+       subtitle = sprintf("K=%d, %d random agents, all their out-neighbours pooled; dashed red lines = tolerance = %s",
+                           CHOSEN_K_22, length(unique(attract_sample$agent[attract_sample$triple_label == attract_sample$triple_label[1]])),
+                           paste(QUALIFY_TOLERANCES, collapse = "/")),
+       x = "attractiveness (A_ij x trust_mod)", y = "count (pooled across sampled agents' neighbours)")
 ```
 
-**Verdict H1:** supported. Both parameters show a significant, non-linear,
-saturating relationship; the direction is opposite between $r_{op}$ and
-$r_{pw}$ for every dynamics metric; the joint curve sits significantly
-closer to the $r_{op}$-only curve than to the $r_{pw}$-only curve; the trust
-effect is present and, where the interaction test is significant, strengthens
-with background responsiveness (see slope columns above).
+## 2.5 Plot
 
-## H2 (RQ2): $r_{op}$ reduces ideological drift, $r_{pw}$ raises it, the joint effect favours opinion
-
-**Expected (expose Sec. 2.3.1):** increasing $r_{op}$ alone reduces drift;
-increasing $r_{pw}$ alone raises it; the joint effect favours the opinion
-term (drift falls, not the sum of both effects); trust has a similar
-drift-reducing effect to $r_{op}$.
-
-```{r h2-gam-table}
-h2_gam <- bind_rows(
-  gam_saturation(diag_A_raw, "avg_drift", "r_op") |> mutate(sweep = "r_op only (A)"),
-  gam_saturation(diag_B_raw, "avg_drift", "r_pw") |> mutate(sweep = "r_pw only (B)")
-) |> select(sweep, everything())
-kable(h2_gam, caption = "GAM avg_drift ~ s(log2(r+1)): smooth-term test + saturation point r*")
+```{r p2-plot, fig.height=12}
+thresh_summary |>
+  ggplot(aes(K, mean_val)) +
+  geom_ribbon(aes(ymin = min_val, ymax = max_val), alpha = 0.15) +
+  geom_line(linewidth = 0.8, colour = "grey20") + geom_point(size = 2.2, colour = "grey20") +
+  geom_hline(yintercept = TARGET_QUALIFYING, linetype = "dashed", colour = "forestgreen") +
+  annotate("text", x = min(K_SWEEP_THRESH), y = TARGET_QUALIFYING, vjust = -0.6, hjust = 0,
+           label = sprintf("target = Dunbar & Spoors mean: %d qualifying neighbours (decision criterion)", TARGET_QUALIFYING),
+           colour = "forestgreen", size = 3.2) +
+  geom_hline(yintercept = LOWER_BOUND_QUALIFYING, linetype = "dotdash", colour = "steelblue") +
+  annotate("text", x = min(K_SWEEP_THRESH), y = LOWER_BOUND_QUALIFYING, vjust = 1.4, hjust = 0,
+           label = sprintf("lower bound: %d (Dunbar & Spoors, reference only)", LOWER_BOUND_QUALIFYING),
+           colour = "steelblue", size = 3.2) +
+  geom_hline(yintercept = UPPER_BOUND_QUALIFYING, linetype = "dotted", colour = "firebrick") +
+  annotate("text", x = min(K_SWEEP_THRESH), y = UPPER_BOUND_QUALIFYING, vjust = -0.6, hjust = 0,
+           label = sprintf("upper bound: %d (Dunbar & Spoors)", UPPER_BOUND_QUALIFYING),
+           colour = "firebrick", size = 3.2) +
+  facet_grid(warmup_label ~ tolerance, labeller = labeller(tolerance = function(x) sprintf("tolerance=%s", x))) +
+  labs(title = "Mean qualifying neighbours (A_ij >= tolerance * A_ii) per agent, vs. K",
+       subtitle = sprintf("Averaged over %d seed(s) per triple, then over %d independent effect-percentage triples; ribbon = min-max across triples; rows = warm-up length, columns = tolerance",
+                           N_SEEDS_K, N_R_TRIPLES),
+       x = "K", y = "Mean qualifying neighbours") +
+  coord_cartesian(ylim = c(0, 30)) +
+  FACET_SPACING
 ```
 
-```{r h2-tests}
-kable(opposite_test("avg_drift") |> mutate(metric = "avg_drift", .before = 1),
-      caption = "Paired test: mean change from r=0 baseline, Condition A vs. Condition B")
-kable(joint_vs_pure_test("avg_drift") |> mutate(metric = "avg_drift", .before = 1),
-      caption = "Paired distance test: does the joint (r_op=r_pw) curve resemble the r_op-only curve?")
-kable(trust_moderation_test("avg_drift") |> mutate(metric = "avg_drift", .before = 1),
-      caption = "Interaction F-test: does the r_trust effect on drift strengthen with background r?")
+## 2.6 Read-off and decision
+
+```{r p2-decision-table}
+kable(decision_by_warmup |> mutate(max_qualifying = round(max_qualifying, 2)),
+      caption = sprintf("K read-off (first run), all tolerances -- CHOSEN_TOLERANCE = %s is what actually feeds K forward below", CHOSEN_TOLERANCE))
 ```
 
-```{r h2-plot, fig.height=5}
-bind_rows(
-  diag_A_raw |> select(seed, r = r_op, avg_drift) |> mutate(sweep = "A: r_op only"),
-  diag_B_raw |> select(seed, r = r_pw, avg_drift) |> mutate(sweep = "B: r_pw only")
-) |>
-  ggplot(aes(r, avg_drift)) +
-  geom_jitter(width = 0.02, height = 0, alpha = 0.15, colour = "steelblue4") +
-  geom_smooth(method = "gam", formula = y ~ s(log2(x + 1), k = 9), colour = "firebrick3", linewidth = 1) +
-  scale_x_log10() + facet_wrap(~sweep) +
-  labs(title = "H2 -- Ideological drift, GAM fit (red) over observations (blue)", x = "r (log scale)", y = "avg. drift")
+# 3. T/n_voting_rounds sweep (manual read-off, not auto-picked)
+
+Report 22 auto-picked (T, nv, Δt) from the saturation sweep below. Here the
+sweep is only for visual inspection -- nv/Δt are chosen by eye afterwards
+(Sec 3.2) and may be adjusted by hand again later.
+
+```{r p2b-config}
+DT_CANDIDATES <- c(1, 2, 3, 5, 10)
+NV_SWEEP      <- c(1, 2, 3, 4, 5, 10, 20, 30, 40, 50, 60)
+
+# r_op/r_pw/r_tr are held equal in PERCENTAGE terms (0/50/100% of each
+# dimension's own saturated effect, via R_SAT_ANCHOR_BOOTSTRAP), not in raw
+# r terms -- each dimension's own saturated effect differs wildly in raw r
+# (op ~16384, pw ~64, tr ~128 at the bootstrap config), so a single shared
+# raw r_level (as this used to be, e.g. r=32 for all three) meant something
+# very different per dimension. One row per r_pct, r_op/r_pw/r_tr computed
+# together so they stay paired when crossed against nv/dt below.
+R_PCT_SETTINGS <- c(0, 50, 100)
+R_LEVELS_T <- tibble(r_pct = R_PCT_SETTINGS) |>
+  mutate(
+    r_op = pct_to_r_from_anchor("op", r_pct, bootstrap_r_res$r3_isolated_final, R_SAT_ANCHOR_BOOTSTRAP),
+    r_pw = pct_to_r_from_anchor("pw", r_pct, bootstrap_r_res$r3_isolated_final, R_SAT_ANCHOR_BOOTSTRAP),
+    r_tr = pct_to_r_from_anchor("tr", r_pct, bootstrap_r_res$r3_isolated_final, R_SAT_ANCHOR_BOOTSTRAP)
+  )
+
+N_SEEDS_T <- 15L
 ```
 
-**Verdict H2:** supported if the opposite-sign test and the "closer to
-r_op-only" joint test both come out significant above (see tables); the
-saturation test confirms non-linearity in both directions.
+```{r p2b-fn}
+run_nv_dt_cell <- function(seed, nv, dt, r_pct, r_op, r_pw, r_tr, K_val, lambda_val = LAMBDA_CONTEXT) {
+  T_val  <- nv * dt
+  window <- max(1, T_val - 4):T_val
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = N_BASE, n_communities = 1, node_degree = K_val,
+    T = T_val, n_voting_rounds = nv,
+    r_op = r_op, r_pw = r_pw, gamma = r_tr, lambda = lambda_val, k1 = 1, k2 = 1,
+    self_reliance_c = 0.5, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05,
+    snap_rounds = window
+  )
+  snap_idx <- match(window, res$snapshots$round)
+  tibble(
+    seed = seed, nv = nv, dt = dt, r_pct = r_pct,
+    delegation_rate      = mean(res$history_delegation[window], na.rm = TRUE),
+    lost_vote_rate       = mean(res$history_lost[window], na.rm = TRUE),
+    delegation_stability = mean(res$history_stability[window], na.rm = TRUE),
+    chain_length         = mean(res$snapshots$avg_chain_length_delegators[snap_idx], na.rm = TRUE),
+    top5_power_share     = mean(res$snapshots$top5_power_share[snap_idx], na.rm = TRUE),
+    share_50pct          = mean(res$snapshots$share_50pct[snap_idx], na.rm = TRUE)
+  )
+}
 
-## H3 (RQ3): $r_{op}$ lowers power concentration, $r_{pw}$ raises it (rich-gets-richer), the joint effect tilts back toward opinion
+# Pure sweep for visual inspection -- no auto-pick (see Sec 3 intro).
+# levels_tbl defaults to R_LEVELS_T (0/50/100%) but takes a different
+# r_pct/r_op/r_pw/r_tr tibble for the closer-look sweep below (25/50/75%).
+run_t_sweep <- function(K_val, cache_tag, levels_tbl = R_LEVELS_T) {
+  grid_nv_dt <- tidyr::crossing(nv = NV_SWEEP, dt = DT_CANDIDATES, seed = seq_len(N_SEEDS_T), levels_tbl)
 
-**Expected (expose Sec. 2.3.1):** increasing $r_{op}$ lowers concentration
-(top-5% power share, share needed for 50%); increasing $r_{pw}$ raises it;
-jointly, the effect tilts back toward the opinion term; trust has a similar
-concentration-lowering effect to $r_{op}$.
+  t_calib_raw <- run_cached(sprintf("r23t_sweep_%s_seeds%d", cache_tag, N_SEEDS_T), function() {
+    plan(multisession, workers = N_WORKERS)
+    out <- future_pmap_dfr(grid_nv_dt, function(nv, dt, r_pct, r_op, r_pw, r_tr, seed)
+      run_nv_dt_cell(seed, nv, dt, r_pct, r_op, r_pw, r_tr, K_val),
+      .options = furrr_options(seed = NULL))
+    plan(sequential)
+    out
+  }, list(grid_nv_dt, K_val, N_BASE, LAMBDA_CONTEXT, N_SEEDS_T, v = 1))
 
-```{r h3-metrics, include=FALSE}
-h3_metrics <- c("top5_power_share", "share_50pct")
-h3_labels  <- c(top5_power_share = "Top-5% power share", share_50pct = "Agents for 50% of power")
+  t_calib_raw |>
+    pivot_longer(all_of(metrics_core), names_to = "metric", values_to = "value") |>
+    group_by(nv, dt, r_pct, metric) |>
+    summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop") |>
+    mutate(metric = factor(metric_labels[metric], levels = unname(metric_labels[metrics_core])))
+}
 ```
 
-```{r h3-gam-table}
-h3_gam <- bind_rows(
-  map_dfr(h3_metrics, \(m) gam_saturation(diag_A_raw, m, "r_op") |> mutate(metric = h3_labels[m], sweep = "r_op only (A)")),
-  map_dfr(h3_metrics, \(m) gam_saturation(diag_B_raw, m, "r_pw") |> mutate(metric = h3_labels[m], sweep = "r_pw only (B)"))
-) |> select(sweep, metric, edf, F_stat, p_value, r_sq, r_star, low_r_trend)
-kable(h3_gam, caption = "GAM y ~ s(log2(r+1)): smooth-term test + saturation point r*")
+```{r p2b-run}
+t_summary <- run_t_sweep(CHOSEN_K_22, "iter0")
+
+# Closer look around r=50%: in the main plot below, all three r_pct columns
+# share one y-axis per row (facet_grid's free_y frees per ROW, not per
+# panel) -- at r=0%/100% several metrics sit pinned near their floor/ceiling,
+# which forces that shared axis wide and visually flattens the (real, and
+# similarly-sized) variation in the r=50% column. This second sweep at
+# 25/50/75% is plotted with a genuinely independent scale per panel instead
+# (facet_wrap, not facet_grid) so that variation is actually visible.
+R_PCT_CLOSER <- c(25, 50, 75)
+R_LEVELS_T_CLOSER <- tibble(r_pct = R_PCT_CLOSER) |>
+  mutate(
+    r_op = pct_to_r_from_anchor("op", r_pct, bootstrap_r_res$r3_isolated_final, R_SAT_ANCHOR_BOOTSTRAP),
+    r_pw = pct_to_r_from_anchor("pw", r_pct, bootstrap_r_res$r3_isolated_final, R_SAT_ANCHOR_BOOTSTRAP),
+    r_tr = pct_to_r_from_anchor("tr", r_pct, bootstrap_r_res$r3_isolated_final, R_SAT_ANCHOR_BOOTSTRAP)
+  )
+t_summary_closer <- run_t_sweep(CHOSEN_K_22, "iter0_closer", levels_tbl = R_LEVELS_T_CLOSER)
 ```
 
-```{r h3-tests}
-kable(map_dfr(h3_metrics, \(m) opposite_test(m) |> mutate(metric = h3_labels[m], .before = 1)),
-      caption = "Paired test: mean change from r=0 baseline, Condition A vs. Condition B")
-kable(map_dfr(h3_metrics, \(m) joint_vs_pure_test(m) |> mutate(metric = h3_labels[m], .before = 1)),
-      caption = "Paired distance test: does the joint curve tilt back toward r_op-only?")
-kable(map_dfr(h3_metrics, \(m) trust_moderation_test(m) |> mutate(metric = h3_labels[m], .before = 1)),
-      caption = "Interaction F-test: does the r_trust effect on concentration strengthen with background r?")
+## 3.1 Plot
+
+```{r p2b-plot-fn}
+plot_t_calib_all <- function(t_summary) {
+  t_summary |>
+    ggplot(aes(nv, mean_val, colour = factor(dt))) +
+    geom_line(linewidth = 0.8) + geom_point(size = 1.4) +
+    scale_colour_viridis_d(name = "Δt (round spacing)", end = 0.85) +
+    facet_grid(metric ~ r_pct, scales = "free_y",
+               labeller = labeller(r_pct = function(x) sprintf("r=%s%%", x))) +
+    labs(title = "n_v / Δt sweep",
+         subtitle = sprintf("K=%d, N=%d, %d seed(s) per cell; columns = r_op=r_pw=r_tr in %% of each dimension's own saturated effect (R_SAT_ANCHOR_BOOTSTRAP), not raw r",
+                             CHOSEN_K_22, N_BASE, N_SEEDS_T),
+         x = "n_v (voting rounds)", y = NULL) +
+    theme(legend.position = "top") + FACET_SPACING
+}
 ```
 
-```{r h3-plot, fig.height=7}
-bind_rows(
-  diag_A_raw |> select(seed, r = r_op, all_of(h3_metrics)) |> mutate(sweep = "A: r_op only"),
-  diag_B_raw |> select(seed, r = r_pw, all_of(h3_metrics)) |> mutate(sweep = "B: r_pw only")
-) |>
-  pivot_longer(all_of(h3_metrics), names_to = "metric", values_to = "value") |>
-  mutate(metric = factor(h3_labels[metric], levels = unname(h3_labels))) |>
-  ggplot(aes(r, value)) +
-  geom_jitter(width = 0.02, height = 0, alpha = 0.15, colour = "steelblue4") +
-  geom_smooth(method = "gam", formula = y ~ s(log2(x + 1), k = 9), colour = "firebrick3", linewidth = 1) +
-  scale_x_log10() + facet_grid(metric ~ sweep, scales = "free_y") +
-  labs(title = "H3 -- Power concentration, GAM fit (red) over observations (blue)", x = "r (log scale)", y = NULL) +
-  theme(strip.background = element_rect(fill = "grey93", colour = NA), strip.text = element_text(face = "bold", size = 9))
+```{r p2b-plot-all, fig.height=12}
+plot_t_calib_all(t_summary)
 ```
 
-**Verdict H3:** supported if $r_{op}$ and $r_{pw}$ show opposite signs on
-both concentration metrics and the joint curve sits significantly closer to
-$r_{op}$-only than to $r_{pw}$-only (see tables above).
+```{r p2b-plot-closer-fn}
+plot_t_calib_closer <- function(t_summary) {
+  t_summary |>
+    ggplot(aes(nv, mean_val, colour = factor(dt))) +
+    geom_line(linewidth = 0.8) + geom_point(size = 1.4) +
+    scale_colour_viridis_d(name = "Δt (round spacing)", end = 0.85) +
+    facet_wrap(vars(metric, r_pct), scales = "free_y", ncol = length(R_PCT_CLOSER),
+               labeller = labeller(r_pct = function(x) sprintf("r=%s%%", x))) +
+    labs(title = "n_v / Δt sweep -- closer look around r=50%",
+         subtitle = sprintf("K=%d, N=%d, %d seed(s) per cell; each panel independently scaled (facet_wrap, not facet_grid) so its own variation is visible regardless of the other columns",
+                             CHOSEN_K_22, N_BASE, N_SEEDS_T),
+         x = "n_v (voting rounds)", y = NULL) +
+    theme(legend.position = "top") + FACET_SPACING
+}
+```
 
----
+```{r p2b-plot-closer, fig.height=20}
+plot_t_calib_closer(t_summary_closer)
+```
 
-# Part II: Minority Representation (H4-H5)
+## 3.2 Manual choice
 
-Part II adds a permanent binary group identity and an in-group term
-$a^{\text{in-group}}_{ij}=2\sigma(r_{\text{ingroup}}S(g_i,g_j))$. Three
-conditions are compared: `random` (opinion/network independent of group),
-`polarised` (group-specific opinion distributions), `homophily` (additionally
-reshuffled onto the network for group-specific opinion assortativity
-$\ge 0.8$). $r_{\text{ingroup}}$ is swept at three-to-four background
-responsiveness levels ($r_{op}=r_{pw}=r_{trust}\in\{1,4,8,16\}$).
+```{r p2b-fixed}
+# Eyeballed from the sweep plot above -- NOT auto-derived. Update by hand
+# and re-knit as needed.
+CHOSEN_NV_FINAL <- 40
+CHOSEN_DT_FINAL <- 2
+CHOSEN_T_FINAL  <- CHOSEN_NV_FINAL * CHOSEN_DT_FINAL
+```
 
-```{r p2-prep}
-sim_p2_long <- bind_rows(
-  sim_p2_raw |> transmute(condition, r_background, r_ingroup, seed,
-                           scope = "minority", delegation_rate = minority_delegation_rate),
-  sim_p2_raw |> transmute(condition, r_background, r_ingroup, seed,
-                           scope = "majority", delegation_rate = majority_delegation_rate)
+**Chosen: T=`r CHOSEN_T_FINAL`, n_v=`r CHOSEN_NV_FINAL`, Δt=`r CHOSEN_DT_FINAL`.**
+
+# 4. Responsiveness-range saturation ($r_{op}, r_{pw}, r_{tr}$)
+
+K is fixed at `r CHOSEN_K_22` (Sec 2, provisional first guess -- refined in Sec 5);
+T=`r CHOSEN_T_FINAL`, nv=`r CHOSEN_NV_FINAL`, Δt=`r CHOSEN_DT_FINAL` (fixed above, Sec 3.2).
+
+## 4.1 Grid and computation
+
+```{r p3-run}
+r_res0 <- run_r_sweep(CHOSEN_K_22, CHOSEN_T_FINAL, CHOSEN_NV_FINAL, "iter0")
+r3_isolated_summary <- r_res0$r3_isolated_summary
+r3_isolated_final   <- r_res0$r3_isolated_final
+r_sat_isolated       <- r_res0$r_sat_isolated
+r_sat_coarse         <- r_res0$r_sat_coarse
+dims_needing_fine    <- r_res0$dims_needing_fine
+coarse_keep_dims     <- r_res0$coarse_keep_dims
+```
+
+## 4.2 Isolated dimensions ($r_{op}$, $r_{pw}$, $r_{tr}$ swept alone)
+
+```{r p3-isolated-plot, fig.height=9}
+r3_isolated_summary |>
+  ggplot(aes(r_val, mean_val, colour = dim, group = dim)) +
+  geom_blank(data = y_anchor_01(levels(r3_isolated_summary$metric), x_val = 1),
+             aes(x = x, y = y), inherit.aes = FALSE) +
+  geom_line(linewidth = 0.8) + geom_point(size = 1.8) +
+  scale_x_continuous(trans = "log1p", breaks = c(0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768)) +
+  scale_colour_viridis_d(name = "dimension", end = 0.85,
+                          labels = c(op = "r_op", pw = "r_pw", tr = "r_tr")) +
+  facet_wrap(~metric, scales = "free_y", ncol = 2) +
+  labs(title = "Isolated responsiveness dimensions -- other two held at r=0",
+       subtitle = sprintf("K=%d, T=%d, nv=%d, N=%d, %d seed(s) per point; r swept up to %d; x on log1p scale",
+                           CHOSEN_K_22, CHOSEN_T_FINAL, CHOSEN_NV_FINAL, N_BASE, N_SEEDS_R, max(R_OPTR_MAX)),
+       x = "r value (log1p scale)", y = NULL) +
+  theme(legend.position = "top") + FACET_SPACING
+```
+
+"Delta %" columns = step-to-step change as a % of that metric's own
+observed range (max-min across all r_val), not an absolute difference.
+
+```{r p3-diag-table}
+diag_final <- build_diag_tables(r3_isolated_summary)
+
+kable(round_diag_table(diag_final$op), col.names = diag_col_names(diag_final$op),
+      caption = "r_op, final K/T config -- read off by eye where the slowest metric stops changing further; use this to set R_SAT_ANCHOR_FINAL below")
+kable(round_diag_table(diag_final$pw), col.names = diag_col_names(diag_final$pw),
+      caption = "r_pw, final K/T config")
+kable(round_diag_table(diag_final$tr), col.names = diag_col_names(diag_final$tr),
+      caption = "r_tr, final K/T config")
+```
+
+```{r p3-sat-anchor-manual}
+# ANNAHME (placeholder, fill in by hand from the table above -- final K/T
+# config, not the bootstrap K=40/T=30 one from Sec 2.2). Same
+# eyeball-then-hardcode pattern as R_SAT_ANCHOR_BOOTSTRAP. Placeholder
+# defaults (full swept range, Delegation rate) keep this runnable before
+# read-off; update both columns per dimension once the plot/table above
+# have been checked. Feeds Sec 6's r ceilings and everything downstream
+# that expresses r in percentages (Sec 7-10) via pct_to_r_from_anchor().
+R_SAT_ANCHOR_FINAL <- tribble(
+  ~dim,  ~r_sat,             ~r_sat_metric,
+  "op",  max(R_OPTR_MAX),    "Delegation rate",
+  "pw",  max(R_OPTR_MAX),    "Delegation rate",
+  "tr",  max(R_OPTR_MAX),    "Delegation rate"
+)
+
+r_sat_manual_final <- function(d) R_SAT_ANCHOR_FINAL$r_sat[R_SAT_ANCHOR_FINAL$dim == d]
+```
+
+# 5. K/T/r first values (first run)
+
+```{r p5-loop}
+MAX_ITER <- 1L
+K_TOL    <- 0
+
+r_sweep_current <- bootstrap_r_res
+iter_log  <- list()
+k_prev    <- NA_integer_
+converged <- FALSE
+
+for (iter in 0:(MAX_ITER - 1)) {
+  # iter=0 always reads r_sweep_current == bootstrap_r_res (assigned above),
+  # so R_SAT_ANCHOR_BOOTSTRAP is the right anchor here. NOTE: manual
+  # eyeball-then-hardcode fundamentally doesn't extend to iter>0 -- a human
+  # can't interactively re-read a table mid-loop -- so with MAX_ITER=1 this
+  # is exact, but raising MAX_ITER later would need this rewired (e.g. to
+  # R_SAT_ANCHOR_FINAL, itself re-read-off by hand between runs) rather than
+  # left as-is.
+  r_triples_current <- pct_triples |>
+    mutate(
+      r_op = pct_to_r_from_anchor("op", pct_op, r_sweep_current$r3_isolated_final, R_SAT_ANCHOR_BOOTSTRAP),
+      r_pw = pct_to_r_from_anchor("pw", pct_pw, r_sweep_current$r3_isolated_final, R_SAT_ANCHOR_BOOTSTRAP),
+      r_tr = pct_to_r_from_anchor("tr", pct_tr, r_sweep_current$r3_isolated_final, R_SAT_ANCHOR_BOOTSTRAP)
+    )
+
+  k_res <- run_k_decision(r_triples_current, paste0("iter", iter))
+  r_res <- run_r_sweep(k_res$CHOSEN_K, CHOSEN_T_FINAL, CHOSEN_NV_FINAL, paste0("iter", iter))
+
+  iter_log[[iter + 1]] <- tibble(
+    iter = iter, K = k_res$CHOSEN_K, T = CHOSEN_T_FINAL, NV = CHOSEN_NV_FINAL, DT = CHOSEN_DT_FINAL,
+    tolerance = CHOSEN_TOLERANCE,
+    r_sat_op = r_res$r_sat_isolated$r_sat[r_res$r_sat_isolated$dim == "op"],
+    r_sat_pw = r_res$r_sat_isolated$r_sat[r_res$r_sat_isolated$dim == "pw"],
+    r_sat_tr = r_res$r_sat_isolated$r_sat[r_res$r_sat_isolated$dim == "tr"]
+  )
+
+  if (iter > 0 && abs(k_res$CHOSEN_K - k_prev) <= K_TOL) { converged <- TRUE; break }
+
+  k_prev <- k_res$CHOSEN_K
+  r_sweep_current <- r_res
+}
+
+iter_table <- bind_rows(iter_log)
+FINAL_ITER      <- iter
+CHOSEN_K_FINAL  <- k_res$CHOSEN_K
+
+# T/nv/dt are already fixed (Sec 3.2) and r_res above was already computed
+# at CHOSEN_K_FINAL/CHOSEN_T_FINAL/CHOSEN_NV_FINAL directly -- no separate
+# re-run needed, just carry it forward under a stable name.
+r_res_final <- r_res
+r_sat_FINAL <- r_res_final$r_sat_isolated
+```
+
+```{r p5-table}
+kable(iter_table |> mutate(across(starts_with("r_sat"), ~round(.x, 3))),
+      caption = "K/T/r across loop iterations")
+```
+
+```{r p5-prose, results = "asis"}
+if (converged) {
+  cat(sprintf("**K converged after %d iterations**: K=%d agreed between iteration %d and iteration %d.",
+              FINAL_ITER + 1, CHOSEN_K_FINAL, FINAL_ITER - 1, FINAL_ITER))
+} else {
+  cat(sprintf("**K did NOT converge within %d iterations** (K sequence: %s) -- the iteration-%d values below are reported as provisional, not converged. Raise MAX_ITER (and the seed counts, currently 1 for a fast first pass) to close the loop properly.",
+              MAX_ITER, paste(iter_table$K, collapse = " -> "), FINAL_ITER))
+}
+```
+
+# 6. Final calibrated values
+
+```{r p6-summary, results = "asis"}
+cat(sprintf(
+  "- **K = %d** -- smallest K clearing %d qualifying neighbours (tolerance = %s) across %d independent effect-percentage triples, %s, converged at iteration %d.\n",
+  CHOSEN_K_FINAL, TARGET_QUALIFYING, CHOSEN_TOLERANCE, k_res$N_R_TRIPLES,
+  if (converged) "both warm-up lengths checked" else "warm-up-length check as in Sec 2",
+  FINAL_ITER
+))
+cat(sprintf(
+  "- **T = %d, n_voting_rounds = %d, Δt = %d** -- chosen by eye from the Sec 3 sweep, not auto-derived; may still be adjusted by hand.\n",
+  CHOSEN_T_FINAL, CHOSEN_NV_FINAL, CHOSEN_DT_FINAL
+))
+cat(sprintf(
+  "- **r ceilings** -- r_op=%.2f, r_pw=%.2f, r_tr=%.2f -- r_sat read off by eye from the Sec 4.2 diagnostic table (R_SAT_ANCHOR_FINAL), the r_val at which each dimension's own slowest-to-settle tracked metric stops changing further.\n",
+  r_sat_manual_final("op"), r_sat_manual_final("pw"), r_sat_manual_final("tr")
+))
+```
+
+```{r p6-corridor}
+N_MIN_CORRIDOR <- 10 * CHOSEN_K_FINAL
+```
+
+Small-world corridor ($N > 10K$) at K = `r CHOSEN_K_FINAL`: N > `r N_MIN_CORRIDOR`.
+
+# 7. N sensitivity check
+
+```{r p8-config}
+N_SENS_GRID   <- c(1500, 3000, 6000, 12000)
+N_SEEDS_N     <- 10L
+
+N_SENS_TRIPLES <- bind_rows(
+  tibble(triple_id = 0, r_op = 0, r_pw = 0, r_tr = 0, r_label = "r=r=r 0%"),
+  r_triples |> filter(triple_id %in% c(1, 2)) |>
+    transmute(triple_id, r_op, r_pw, r_tr, r_label = sprintf("r=r=r %d%%", pct_op))
 )
 ```
 
-## H4 (RQ4): In-group delegation behaviour is dip-shaped for the minority (out-group best-neighbour must lose attractiveness before an in-group one catches up), closer to monotonic for the majority, and less dip-pronounced under polarised/homophily
+```{r p8-fn}
+run_n_cell <- function(seed, N, r_op, r_pw, r_tr) {
+  window <- max(1, CHOSEN_T_FINAL - 4):CHOSEN_T_FINAL
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = N, n_communities = 1, node_degree = CHOSEN_K_FINAL, T = CHOSEN_T_FINAL,
+    n_voting_rounds = CHOSEN_NV_FINAL,
+    r_op = r_op, r_pw = r_pw, gamma = r_tr, lambda = LAMBDA_CONTEXT, k1 = 1, k2 = 1,
+    self_reliance_c = 0.5, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05,
+    snap_rounds = window
+  )
+  snap_idx <- match(window, res$snapshots$round)
+  tibble(
+    seed = seed, N = N,
+    delegation_rate      = mean(res$history_delegation[window], na.rm = TRUE),
+    delegation_stability = mean(res$history_stability[window], na.rm = TRUE),
+    lost_vote_rate       = mean(res$history_lost[window], na.rm = TRUE),
+    top5_power_share     = mean(res$snapshots$top5_power_share[snap_idx], na.rm = TRUE),
+    share_50pct          = mean(res$snapshots$share_50pct[snap_idx], na.rm = TRUE),
+    chain_length         = mean(res$snapshots$avg_chain_length_delegators[snap_idx], na.rm = TRUE)
+  )
+}
+```
 
-**Expected (expose Sec. 2.4.1):** under `random`, the minority curve is
-dip-dominated (delegation first falls, then recovers, as
-$r_{\text{ingroup}}$ rises) while the majority curve is closer to monotonic;
-the dip is less pronounced under `polarised`/`homophily`, where
-group-correlated structure already raises the odds an agent's best neighbour
-starts in-group.
+```{r p8-run}
+grid_n_sens <- tidyr::crossing(N_SENS_TRIPLES, N = N_SENS_GRID, seed = seq_len(N_SEEDS_N))
 
-**Test.** For each (condition, background, group) cell, `delegation_rate` is
-fit both as a forced-linear GAM term (`s(log_r, k=2, fx=TRUE)`) and a
-flexible smooth (`s(log_r)`); a nested F-test (`anova(linear, smooth)`)
-tests whether the flexible fit is a significant improvement (i.e. the
-response is genuinely non-linear), and the flexible fit's derivative is
-scanned for an interior sign change (negative-then-positive = a dip).
+n_sens_raw <- run_cached("r23n_sensitivity", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_n_sens, function(triple_id, r_op, r_pw, r_tr, r_label, N, seed)
+    run_n_cell(seed, N, r_op, r_pw, r_tr) |> mutate(triple_id = triple_id, r_label = r_label, .before = 1),
+    .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(grid_n_sens, CHOSEN_K_FINAL, CHOSEN_T_FINAL, CHOSEN_NV_FINAL, LAMBDA_CONTEXT, v = 1))
 
-```{r h4-dip-test}
-dip_test_one <- function(g) {
-  # method = "ML" (not "REML"): the two models differ in smooth/fixed-effects
-  # structure (forced-linear vs. flexible basis), and REML scores are not
-  # comparable across models with different fixed-effects specifications --
-  # mgcv's own guidance is to use ML for this kind of nested comparison.
-  k_use <- min(6L, n_distinct(g$log_r) - 1L)
-  lin <- gam(y ~ s(log_r, k = 2, fx = TRUE), data = g, method = "ML")
-  sm  <- gam(y ~ s(log_r, k = k_use),        data = g, method = "ML")
-  a   <- anova(lin, sm, test = "F")
-  grid  <- seq(min(g$log_r), max(g$log_r), length.out = 200)
-  pred  <- predict(sm, newdata = tibble(log_r = grid))
-  deriv <- diff(pred)
-  sign_changes <- sum(diff(sign(deriv)) != 0)
-  tibble(edf_smooth   = round(summary(sm)$s.table[1, "edf"], 2),
-         F_nonlinear  = round(a$F[2], 2),
-         p_nonlinear  = signif(a$`Pr(>F)`[2], 3),
-         dip_detected = sign_changes >= 1)
+n_sens_summary <- n_sens_raw |>
+  pivot_longer(all_of(metrics_r), names_to = "metric", values_to = "value") |>
+  group_by(r_label, N, metric) |>
+  summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop") |>
+  mutate(metric = factor(metric_labels[metric], levels = unname(metric_labels[metrics_r])))
+```
+
+```{r p8-plot, fig.height=9}
+n_sens_summary |>
+  ggplot(aes(N, mean_val, colour = r_label, group = r_label)) +
+  geom_line(linewidth = 0.8) + geom_point(size = 1.8) +
+  scale_x_continuous(trans = "log2", breaks = N_SENS_GRID) +
+  scale_colour_viridis_d(name = "r_op=r_pw=r_tr level", end = 0.85) +
+  facet_wrap(~metric, scales = "free_y", ncol = 2) +
+  labs(title = "N sensitivity at calibrated K/T/nv",
+       subtitle = sprintf("K=%d, T=%d, nv=%d, %d seed(s) per point; small-world corridor requires N > %d",
+                           CHOSEN_K_FINAL, CHOSEN_T_FINAL, CHOSEN_NV_FINAL, N_SEEDS_N, N_MIN_CORRIDOR),
+       x = "N (log2 scale)", y = NULL) +
+  theme(legend.position = "top") + FACET_SPACING
+```
+
+# 8. Δt x λ (trust forget-rate) interaction
+
+```{r p9-config}
+FORGET_RATES  <- c(10, 50, 90)
+LAMBDA_VALUES <- lambda_from_forget_rate(FORGET_RATES)
+names(LAMBDA_VALUES) <- sprintf("forget%d", FORGET_RATES)
+
+n_voting_rounds_in_window <- function(T_val, nv, window = 5) {
+  voting_rounds <- round(seq(T_val / nv, T_val, length.out = nv))
+  sum(voting_rounds > T_val - window)
 }
 
-h4_results <- sim_p2_long |>
-  mutate(log_r = log2(r_ingroup + 1), y = delegation_rate) |>
-  group_by(condition, scope, r_background) |>
-  group_modify(~ dip_test_one(.x)) |>
-  ungroup() |>
-  mutate(condition = factor(condition, levels = c("random", "polarised", "homophily"))) |>
-  arrange(scope, condition, r_background)
-
-kable(h4_results, caption = "Non-linearity (dip) test per condition x background x group")
+N_SEEDS_S9   <- 10L
+# 50% row of R_LEVELS_T (Sec 3) -- reusing the same bootstrap-derived
+# percentage translation rather than recomputing it here.
+R_LEVEL_FOR_DTLAMBDA <- R_LEVELS_T |> filter(r_pct == 50)
 ```
 
-```{r h4-summary}
-h4_summary <- h4_results |>
-  group_by(scope, condition) |>
-  summarise(n_dip_significant = sum(dip_detected & p_nonlinear < 0.05, na.rm = TRUE),
-            n_inconclusive     = sum(is.na(p_nonlinear)),
-            n_cells            = n(), .groups = "drop") |>
-  mutate(condition = factor(condition, levels = c("random", "polarised", "homophily"))) |>
-  arrange(scope, condition)
-kable(h4_summary, caption = "Cells (out of n_cells background levels) with a significant, detected dip; n_inconclusive = F-test numerically undefined (near-identical linear/smooth fit, i.e. no curvature to test)")
-```
+```{r p9-default-ref, results = "asis"}
+default_forget_rate <- LAMBDA_FORGET_PCT_5
 
-```{r h4-plot, fig.height=10}
-sim_p2_long |>
-  mutate(condition = factor(condition, levels = c("random", "polarised", "homophily"))) |>
-  ggplot(aes(r_ingroup, delegation_rate, colour = scope)) +
-  geom_jitter(width = 0.02, height = 0, alpha = 0.12) +
-  geom_smooth(method = "gam", formula = y ~ s(log2(x + 1), k = 6), linewidth = 1) +
-  scale_colour_manual(values = c(minority = "firebrick3", majority = "steelblue4")) +
-  scale_x_log10() +
-  facet_grid(r_background ~ condition, scales = "free_y", labeller = label_both) +
-  labs(title = "H4 -- Minority vs. majority delegation rate by condition x background r",
-       x = "r_ingroup (log scale)", y = "delegation rate") +
-  theme(strip.background = element_rect(fill = "grey93", colour = NA), strip.text = element_text(face = "bold", size = 8))
-```
+lo <- FORGET_RATES[FORGET_RATES <= default_forget_rate]
+hi <- FORGET_RATES[FORGET_RATES >= default_forget_rate]
 
-**Verdict H4:** supported to the extent the `n_dip_significant` count is
-higher for `scope = minority` than `scope = majority`, and higher under
-`random` than under `polarised`/`homophily`, per the summary table above.
-
-## H5 (RQ5): In-group preference improves minority representation ($RR_m\uparrow$, $PC_m\downarrow$); at $r_{\text{ingroup}}=0$ under `random`, $RR_m=1$; `random` shows the largest response
-
-**Expected (expose Sec. 2.4.2):** at $r_{\text{ingroup}}=0$ under `random`,
-group identity plays no role, so $RR_m$ should track the minority's
-population share exactly ($RR_m=1$). Increasing $r_{\text{ingroup}}$ should
-monotonically raise $RR_m$ and lower $PC_m$ (minority power capture by the
-majority). `random` should show the largest deviation from baseline, since
-group membership offers no representational advantage there on its own,
-unlike under `polarised`/`homophily`.
-
-### Baseline test: $RR_m = 1$ at $r_{\text{ingroup}}=0$, `random`
-
-```{r h5-baseline-test}
-baseline <- sim_p2_raw |> filter(condition == "random", r_ingroup == 0)
-tt_pooled <- t.test(baseline$RR_m, mu = 1)
-tt_by_bg  <- baseline |> group_by(r_background) |>
-  summarise(mean_RRm = round(mean(RR_m), 3),
-            t_stat = round(t.test(RR_m, mu = 1)$statistic, 2),
-            p_value = signif(t.test(RR_m, mu = 1)$p.value, 3), .groups = "drop")
-kable(tibble(mean_RRm = round(mean(baseline$RR_m), 3), t_stat = round(unname(tt_pooled$statistic), 2),
-             df = unname(tt_pooled$parameter), p_value = signif(tt_pooled$p.value, 3)),
-      caption = sprintf("Pooled one-sample t-test, RR_m vs. mu=1 (N=%d cells)", nrow(baseline)))
-kable(tt_by_bg, caption = "Same test, broken out by background responsiveness level")
-```
-
-### Trend tests: $RR_m$ rises, $PC_m$ falls with $r_{\text{ingroup}}$ (controlling for background)
-
-```{r h5-trend-test}
-trend_test <- function(df, y_col, expect_positive) {
-  df |> group_by(condition) |> group_modify(function(g, key) {
-    m <- lm(reformulate(c("log2(r_ingroup + 1)", "factor(r_background)"), response = y_col), data = g)
-    co <- summary(m)$coefficients
-    slope <- co["log2(r_ingroup + 1)", "Estimate"]
-    p <- co["log2(r_ingroup + 1)", "Pr(>|t|)"]
-    tibble(slope = round(slope, 4), p_value = signif(p, 3),
-           direction_as_expected = if (expect_positive) slope > 0 else slope < 0,
-           significant = p < 0.05)
-  }) |> ungroup()
+if (any(FORGET_RATES == default_forget_rate)) {
+  cat(sprintf(
+    "For reference: the report's own default `LAMBDA_CONTEXT = %.4f` corresponds to **%.1f%% forgotten after 5 voting rounds**, which matches the `forget%d` column below exactly.",
+    LAMBDA_CONTEXT, default_forget_rate, default_forget_rate
+  ))
+} else if (!length(lo)) {
+  cat(sprintf(
+    "For reference: the report's own default `LAMBDA_CONTEXT = %.4f` corresponds to **%.1f%% forgotten after 5 voting rounds** -- this falls BELOW the lowest swept forget-rate (`forget%d`), so no sweep column below reproduces the report's actual working default.",
+    LAMBDA_CONTEXT, default_forget_rate, min(FORGET_RATES)
+  ))
+} else if (!length(hi)) {
+  cat(sprintf(
+    "For reference: the report's own default `LAMBDA_CONTEXT = %.4f` corresponds to **%.1f%% forgotten after 5 voting rounds** -- this falls ABOVE the highest swept forget-rate (`forget%d`), so no sweep column below reproduces the report's actual working default.",
+    LAMBDA_CONTEXT, default_forget_rate, max(FORGET_RATES)
+  ))
+} else {
+  cat(sprintf(
+    "For reference: the report's own default `LAMBDA_CONTEXT = %.4f` corresponds to **%.1f%% forgotten after 5 voting rounds** -- this falls between the `forget%d` and `forget%d` columns below, not at either one, so neither sweep column should be read as reproducing the report's actual working default.",
+    LAMBDA_CONTEXT, default_forget_rate, max(lo), min(hi)
+  ))
 }
-
-kable(trend_test(sim_p2_raw, "RR_m", expect_positive = TRUE) |>
-        mutate(condition = factor(condition, levels = c("random", "polarised", "homophily"))) |> arrange(condition),
-      caption = "RR_m ~ log2(r_ingroup+1) + factor(r_background), per condition -- expect slope > 0")
-kable(trend_test(sim_p2_raw, "minority_capture", expect_positive = FALSE) |>
-        mutate(condition = factor(condition, levels = c("random", "polarised", "homophily"))) |> arrange(condition),
-      caption = "PC_m (minority_capture) ~ log2(r_ingroup+1) + factor(r_background), per condition -- expect slope < 0")
 ```
 
-### Condition-difference test: is the response strongest under `random`?
+```{r p9-run}
+grid_dtlambda <- tidyr::crossing(
+  nv = NV_SWEEP, dt = DT_CANDIDATES, lambda_name = names(LAMBDA_VALUES), seed = seq_len(N_SEEDS_S9)
+) |>
+  mutate(lambda_val = LAMBDA_VALUES[lambda_name],
+         n_vr_in_window = purrr::map2_int(nv, dt, ~n_voting_rounds_in_window(.x * .y, .x)))
 
-```{r h5-condition-test}
-full_RRm    <- lm(RR_m ~ log2(r_ingroup + 1) * condition + factor(r_background), data = sim_p2_raw)
-reduced_RRm <- lm(RR_m ~ log2(r_ingroup + 1) + condition   + factor(r_background), data = sim_p2_raw)
-a_RRm <- anova(reduced_RRm, full_RRm)
-
-kable(tibble(F_stat = round(a_RRm$F[2], 2), df1 = a_RRm$Df[2], df2 = a_RRm$Res.Df[2],
-             p_value = signif(a_RRm$`Pr(>F)`[2], 3)),
-      caption = "Interaction F-test: RR_m response to r_ingroup differs by condition")
-
-kable(sim_p2_raw |> group_by(condition) |>
-        summarise(slope_RRm = round(coef(lm(RR_m ~ log2(r_ingroup + 1) + factor(r_background)))["log2(r_ingroup + 1)"], 4),
-                   .groups = "drop") |>
-        mutate(condition = factor(condition, levels = c("random", "polarised", "homophily"))) |> arrange(condition),
-      caption = "RR_m slope on log2(r_ingroup+1) by condition -- largest magnitude expected under random")
+dtlambda_raw <- run_cached("r23_dtlambda", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_dtlambda, function(nv, dt, lambda_name, lambda_val, seed, n_vr_in_window)
+    run_nv_dt_cell(seed, nv, dt, R_LEVEL_FOR_DTLAMBDA$r_pct, R_LEVEL_FOR_DTLAMBDA$r_op,
+                   R_LEVEL_FOR_DTLAMBDA$r_pw, R_LEVEL_FOR_DTLAMBDA$r_tr,
+                   CHOSEN_K_FINAL, lambda_val = lambda_val) |>
+      mutate(lambda_name = lambda_name, n_vr_in_window = n_vr_in_window),
+    .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(grid_dtlambda, CHOSEN_K_FINAL, R_LEVEL_FOR_DTLAMBDA, LAMBDA_VALUES, N_SEEDS_S9, v = 1))
 ```
 
-```{r h5-plot, fig.height=6}
-sim_p2_raw |>
-  mutate(condition = factor(condition, levels = c("random", "polarised", "homophily"))) |>
-  group_by(condition, r_ingroup) |>
-  summarise(RR_m = mean(RR_m), minority_capture = mean(minority_capture), .groups = "drop") |>
-  pivot_longer(c(RR_m, minority_capture), names_to = "metric", values_to = "value") |>
-  ggplot(aes(r_ingroup, value, colour = condition)) +
-  geom_hline(data = tibble(metric = "RR_m", value = 1), aes(yintercept = value), linetype = "dotted", colour = "grey50") +
-  geom_line(linewidth = 0.9) + geom_point(size = 1.8) +
-  scale_colour_manual(values = c(random = "grey40", polarised = "darkorange3", homophily = "seagreen4")) +
-  facet_wrap(~metric, scales = "free_y") +
-  labs(title = "H5 -- RR_m and PC_m (minority_capture) by condition, averaged over background levels",
-       x = "r_ingroup", y = NULL)
+```{r p9-window-check}
+thin_window_cells <- grid_dtlambda |> filter(n_vr_in_window < 3) |> distinct(nv, dt, lambda_name, n_vr_in_window)
 ```
 
-**Verdict H5:** the baseline test above should fail to reject $RR_m=1$ under
-`random` at $r_{\text{ingroup}}=0$; the trend tests should show a
-significant positive $RR_m$ slope and negative $PC_m$ slope in every
-condition; the condition-interaction test and per-condition slopes should
-show `random`'s response as the largest in magnitude.
-
-## RQ6 (mechanism check, not a separate hypothesis): does reduced cross-group delegation explain the $RR_m$/drift response?
-
-The expose does not give RQ6 its own sweep -- it is read off the RQ4/RQ5
-data already collected. If in-group preference works through reduced
-cross-group delegation, cross-group delegation rate (CDR) and average
-ideological drift should fall together as $r_{\text{ingroup}}$ rises, and
-the two should be positively correlated across cells.
-
-```{r rq6-mechanism}
-mech <- sim_p2_raw |> group_by(condition, r_ingroup, r_background) |>
-  summarise(cdr = mean(cross_group_dlg_rate), drift = mean(avg_drift), .groups = "drop")
-
-ct <- cor.test(mech$cdr, mech$drift)
-kable(tibble(pearson_r = round(unname(ct$estimate), 3), t_stat = round(unname(ct$statistic), 2),
-             df = unname(ct$parameter), p_value = signif(ct$p.value, 3)),
-      caption = "Correlation: cross-group delegation rate vs. avg. ideological drift, across all condition x r_ingroup x background cells")
-
-cdr_trend <- trend_test(sim_p2_raw, "cross_group_dlg_rate", expect_positive = FALSE) |>
-  mutate(condition = factor(condition, levels = c("random", "polarised", "homophily"))) |> arrange(condition)
-kable(cdr_trend, caption = "CDR ~ log2(r_ingroup+1) + factor(r_background), per condition -- expect slope < 0")
+```{r p9-window-warn, results = "asis"}
+if (nrow(thin_window_cells) > 0) {
+  cat(sprintf(
+    "**Warning: %d (nv, dt, lambda) combinations have fewer than 3 voting rounds in the last-5-calendar-round steady-state window** (e.g. %s) -- their steady-state values may look unsaturated simply because trust had too few updates in that window, not because of dt or lambda itself. Read these cells with caution.",
+    nrow(thin_window_cells),
+    paste(head(sprintf("nv=%d,dt=%d,%s", thin_window_cells$nv, thin_window_cells$dt, thin_window_cells$lambda_name), 5), collapse = "; ")
+  ))
+} else {
+  cat("Every (nv, dt, lambda) combination has at least 3 voting rounds in the steady-state window -- no thin-window concern here.")
+}
 ```
 
-```{r rq6-plot, fig.height=5}
-mech |> mutate(condition = factor(condition, levels = c("random", "polarised", "homophily"))) |>
-  ggplot(aes(cdr, drift, colour = condition)) +
-  geom_point(alpha = 0.6) + geom_smooth(method = "lm", se = FALSE, linewidth = 0.8) +
-  scale_colour_manual(values = c(random = "grey40", polarised = "darkorange3", homophily = "seagreen4")) +
-  labs(title = "RQ6 -- Cross-group delegation rate vs. ideological drift", x = "cross-group delegation rate", y = "avg. drift")
+```{r p9-summary}
+dtlambda_summary <- dtlambda_raw |>
+  pivot_longer(all_of(metrics_core), names_to = "metric", values_to = "value") |>
+  group_by(nv, dt, lambda_name, metric) |>
+  summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop") |>
+  mutate(metric = factor(metric_labels[metric], levels = unname(metric_labels[metrics_core])),
+         lambda_name = factor(lambda_name, levels = names(LAMBDA_VALUES)))
 ```
 
-**Verdict RQ6:** supported if CDR falls significantly with
-$r_{\text{ingroup}}$ (as in H5's mechanism) and CDR/drift are significantly
-positively correlated across cells, i.e. conditions and parameter settings
-with less cross-group delegation also show less drift.
+```{r p9-plot, fig.height=14}
+dtlambda_summary |>
+  ggplot(aes(nv, mean_val, colour = factor(dt))) +
+  geom_line(linewidth = 0.8) + geom_point(size = 1.4) +
+  scale_colour_viridis_d(name = "Δt (round spacing)", end = 0.85) +
+  facet_grid(metric ~ lambda_name, scales = "free_y") +
+  labs(title = "n_v / Δt sweep across trust forget-rate",
+       subtitle = sprintf("K=%d, N=%d, r_op/r_pw/r_tr at %d%% of each dimension's own saturated effect, %d seeds per cell; columns = %% of trust signal forgotten over 5 voting rounds",
+                           CHOSEN_K_FINAL, N_BASE, R_LEVEL_FOR_DTLAMBDA$r_pct, N_SEEDS_S9),
+       x = "n_v (voting rounds)", y = NULL) +
+  theme(legend.position = "top") + FACET_SPACING
+```
 
----
+# 9. Self-reliance c sensitivity
 
-# Summary
+`self_reliance_c` (the c in the Möbius self-vote curve `p_self_mobius_M`,
+Sec 1.4.1) swept across its full [0, 1] range, over all six tracked metrics,
+at three r_op=r_pw=r_tr levels (0%, 50%, 100% of each dimension's own
+saturated effect, single shared dial like Sec 7/10) shown as separate
+coloured lines per facet. Note: c=0 is a genuine division-by-zero in
+`p_self_mobius_M` (`(M-1)/c` blows up), so the sweep uses c=0.01 as the
+practical lower bound instead of the literal 0.
 
-```{r summary-table}
-summary_tbl <- tribble(
-  ~ID, ~Hypothesis, ~`Primary test`, ~`Preliminary verdict (N=25 seeds)`,
-  "H1 (RQ1)", "Delegation dynamics saturate non-linearly; r_op / r_pw pull in opposite directions; joint favours opinion; trust moderates.",
-  "GAM smooth test + paired opposite-sign test + paired joint-distance test + trust interaction F-test",
-  "See H1 tables above",
-  "H2 (RQ2)", "r_op reduces drift, r_pw raises it, joint effect favours opinion.",
-  "Same battery, avg_drift", "See H2 tables above",
-  "H3 (RQ3)", "r_op lowers power concentration, r_pw raises it, joint effect tilts back to opinion.",
-  "Same battery, top5_power_share / share_50pct", "See H3 tables above",
-  "H4 (RQ4)", "Minority delegation is dip-shaped under random, majority closer to monotonic, dip weaker under polarised/homophily.",
-  "Nested linear-vs-smooth F-test per condition x background x group + interior-extremum scan",
-  "See H4 summary table above",
-  "H5 (RQ5)", "RR_m = 1 at r_ingroup=0 under random; RR_m rises / PC_m falls with r_ingroup; random shows the largest response.",
-  "One-sample t-test + per-condition trend regressions + condition interaction F-test",
-  "See H5 tables above",
-  "RQ6 (mechanism)", "Reduced cross-group delegation explains the RR_m/drift response to r_ingroup.",
-  "Trend regression (CDR) + Pearson correlation (CDR vs. drift)", "See RQ6 tables above"
+```{r p10-c-config}
+C_SWEEP      <- c(0.01, seq(0.1, 1, by = 0.1))
+N_SEEDS_S10  <- 25L
+
+C_R_LEVELS <- bind_rows(
+  tibble(r_pct = 0, r_op = 0, r_pw = 0, r_tr = 0),
+  tibble(r_pct = c(50, 100)) |>
+    mutate(
+      r_op = pct_to_r_from_anchor("op", r_pct, r_res_final$r3_isolated_final, R_SAT_ANCHOR_FINAL),
+      r_pw = pct_to_r_from_anchor("pw", r_pct, r_res_final$r3_isolated_final, R_SAT_ANCHOR_FINAL),
+      r_tr = pct_to_r_from_anchor("tr", r_pct, r_res_final$r3_isolated_final, R_SAT_ANCHOR_FINAL)
+    )
 )
-kable(summary_tbl)
 ```
 
-**Next step.** This is the fast, 25-seed pass requested as a first check of
-the design. Because the underlying simulation code is unchanged from Report
-21, the identical analysis can be re-run at the full 100 seeds simply by
-raising `N_SEEDS` above and re-knitting -- no new simulation code is needed,
-only (for cells beyond what Report 21 already cached) additional compute
-time.
+```{r p10-c-run}
+c_sweep_cell <- function(seed, c_val, r_op, r_pw, r_tr) {
+  window <- max(1, CHOSEN_T_FINAL - 4):CHOSEN_T_FINAL
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = N_BASE, n_communities = 1, node_degree = CHOSEN_K_FINAL,
+    T = CHOSEN_T_FINAL, n_voting_rounds = CHOSEN_NV_FINAL,
+    r_op = r_op, r_pw = r_pw, gamma = r_tr, lambda = LAMBDA_CONTEXT, k1 = 1, k2 = 1,
+    self_reliance_c = c_val, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05,
+    snap_rounds = window
+  )
+  snap_idx <- match(window, res$snapshots$round)
+  tibble(
+    seed = seed, c_val = c_val,
+    delegation_rate      = mean(res$history_delegation[window], na.rm = TRUE),
+    delegation_stability = mean(res$history_stability[window], na.rm = TRUE),
+    lost_vote_rate       = mean(res$history_lost[window], na.rm = TRUE),
+    chain_length         = mean(res$snapshots$avg_chain_length_delegators[snap_idx], na.rm = TRUE),
+    top5_power_share     = mean(res$snapshots$top5_power_share[snap_idx], na.rm = TRUE),
+    share_50pct          = mean(res$snapshots$share_50pct[snap_idx], na.rm = TRUE)
+  )
+}
+
+grid_c <- tidyr::crossing(C_R_LEVELS, c_val = C_SWEEP, seed = seq_len(N_SEEDS_S10))
+c_sweep_raw <- run_cached("r23_s10_c_sweep", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_c, function(c_val, r_pct, r_op, r_pw, r_tr, seed)
+    c_sweep_cell(seed, c_val, r_op, r_pw, r_tr) |> mutate(r_pct = r_pct),
+    .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(grid_c, CHOSEN_K_FINAL, CHOSEN_T_FINAL, CHOSEN_NV_FINAL, v = 1))
+
+c_sweep_summary <- c_sweep_raw |>
+  pivot_longer(all_of(metrics_core), names_to = "metric", values_to = "value") |>
+  group_by(c_val, r_pct, metric) |>
+  summarise(mean_val = mean(value, na.rm = TRUE), se_val = sd(value, na.rm = TRUE) / sqrt(n()), .groups = "drop") |>
+  mutate(metric = factor(metric_labels[metric], levels = unname(metric_labels[metrics_core])),
+         r_level = factor(sprintf("r=r=r %d%%", r_pct), levels = sprintf("r=r=r %d%%", c(0, 50, 100))))
+```
+
+```{r p10-c-plot, fig.height=9}
+c_sweep_summary |>
+  ggplot(aes(c_val, mean_val, colour = r_level, fill = r_level, group = r_level)) +
+  geom_blank(data = y_anchor_01(levels(c_sweep_summary$metric), x_val = 1),
+             aes(x = x, y = y), inherit.aes = FALSE) +
+  geom_ribbon(aes(ymin = mean_val - se_val, ymax = mean_val + se_val), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 0.8) + geom_point(size = 1.8) +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.1)) +
+  scale_colour_viridis_d(name = "r level", end = 0.85) +
+  scale_fill_viridis_d(guide = "none", end = 0.85) +
+  facet_wrap(~metric, scales = "free_y", ncol = 2) +
+  labs(title = "Self-reliance c sensitivity, mean +/- SE",
+       subtitle = sprintf("K=%d, T=%d, nv=%d, %d seeds per cell; r_op=r_pw=r_tr at 0/50/100%% of each dimension's own saturated effect; y-axis forced to [0,1] for the five share/rate metrics, chain length kept on its own natural scale",
+                           CHOSEN_K_FINAL, CHOSEN_T_FINAL, CHOSEN_NV_FINAL, N_SEEDS_S10),
+       x = "self_reliance_c", y = NULL) +
+  theme(legend.position = "top") + FACET_SPACING
+```
+
+# 10. Watts-Strogatz vs. Barabasi-Albert
+
+Fixing N=`r N_BASE`, K=`r CHOSEN_K_FINAL`, T=`r CHOSEN_T_FINAL`, nv=`r CHOSEN_NV_FINAL`
+(the calibrated values from Sec. 6, not Report_20's anchor N=1000/K=16): does
+the network generator itself matter? WS (small-world, the default used
+everywhere else in this report) vs. BA (Barabasi-Albert preferential
+attachment -- hub-like degree heterogeneity that WS cannot produce). Everything
+from here on is expressed in r-percentages (% of each dimension's own
+saturated effect, read off by hand into `R_SAT_ANCHOR_FINAL`, Sec 4.2), not
+raw r-values -- consistent with Sec 7/9. Each pair of responsiveness dimensions is varied
+*together* across 10%-100% (in 10-point steps) of their own saturated effect,
+while the third is held fixed at one of three levels (0%/50%/100%), shown as
+differently coloured lines, network type distinguished by line style on top
+of that (WS solid, BA dashed). All three possible pairings are covered:
+
+- $r_{op}=r_{pw}$ varied, $r_{tr}$ fixed
+- $r_{op}=r_{tr}$ varied, $r_{pw}$ fixed
+- $r_{pw}=r_{tr}$ varied, $r_{op}$ fixed
+
+```{r p11-config}
+PCT_VALS_WSBA         <- seq(10, 100, by = 10)
+PCT_FIXED_LEVELS_WSBA <- c(0, 50, 100)
+N_SEEDS_WSBA          <- 25L
+```
+
+```{r p11-fn}
+run_wsba_cell <- function(seed, r_op, r_pw, r_tr, network_type) {
+  window <- max(1, CHOSEN_T_FINAL - 4):CHOSEN_T_FINAL
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = N_BASE, n_communities = 1, node_degree = CHOSEN_K_FINAL,
+    T = CHOSEN_T_FINAL, n_voting_rounds = CHOSEN_NV_FINAL, network_type = network_type,
+    r_op = r_op, r_pw = r_pw, gamma = r_tr, lambda = LAMBDA_CONTEXT, k1 = 1, k2 = 1,
+    self_reliance_c = 0.5, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05,
+    snap_rounds = window
+  )
+  snap_idx <- match(window, res$snapshots$round)
+  tibble(
+    seed = seed, network_type = network_type,
+    delegation_rate      = mean(res$history_delegation[window], na.rm = TRUE),
+    delegation_stability = mean(res$history_stability[window], na.rm = TRUE),
+    lost_vote_rate       = mean(res$history_lost[window], na.rm = TRUE),
+    chain_length         = mean(res$snapshots$avg_chain_length_delegators[snap_idx], na.rm = TRUE),
+    top5_power_share     = mean(res$snapshots$top5_power_share[snap_idx], na.rm = TRUE),
+    share_50pct          = mean(res$snapshots$share_50pct[snap_idx], na.rm = TRUE)
+  )
+}
+
+build_wsba_pair_grid <- function(pair_label, dim_v1, dim_v2, dim_f) {
+  df <- tidyr::crossing(pct_v = PCT_VALS_WSBA, pct_f = PCT_FIXED_LEVELS_WSBA,
+                         network_type = c("ws", "ba"), seed = seq_len(N_SEEDS_WSBA))
+  df$pair_label <- pair_label
+  r_v1 <- pct_to_r_from_anchor(dim_v1, df$pct_v, r_res_final$r3_isolated_final, R_SAT_ANCHOR_FINAL)
+  r_v2 <- pct_to_r_from_anchor(dim_v2, df$pct_v, r_res_final$r3_isolated_final, R_SAT_ANCHOR_FINAL)
+  r_f  <- pct_to_r_from_anchor(dim_f,  df$pct_f, r_res_final$r3_isolated_final, R_SAT_ANCHOR_FINAL)
+  r_by_dim <- setNames(list(r_v1, r_v2, r_f), c(dim_v1, dim_v2, dim_f))
+  df$r_op <- r_by_dim[["op"]]
+  df$r_pw <- r_by_dim[["pw"]]
+  df$r_tr <- r_by_dim[["tr"]]
+  df
+}
+```
+
+```{r p11-run}
+grid_wsba <- bind_rows(
+  build_wsba_pair_grid("r_op x r_pw (r_tr fixed)", "op", "pw", "tr"),
+  build_wsba_pair_grid("r_op x r_tr (r_pw fixed)", "op", "tr", "pw"),
+  build_wsba_pair_grid("r_pw x r_tr (r_op fixed)", "pw", "tr", "op")
+)
+
+wsba_raw <- run_cached("r23_wsba_pair", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_wsba, function(pair_label, pct_v, pct_f, network_type, seed, r_op, r_pw, r_tr)
+    run_wsba_cell(seed, r_op, r_pw, r_tr, network_type) |> mutate(pair_label = pair_label, pct_v = pct_v, pct_f = pct_f),
+    .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(grid_wsba, CHOSEN_K_FINAL, CHOSEN_T_FINAL, CHOSEN_NV_FINAL, LAMBDA_CONTEXT, v = 2))
+
+wsba_summary <- wsba_raw |>
+  pivot_longer(all_of(metrics_core), names_to = "metric", values_to = "value") |>
+  group_by(pair_label, network_type, pct_v, pct_f, metric) |>
+  summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop") |>
+  mutate(metric = factor(metric_labels[metric], levels = unname(metric_labels[metrics_core])),
+         network_type = factor(network_type, levels = c("ws", "ba"), labels = c("WS", "BA")))
+```
+
+```{r p11-plot-fn}
+plot_wsba_pair <- function(label) {
+  wsba_summary |>
+    filter(pair_label == label) |>
+    ggplot(aes(pct_v, mean_val, colour = factor(pct_f, levels = PCT_FIXED_LEVELS_WSBA),
+               linetype = network_type, group = interaction(pct_f, network_type))) +
+    geom_line(linewidth = 0.8) + geom_point(size = 1.5) +
+    scale_x_continuous(breaks = PCT_VALS_WSBA) +
+    scale_colour_viridis_d(name = "fixed level (%)", end = 0.85) +
+    scale_linetype_manual(name = "network", values = c(WS = "solid", BA = "dashed")) +
+    facet_wrap(~metric, scales = "free_y", ncol = 2) +
+    labs(title = sprintf("K=%d, T=%d, nv=%d -- %s x network", CHOSEN_K_FINAL, CHOSEN_T_FINAL, CHOSEN_NV_FINAL, label),
+         subtitle = sprintf("%d seeds per cell; shared axis and fixed level both in %% of each dimension's own saturated effect", N_SEEDS_WSBA),
+         x = "shared r level (% of each dimension's own saturated effect)", y = NULL) +
+    theme(legend.position = "top") + FACET_SPACING
+}
+```
+
+```{r p11-plot-1, fig.height=16}
+plot_wsba_pair("r_op x r_pw (r_tr fixed)")
+```
+
+```{r p11-plot-2, fig.height=16}
+plot_wsba_pair("r_op x r_tr (r_pw fixed)")
+```
+
+```{r p11-plot-3, fig.height=16}
+plot_wsba_pair("r_pw x r_tr (r_op fixed)")
+```
+
+# 11. Actual runtime
+
+```{r p12-timing-single-run}
+single_run_time_sec <- system.time(
+  simulate_liquid_democracy(
+    seed = 1L, n_per_community = N_BASE, n_communities = 1, node_degree = CHOSEN_K_FINAL,
+    T = CHOSEN_T_FINAL, n_voting_rounds = CHOSEN_NV_FINAL,
+    r_op = r_sat_manual_final("op"),
+    r_pw = r_sat_manual_final("pw"),
+    gamma = r_sat_manual_final("tr"),
+    lambda = LAMBDA_CONTEXT, k1 = 1, k2 = 1,
+    self_reliance_c = 0.5, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05
+  )
+)[["elapsed"]]
+```
+
+Runtime for a single simulation at the final calibrated config (K=`r CHOSEN_K_FINAL`, T=`r CHOSEN_T_FINAL`, nv=`r CHOSEN_NV_FINAL`, N=`r N_BASE`): **`r sprintf("%.2f", single_run_time_sec)` seconds**.
+
+```{r p12-timing-per-section}
+describe_cache <- function(cache_name) {
+  case_when(
+    str_starts(cache_name, "r23r_isolated_raw_fine_bootstrap") ~
+      sprintf("r-sweep bootstrap, fine grid (K=%d, T=%d, nv=%d)", K_BOOTSTRAP, T_BOOTSTRAP, NV_BOOTSTRAP),
+    str_starts(cache_name, "r23r_isolated_raw_bootstrap") ~
+      sprintf("r-sweep bootstrap, coarse grid (K=%d, T=%d, nv=%d)", K_BOOTSTRAP, T_BOOTSTRAP, NV_BOOTSTRAP),
+    str_starts(cache_name, "r23r_isolated_raw_fine_iter") ~
+      sprintf("r-sweep at chosen K, fine grid (K=%d, T=%d, nv=%d)", CHOSEN_K_FINAL, CHOSEN_T_FINAL, CHOSEN_NV_FINAL),
+    str_starts(cache_name, "r23r_isolated_raw_iter") ~
+      sprintf("r-sweep at chosen K, coarse grid (K=%d, T=%d, nv=%d)", CHOSEN_K_FINAL, CHOSEN_T_FINAL, CHOSEN_NV_FINAL),
+    str_starts(cache_name, "r23k_thresh_") ~
+      sprintf("K-sweep (K=%d-%d, T=%d, nv=%d, %d r-triples x %d tolerances)",
+              min(K_SWEEP_THRESH), max(K_SWEEP_THRESH),
+              WARMUP_CONFIGS$T_warmup[1], WARMUP_CONFIGS$nv_warmup[1],
+              nrow(r_triples), length(QUALIFY_TOLERANCES)),
+    str_starts(cache_name, "r23t_sweep_") ~
+      sprintf("T/nv sweep (K=%d, nv up to %d, dt up to %d)", CHOSEN_K_22, max(NV_SWEEP), max(DT_CANDIDATES)),
+    cache_name == "r23n_sensitivity" ~
+      sprintf("N sensitivity (K=%d, T=%d, nv=%d, N up to %d)", CHOSEN_K_FINAL, CHOSEN_T_FINAL, CHOSEN_NV_FINAL, max(N_SENS_GRID)),
+    cache_name == "r23_dtlambda" ~
+      sprintf("dt x lambda (K=%d, nv up to %d, dt up to %d)", CHOSEN_K_FINAL, max(NV_SWEEP), max(DT_CANDIDATES)),
+    cache_name == "r23_s10_c_sweep" ~
+      sprintf("Self-reliance c (K=%d, T=%d, nv=%d)", CHOSEN_K_FINAL, CHOSEN_T_FINAL, CHOSEN_NV_FINAL),
+    cache_name == "r23_wsba_pair" ~
+      sprintf("WS vs BA (K=%d, T=%d, nv=%d)", CHOSEN_K_FINAL, CHOSEN_T_FINAL, CHOSEN_NV_FINAL),
+    TRUE ~ cache_name
+  )
+}
+
+# Seeds per grid cell for each sweep -- same dispatch/patterns as
+# describe_cache() above, so the two always agree on which cache is which.
+n_seeds_for_cache <- function(cache_name) {
+  case_when(
+    str_starts(cache_name, "r23r_isolated_raw_") ~ N_SEEDS_R,
+    str_starts(cache_name, "r23k_thresh_")       ~ N_SEEDS_K,
+    str_starts(cache_name, "r23t_sweep_")        ~ N_SEEDS_T,
+    cache_name == "r23n_sensitivity"             ~ N_SEEDS_N,
+    cache_name == "r23_dtlambda"                 ~ N_SEEDS_S9,
+    cache_name == "r23_s10_c_sweep"              ~ N_SEEDS_S10,
+    cache_name == "r23_wsba_pair"                ~ N_SEEDS_WSBA,
+    TRUE ~ NA_integer_
+  )
+}
+
+timing_log_df <- bind_rows(TIMING_LOG) |>
+  mutate(description = describe_cache(cache_name),
+         seeds   = n_seeds_for_cache(cache_name),
+         minutes = round(seconds / 60, 1)) |>
+  select(Sweep = description, Status = status, Seeds = seeds, Runs = n_rows, Seconds = seconds, Minutes = minutes)
+
+kable(timing_log_df, caption = "Actual measured wall-clock time per sweep this knit -- 'cached' rows took 0s because they were reused from a previous run's saved .rds, not recomputed. Seeds = seeds per grid cell; Runs = total simulate_liquid_democracy() calls (grid cells x seeds) that sweep represents, whether cached or freshly computed this knit")
+```
+
+```{r p12-timing-total, results = "asis"}
+total_computed_sec <- sum(timing_log_df$Seconds[timing_log_df$Status == "computed"])
+cat(sprintf(
+  "**Total actual compute time this knit (sum of everything freshly computed, excluding cache hits): %.1f minutes (%.2f hours).**",
+  total_computed_sec / 60, total_computed_sec / 3600
+))
+```
+
+# 12. RQ1-3: Effect of Responsiveness on Liquid Democracy Outcomes
+
+Formerly its own standalone report (RQ1.Rmd), kept in sync with this
+document's K/T/n_v/λ by hand. Now appended here directly: reuses
+`CHOSEN_K_FINAL`, `CHOSEN_T_FINAL`, `CHOSEN_NV_FINAL`, `LAMBDA_CONTEXT` from
+Sec. 6 instead of a separate copy of the same constants.
+
+```{r rq-metrics-setup}
+# RQ1: delegation behaviour. RQ2: quality of representation (ideological
+# drift). RQ3: concentration of voting power. All three are answered off the
+# SAME simulation grid (see 12.2 below) -- one run per (pair, fixed-level,
+# seed) cell produces every metric needed for all three RQs at once.
+metrics_rq1 <- c("delegation_rate", "lost_vote_rate", "n_direct_voters", "chain_length", "flickerness")
+metrics_rq2 <- c("avg_drift")
+metrics_rq3 <- c("top5_power_share", "share_50pct")
+metrics_all_rqs <- c(metrics_rq1, metrics_rq2, metrics_rq3)
+
+# _rq suffix: this report already has its own metric_labels (Sec 1) for a
+# different metric set -- kept separate rather than overloading that name.
+metric_labels_rq <- c(
+  delegation_rate  = "Delegation rate",
+  lost_vote_rate   = "Lost-vote rate",
+  n_direct_voters  = "Direct voters (N x (1 - delegation rate))",
+  chain_length     = "Avg. delegation-chain length",
+  flickerness      = "Flickerness (delegation-target stability)",
+  avg_drift        = "Avg. ideological drift",
+  top5_power_share = "Top-5% voting-power share",
+  share_50pct      = "Agents needed for 50% of power"
+)
+
+# r_op/r_pw/r_tr needed to reach a given % of each dimension's own saturated
+# effect -- the specific, already-confirmed numbers given for this section
+# (not tied to R_SAT_ANCHOR_FINAL above, which may still be a placeholder --
+# see Sec 4.2's own comment). Linearly interpolated for pct in between.
+RQ_PCT_LOOKUP <- tribble(
+  ~pct, ~r_op,     ~r_pw, ~r_tr,
+  0,       0.00,     0.00,   0.00,
+  10,     13.17,     0.05,   2.09,
+  20,     28.85,     0.10,   3.99,
+  30,     48.58,     0.15,   6.79,
+  40,     72.89,     0.20,   9.76,
+  50,    109.53,     0.32,  12.86,
+  60,    166.16,     0.51,  15.97,
+  70,    243.11,     1.07,  22.97,
+  80,    429.31,     3.04,  30.01,
+  90,    910.23,     6.59,  48.68,
+  100, 16384.00,    64.00, 128.00
+)
+
+pct_to_r_rq <- function(dim_name, pct) {
+  col <- switch(dim_name, op = "r_op", pw = "r_pw", tr = "r_tr", stop("unknown dim: ", dim_name))
+  approx(RQ_PCT_LOOKUP$pct, RQ_PCT_LOOKUP[[col]], xout = pct, rule = 2)$y
+}
+```
+
+**K = `r CHOSEN_K_FINAL`, T = `r CHOSEN_T_FINAL` (`r CHOSEN_NV_FINAL` voting
+rounds, Δt = `r CHOSEN_DT_FINAL`), c = 0.5, forget rate = 50% over 5 voting
+rounds (`LAMBDA_CONTEXT`).**
+
+```{r rq-pct-table}
+kable(RQ_PCT_LOOKUP, caption = "r needed to reach a given % of each dimension's own saturated effect -- everything below is expressed in these percentages, not raw r")
+```
+
+## 12.1 Extreme behaviour: single-dial vs. isolated dimensions, 0-100%
+
+A wide look across the full 0-100% range of each dimension's own saturated
+effect, fixed at N=`r N_BASE`, K=`r CHOSEN_K_FINAL` -- showing every metric
+used in RQ1-3 below at once, to see where each one saturates. Four
+scenarios: **all** ($r_{op},r_{pw},r_{tr}$ all at the same %, each
+translated via `RQ_PCT_LOOKUP`) and each dimension **isolated** in turn (one
+dimension at that %, the other two at 0).
+
+```{r rq-extreme-config}
+PCT_VALS_EXTREME <- seq(0, 100, by = 10)
+N_SEEDS_EXTREME  <- 25L
+
+scenarios_extreme <- tribble(
+  ~scenario,     ~use_op, ~use_pw, ~use_tr,
+  "all (r=r=r)", TRUE,    TRUE,    TRUE,
+  "op only",     TRUE,    FALSE,   FALSE,
+  "pw only",     FALSE,   TRUE,    FALSE,
+  "trust only",  FALSE,   FALSE,   TRUE
+)
+```
+
+```{r rq-extreme-run}
+run_extreme_cell <- function(seed, pct, scenario, use_op, use_pw, use_tr) {
+  r_op <- if (use_op) pct_to_r_rq("op", pct) else 0
+  r_pw <- if (use_pw) pct_to_r_rq("pw", pct) else 0
+  r_tr <- if (use_tr) pct_to_r_rq("tr", pct) else 0
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = N_BASE, n_communities = 1, node_degree = CHOSEN_K_FINAL, T = CHOSEN_T_FINAL,
+    n_voting_rounds = CHOSEN_NV_FINAL,
+    r_op = r_op, r_pw = r_pw, gamma = r_tr, lambda = LAMBDA_CONTEXT, k1 = 1, k2 = 1,
+    self_reliance_c = 0.5, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05
+  )
+  last5 <- max(1L, CHOSEN_T_FINAL - 4L):CHOSEN_T_FINAL
+  snaps <- res$snapshots |> dplyr::filter(round >= max(1L, CHOSEN_T_FINAL - 4L))
+  delegation_rate <- mean(res$history_delegation[last5], na.rm = TRUE)
+  tibble(
+    seed = seed, pct = pct, scenario = scenario,
+    delegation_rate  = delegation_rate,
+    lost_vote_rate   = mean(res$history_lost[last5], na.rm = TRUE),
+    n_direct_voters  = N_BASE * (1 - delegation_rate),
+    chain_length     = mean(snaps$avg_chain_length_delegators, na.rm = TRUE),
+    flickerness      = mean(res$history_flickerness[last5], na.rm = TRUE),
+    avg_drift        = mean(snaps$avg_drift, na.rm = TRUE),
+    top5_power_share = mean(snaps$top5_power_share, na.rm = TRUE),
+    share_50pct      = mean(snaps$share_50pct, na.rm = TRUE)
+  )
+}
+
+grid_extreme <- tidyr::crossing(scenarios_extreme, pct = PCT_VALS_EXTREME, seed = seq_len(N_SEEDS_EXTREME))
+
+extreme_raw <- run_cached("rq_extreme_raw", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_extreme, run_extreme_cell, .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(N_BASE, CHOSEN_K_FINAL, CHOSEN_T_FINAL, CHOSEN_NV_FINAL, N_SEEDS_EXTREME, PCT_VALS_EXTREME,
+        scenarios_extreme, LAMBDA_CONTEXT, RQ_PCT_LOOKUP, v = 1))
+
+extreme_summary <- extreme_raw |>
+  pivot_longer(all_of(metrics_all_rqs), names_to = "metric", values_to = "value") |>
+  group_by(scenario, pct, metric) |>
+  summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop") |>
+  mutate(metric   = factor(metric_labels_rq[metric], levels = unname(metric_labels_rq)),
+         scenario = factor(scenario, levels = scenarios_extreme$scenario))
+```
+
+```{r rq-extreme-plot, fig.height=12}
+extreme_summary |>
+  ggplot(aes(pct, mean_val, colour = scenario, group = scenario)) +
+  geom_line(linewidth = 0.8) + geom_point(size = 1.5) +
+  scale_x_continuous(breaks = PCT_VALS_EXTREME) +
+  scale_colour_viridis_d(name = "responsiveness scenario", end = 0.85) +
+  facet_wrap(~metric, scales = "free_y", ncol = 2) +
+  labs(title = sprintf("Extreme behaviour -- N=%d, K=%d, all vs. isolated dimensions", N_BASE, CHOSEN_K_FINAL),
+       subtitle = sprintf("%d seeds per cell; x = %% of each dimension's own saturated effect (RQ_PCT_LOOKUP)", N_SEEDS_EXTREME),
+       x = "% of own saturated effect", y = NULL) +
+  theme(legend.position = "top")
+```
+
+## 12.2 Shared design: paired sweep, third dimension held fixed
+
+Same sweep grid for all three RQs. For each pair of responsiveness
+dimensions, both are varied *together* in **percentage** terms (translated
+to each dimension's own r via `RQ_PCT_LOOKUP` -- op/pw/tr saturate at
+wildly different raw r, so a shared raw value wouldn't mean the same thing
+across dimensions) across $\{10,20,...,100\}\%$, while the third dimension
+is held fixed at one of 3 percentage levels ($0\%, 50\%, 100\%$) -- shown
+as 3 coloured lines in the same plot. Repeating this for each of the 3
+possible pairs gives 3 plots per RQ, covering all three responsiveness
+dimensions:
+
+- $r_{op}, r_{pw}$ varied together $\in \{10,...,100\}\%$, $r_{tr} \in \{0,50,100\}\%$ (fixed)
+- $r_{op}, r_{tr}$ varied together $\in \{10,...,100\}\%$, $r_{pw} \in \{0,50,100\}\%$ (fixed)
+- $r_{pw}, r_{tr}$ varied together $\in \{10,...,100\}\%$, $r_{op} \in \{0,50,100\}\%$ (fixed)
+
+```{r rq-config}
+N_SEEDS_PAIR <- 25L
+
+PCT_VALS_PAIR    <- seq(10, 100, by = 10)  # % for the two paired (jointly varied) dimensions
+PCT_FIXED_LEVELS <- c(0, 50, 100)          # % for the third, held-fixed dimension
+```
+
+```{r rq-pair-run}
+build_pair_grid <- function(pair_label, dim_v1, dim_v2, dim_fixed) {
+  df <- tidyr::crossing(pct_v = PCT_VALS_PAIR, pct_f = PCT_FIXED_LEVELS, seed = seq_len(N_SEEDS_PAIR))
+  df$pair_label <- pair_label
+  df[[paste0("r_", dim_v1)]]    <- pct_to_r_rq(dim_v1, df$pct_v)
+  df[[paste0("r_", dim_v2)]]    <- pct_to_r_rq(dim_v2, df$pct_v)
+  df[[paste0("r_", dim_fixed)]] <- pct_to_r_rq(dim_fixed, df$pct_f)
+  df
+}
+
+grid_pair <- bind_rows(
+  build_pair_grid("r_op x r_pw (r_tr fixed)", "op", "pw", "tr"),
+  build_pair_grid("r_op x r_tr (r_pw fixed)", "op", "tr", "pw"),
+  build_pair_grid("r_pw x r_tr (r_op fixed)", "pw", "tr", "op")
+)
+
+run_pair_cell <- function(seed, pair_label, pct_v, pct_f, r_op, r_pw, r_tr) {
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = 500L, n_communities = 1, node_degree = CHOSEN_K_FINAL, T = CHOSEN_T_FINAL,
+    n_voting_rounds = CHOSEN_NV_FINAL,
+    r_op = r_op, r_pw = r_pw, gamma = r_tr, lambda = LAMBDA_CONTEXT, k1 = 1, k2 = 1,
+    self_reliance_c = 0.5, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05
+  )
+  last5 <- max(1L, CHOSEN_T_FINAL - 4L):CHOSEN_T_FINAL
+  snaps <- res$snapshots |> dplyr::filter(round >= max(1L, CHOSEN_T_FINAL - 4L))
+  delegation_rate <- mean(res$history_delegation[last5], na.rm = TRUE)
+  tibble(
+    seed = seed, pair_label = pair_label, pct_v = pct_v, pct_f = pct_f,
+    r_op = r_op, r_pw = r_pw, r_tr = r_tr,
+    # RQ1
+    delegation_rate  = delegation_rate,
+    lost_vote_rate   = mean(res$history_lost[last5], na.rm = TRUE),
+    n_direct_voters  = 500L * (1 - delegation_rate),
+    chain_length     = mean(snaps$avg_chain_length_delegators, na.rm = TRUE),
+    flickerness      = mean(res$history_flickerness[last5], na.rm = TRUE),
+    # RQ2
+    avg_drift        = mean(snaps$avg_drift, na.rm = TRUE),
+    # RQ3
+    top5_power_share = mean(snaps$top5_power_share, na.rm = TRUE),
+    share_50pct      = mean(snaps$share_50pct, na.rm = TRUE)
+  )
+}
+
+pair_raw <- run_cached("rq123_pair_raw", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_pair, run_pair_cell, .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(CHOSEN_K_FINAL, CHOSEN_T_FINAL, CHOSEN_NV_FINAL, N_SEEDS_PAIR, PCT_VALS_PAIR, PCT_FIXED_LEVELS, LAMBDA_CONTEXT, RQ_PCT_LOOKUP, v = 1))
+
+pair_summary <- pair_raw |>
+  pivot_longer(all_of(metrics_all_rqs), names_to = "metric", values_to = "value") |>
+  group_by(pair_label, pct_v, pct_f, metric) |>
+  summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop") |>
+  mutate(metric = factor(metric_labels_rq[metric], levels = unname(metric_labels_rq)))
+
+# metrics_subset selects which of the 8 metrics (as their metric_labels_rq)
+# go into this particular plot -- each RQ section below passes its own subset.
+plot_pair_rq <- function(label, metrics_subset) {
+  pair_summary |>
+    filter(pair_label == label, metric %in% metric_labels_rq[metrics_subset]) |>
+    ggplot(aes(pct_v, mean_val, colour = factor(pct_f, levels = PCT_FIXED_LEVELS))) +
+    geom_line(linewidth = 0.8) + geom_point(size = 2) +
+    scale_x_continuous(breaks = PCT_VALS_PAIR) +
+    scale_colour_viridis_d(name = "fixed level", end = 0.85, labels = function(x) sprintf("%s%%", x)) +
+    facet_wrap(~metric, scales = "free_y", ncol = 2) +
+    labs(title = sprintf("Paired sweep -- %s", label),
+         subtitle = sprintf("%d seeds per cell; values are %% of each dimension's own saturated effect (RQ_PCT_LOOKUP), not raw r", N_SEEDS_PAIR),
+         x = "shared % of own saturated effect", y = NULL) +
+    theme(legend.position = "top")
+}
+```
+
+## 12.3 RQ1: delegation behaviour
+
+Metrics: delegation rate, lost-vote rate, number of direct voters, average
+delegation-chain length, and flickerness (share of agents keeping the same
+delegation target as the previous round -- `history_flickerness` from
+`simulate_liquid_democracy()`, NA on round 1).
+
+```{r rq1-pair-plot-1, fig.height=14}
+plot_pair_rq("r_op x r_pw (r_tr fixed)", metrics_rq1)
+```
+
+```{r rq1-pair-plot-2, fig.height=14}
+plot_pair_rq("r_op x r_tr (r_pw fixed)", metrics_rq1)
+```
+
+```{r rq1-pair-plot-3, fig.height=14}
+plot_pair_rq("r_pw x r_tr (r_op fixed)", metrics_rq1)
+```
+
+### Answering RQ1
+
+*(Fill in once the plots above reflect the real simulation run -- this is
+a scaffold, not a pre-written conclusion.)*
+
+- **Ideological responsiveness ($r_{op}$):** ...
+- **Competence/power responsiveness ($r_{pw}$):** ...
+- **Trust responsiveness ($r_{tr}$):** ...
+- **Interactions between dimensions:** ...
+- **Overall answer to RQ1:** ...
+
+## 12.4 RQ2: quality of political representation
+
+Metric: average ideological drift (`avg_drift`) -- the mean distance between
+an agent's own opinion and the opinion of the agent who ultimately casts a
+vote on its behalf.
+
+Expected: $r_{op}$ reduces drift; $r_{pw}$ increases drift (powerful
+delegates stay attractive even when ideologically distant); $r_{tr}$
+reduces drift, same mechanism as $r_{op}$.
+
+```{r rq2-pair-plot-1, fig.height=6}
+plot_pair_rq("r_op x r_pw (r_tr fixed)", metrics_rq2)
+```
+
+```{r rq2-pair-plot-2, fig.height=6}
+plot_pair_rq("r_op x r_tr (r_pw fixed)", metrics_rq2)
+```
+
+```{r rq2-pair-plot-3, fig.height=6}
+plot_pair_rq("r_pw x r_tr (r_op fixed)", metrics_rq2)
+```
+
+### Answering RQ2
+
+*(Fill in once the plots above reflect the real simulation run -- this is
+a scaffold, not a pre-written conclusion.)*
+
+- **Ideological responsiveness ($r_{op}$):** ...
+- **Competence/power responsiveness ($r_{pw}$):** ...
+- **Trust responsiveness ($r_{tr}$):** ...
+- **Joint $r_{op} \times r_{pw}$ effect (opinion term expected to dominate):** ...
+- **Overall answer to RQ2:** ...
+
+## 12.5 RQ3: concentration of voting power
+
+Metrics: voting-power share held by the top 5% of agents (`top5_power_share`)
+and the fraction of agents needed to collectively hold 50% of total voting
+power (`share_50pct`).
+
+Expected: $r_{op}$ lowers concentration (more agents vote directly);
+$r_{pw}$ raises concentration (rich-get-richer). For the joint
+$r_{op} \times r_{pw}$ effect: low opinion-based attractiveness is expected
+to constrain how much high voting power can raise a neighbour's overall
+attractiveness -- so increasing both together should yield *lower*
+concentration than high $r_{pw}$ alone.
+
+```{r rq3-pair-plot-1, fig.height=8}
+plot_pair_rq("r_op x r_pw (r_tr fixed)", metrics_rq3)
+```
+
+```{r rq3-pair-plot-2, fig.height=8}
+plot_pair_rq("r_op x r_tr (r_pw fixed)", metrics_rq3)
+```
+
+```{r rq3-pair-plot-3, fig.height=8}
+plot_pair_rq("r_pw x r_tr (r_op fixed)", metrics_rq3)
+```
+
+### Answering RQ3
+
+*(Fill in once the plots above reflect the real simulation run -- this is
+a scaffold, not a pre-written conclusion.)*
+
+- **Ideological responsiveness ($r_{op}$):** ...
+- **Competence/power responsiveness ($r_{pw}$):** ...
+- **Joint $r_{op} \times r_{pw}$ effect (opinion term expected to constrain concentration):** ...
+- **Overall answer to RQ3:** ...
