@@ -366,6 +366,12 @@ setup_friendship_network <- function(agents, n_communities, node_degree,
 # =============================================================
 # HOMOPHILY OPINION SHUFFLE (Metropolis)
 #
+# LEGACY as of Report 23: homophily_target = "opinion" is no longer
+# simulate_liquid_democracy()'s default (see that function's docstring) --
+# shuffle_group_homophily() below is used instead for every condition in
+# Report 23. Kept here for callers that explicitly pass
+# homophily_target = "opinion", and for reports predating this switch.
+#
 # Runs AFTER the friendship network is built and BEFORE the
 # simulation loop. The network structure is never touched —
 # only opinions are redistributed among lay agents so that
@@ -491,6 +497,195 @@ shuffle_opinions_homophily <- function(agents, gF,
 }
 
 # =============================================================
+# shuffle_group_homophily()
+#
+# DEFAULT as of Report 23 (homophily_target = "group"): used by every
+# condition in Report 23 Sec 3, not just "non-polarised-homophily" --
+# see simulate_liquid_democracy()'s homophily_target docstring.
+#
+# Re-seats agents onto the fixed network gF so that GROUP LABEL
+# (minority/majority), not opinion, becomes structurally clustered --
+# originally added for conditions where opinions must stay independent
+# of group (e.g. "non-polarised-homophily", isolating the effect of
+# r_ingroup acting on network structure alone, without any opinion-based
+# delegation confound). shuffle_opinions_homophily() cannot be reused for this: it
+# optimises OPINION similarity within each group's own subgraph, which
+# only produces group clustering as a side effect when opinion happens
+# to correlate with group (the "homophilic" condition). When opinion is
+# independent of group (random opinions), that mechanism clusters
+# agents by opinion and leaves group assortativity at ~0 -- confirmed
+# empirically via a diagnostic run (see Report 23 Sec 4).
+#
+# Same Metropolis-Hastings swap procedure as shuffle_opinions_homophily(),
+# but with energy = number of cross-group lay-lay edges (mismatched
+# neighbour group), not opinion distance. Swaps the whole agent (opinion
+# + group) together, same reasoning as shuffle_opinions_homophily(): a
+# re-seating of agents onto fixed positions, so every per-agent
+# attribute moves together.
+#
+# CROSS-GROUP-ONLY PROPOSALS: unlike shuffle_opinions_homophily() (opinion
+# is continuous, so any pair of agents can improve the objective),
+# swapping two agents of the SAME group here is a strict no-op -- their
+# positions trade opinions, but the group arrangement (and therefore the
+# objective, cross-group edge count) is unchanged. Under uniform sampling
+# over all lay agents, P(same group) = p_min^2 + p_maj^2 (e.g. 0.68 at a
+# 20/80 split), so most of homophily_steps was previously wasted on
+# proposals that could never move the objective -- observed empirically as
+# realised assortativity plateauing around 0.7-0.75 even for a
+# target_homophily of 0.9 (Report 23 Sec 4). Sampling one minority
+# position and one majority position on every step instead (min_pos/
+# maj_pos below) makes every proposal potentially energy-changing.
+#
+# Target is the network's pooled group assortativity (a single scalar,
+# unlike the per-group opinion check above) -- with a binary attribute,
+# the mixing pattern between the two groups is already one symmetric
+# relational statistic, so there's no analogous "majority dominates the
+# pooled statistic" failure mode to guard against.
+#
+# Parameters: same as shuffle_opinions_homophily(), except
+#   target_homophily : target assortativity by group label (numeric
+#                      0/1 coding of minority/majority); NULL disables
+#
+# Returns: agents tibble with (possibly) reshuffled opinions + group
+# =============================================================
+
+shuffle_group_homophily <- function(agents, gF,
+                                    target_homophily,
+                                    homophily_t     = 5,
+                                    homophily_steps = 400000,
+                                    seed            = 1) {
+  if (is.null(target_homophily)) return(agents)
+  set.seed(seed)
+
+  lay_ids <- which(agents$type == "lay")
+  op      <- agents$opinion
+  grp     <- agents$group
+  gF_lay  <- induced_subgraph(gF, lay_ids)
+
+  nb_list <- vector("list", max(lay_ids))
+  for (v in lay_ids) {
+    nb_list[[v]] <- intersect(as.integer(neighbors(gF, v, mode = "out")), lay_ids)
+  }
+
+  # Positions currently holding each group label -- kept in sync with grp
+  # as swaps are accepted below (see the min_pos[mi]/maj_pos[mj] update),
+  # so every step still samples from the CURRENT arrangement, not the
+  # initial one. min_idx_of/maj_idx_of are the inverse lookup (position ->
+  # its index in min_pos/maj_pos), kept in sync alongside them, so finding
+  # a sampled position's index is O(1) instead of a which()-scan.
+  min_pos <- lay_ids[grp[lay_ids] == "minority"]
+  maj_pos <- lay_ids[grp[lay_ids] == "majority"]
+  n_min   <- length(min_pos)
+  n_maj   <- length(maj_pos)
+  if (n_min < 1 || n_maj < 1) return(agents)  # nothing to swap
+
+  max_id <- max(lay_ids)
+  min_idx_of <- integer(max_id); min_idx_of[min_pos] <- seq_len(n_min)
+  maj_idx_of <- integer(max_id); maj_idx_of[maj_pos] <- seq_len(n_maj)
+
+  group_target_met <- function() {
+    grp_lay <- grp[lay_ids]
+    a <- assortativity(gF_lay, (grp_lay == "minority") + 0, directed = FALSE)
+    !is.nan(a) && a >= target_homophily
+  }
+
+  # BOUNDARY-BIASED SAMPLING: a node all of whose neighbours already share
+  # its own group can never be improved by swapping it -- moving a
+  # "perfectly placed" node elsewhere only creates a new mismatch. Only
+  # BOUNDARY nodes (>=1 cross-group neighbour) can possibly be part of an
+  # improving swap, the same principle behind Kernighan-Lin/Fiduccia-
+  # Mattheyses boundary refinement in graph partitioning. Restricting
+  # proposals to the boundary concentrates the step budget where it can
+  # actually help, instead of spending most steps on deep-interior nodes
+  # whose local neighbourhood can't be improved. Boundary membership shifts
+  # as swaps are accepted (a node's neighbours' labels can change), so it's
+  # recomputed periodically (every BOUNDARY_REFRESH steps) rather than
+  # incrementally tracked -- cheap relative to the simulation cost, and
+  # avoids updating every swapped node's whole neighbourhood after each
+  # accepted swap.
+  BOUNDARY_REFRESH <- 2000L
+  compute_boundary <- function() {
+    list(
+      min = min_pos[vapply(min_pos, function(v) any(grp[nb_list[[v]]] != grp[v]), logical(1))],
+      maj = maj_pos[vapply(maj_pos, function(v) any(grp[nb_list[[v]]] != grp[v]), logical(1))]
+    )
+  }
+  boundary <- compute_boundary()
+
+  # Simulated annealing: ramp the Metropolis temperature geometrically from
+  # a SOFT start (homophily_t/10 -- accepts many worsening swaps, so
+  # fragmented minority clusters can still merge into one) up to the FIRM
+  # target homophily_t (mostly-greedy, locks the arrangement in) over the
+  # course of the run. A constant homophily_t (the previous behaviour) was
+  # found to plateau realised assortativity well below target_homophily even
+  # after the cross-group-only sampling fix above (e.g. ~0.73 realised at
+  # target 0.9, almost no better than at target 0.7) -- consistent with the
+  # walk getting stuck with the minority group split across several small
+  # clusters (locally hard to escape at a fixed high temperature) instead of
+  # merging into the single large cluster that actually minimises cross-group
+  # edges. Note temperature/boundary-biasing only help close the
+  # CONVERGENCE gap: part of the remaining shortfall from target_homophily
+  # is a genuine structural ceiling from p_rewire's randomly-rewired edges
+  # (can't be made same-group beyond the population-baseline match rate no
+  # matter how the rest is arranged), which no algorithm change can remove.
+  t_start <- homophily_t / 10
+  t_end   <- homophily_t
+
+  for (step in seq_len(homophily_steps)) {
+
+    if (step %% 100L == 0L) {
+      if (group_target_met())
+        break
+    }
+    if (step %% BOUNDARY_REFRESH == 0L) {
+      boundary <- compute_boundary()
+    }
+
+    t_now <- t_start * (t_end / t_start) ^ (step / homophily_steps)
+
+    # Sample from the boundary when it's non-empty (the common case while
+    # target isn't met yet); fall back to the full min_pos/maj_pos pools if
+    # a group's boundary is momentarily empty (e.g. right after a refresh
+    # found none, or very close to convergence) so the walk never stalls.
+    use_min <- if (length(boundary$min)) boundary$min else min_pos
+    use_maj <- if (length(boundary$maj)) boundary$maj else maj_pos
+    i  <- use_min[sample.int(length(use_min), 1L)]
+    j  <- use_maj[sample.int(length(use_maj), 1L)]
+    mi <- min_idx_of[i]
+    mj <- maj_idx_of[j]
+
+    nb_i <- setdiff(nb_list[[i]], j)
+    nb_j <- setdiff(nb_list[[j]], i)
+
+    E_before <- sum(grp[i] != grp[nb_i]) + sum(grp[j] != grp[nb_j])
+    E_after  <- sum(grp[j] != grp[nb_i]) + sum(grp[i] != grp[nb_j])
+    delta_E  <- E_after - E_before
+
+    if (delta_E < 0 || runif(1) < exp(-delta_E * t_now)) {
+      op[c(i, j)]  <- op[c(j, i)]
+      grp[c(i, j)] <- grp[c(j, i)]
+      # Position i now holds "majority" (it came from j), position j now
+      # holds "minority" (it came from i) -- update the position pools AND
+      # their inverse index lookups to match, so the next proposal samples
+      # from where minority/majority currently sit, not from where they
+      # started.
+      min_pos[mi] <- j
+      maj_pos[mj] <- i
+      min_idx_of[j] <- mi
+      maj_idx_of[i] <- mj
+    }
+  }
+
+  agents$opinion <- op
+  agents$group   <- grp
+  if (!group_target_met())
+    message(sprintf(
+      "shuffle_group_homophily(): target r=%.3f not reached within %d steps",
+      target_homophily, homophily_steps))
+  agents
+}
+
+# =============================================================
 # NETWORK HOMOPHILY MEASUREMENT
 #
 # Computes two complementary measures of opinion homophily on
@@ -597,6 +792,23 @@ simulate_liquid_democracy <- function(
     k2                      = 1,       # "relaxation" only: penalty magnitude s = -k2 when j's vote is lost to a cycle
     cycle_fallback          = "none",  # "none" | "direct" | "redelegate"
     target_homophily        = NULL,    # target assortativity; NULL disables shuffle
+    homophily_target        = "group",   # what target_homophily is measured on:
+                                        # "group" (default as of Report 23) shuffles via
+                                        # shuffle_group_homophily() -- directly targets
+                                        # group-label assortativity, independent of opinion.
+                                        # Used by both "homophilic" and
+                                        # "non-polarised-homophily" (Report 23 Sec 3); the
+                                        # two conditions differ only in whether opinion is
+                                        # ALSO clustered by group beforehand
+                                        # (minority_opinion_mu/majority_opinion_mu etc.), not
+                                        # in the reshuffle mechanism itself. "opinion"
+                                        # (legacy, was the default before Report 23) shuffles
+                                        # via shuffle_opinions_homophily() instead -- opinion
+                                        # similarity within each group's own subgraph; only
+                                        # clusters by group as a side effect when opinion
+                                        # correlates with group. Kept for backward
+                                        # compatibility with callers that explicitly pass
+                                        # "opinion"; no longer the default for any new caller.
     homophily_t             = 5,       # Metropolis temperature (higher = more greedy)
     homophily_steps         = 400000,  # safety cap on proposed swaps (raised from 100k: the
                                         # group-aware stopping criterion in shuffle_opinions_homophily()
@@ -676,10 +888,16 @@ simulate_liquid_democracy <- function(
       0), 1)
   }
 
-  # Redistribute lay opinions on the fixed network so that connected
-  # agents become more similar. No-op when target_homophily is NULL.
-  agents <- shuffle_opinions_homophily(agents, gF, target_homophily,
-                                       homophily_t, homophily_steps, seed)
+  # Redistribute lay agents on the fixed network so that connected agents
+  # become more similar -- by opinion (default) or by group label
+  # (homophily_target = "group"). No-op when target_homophily is NULL.
+  agents <- if (identical(homophily_target, "group")) {
+    shuffle_group_homophily(agents, gF, target_homophily,
+                            homophily_t, homophily_steps, seed)
+  } else {
+    shuffle_opinions_homophily(agents, gF, target_homophily,
+                               homophily_t, homophily_steps, seed)
+  }
 
   # sigma_opinion = "auto": derive the perception-noise SD from this run's
   # own opinion population (empirical SD of agents$opinion around its
@@ -764,6 +982,12 @@ simulate_liquid_democracy <- function(
   history_delegation <- numeric(T)
   history_stability  <- numeric(T)
   cycle_breakdown_list <- vector("list", T)  # RQ1: per-round (cycle_length -> n_agents) table
+  lost_agent_ids       <- vector("list", T)  # per-round WHICH agent ids are lost (NA vote) -- for
+                                              # round-to-round cycle-membership tracking (Results.Rmd's
+                                              # "Lost votes: cycle mechanics" section); cycle_breakdown
+                                              # above only has per-round COUNTS by cycle_length, not
+                                              # agent identity, so it can't answer "is agent i still
+                                              # lost next round" on its own.
 
   snapshot_list     <- vector("list", length(snapshot_rounds))
   names(snapshot_list) <- as.character(snapshot_rounds)
@@ -960,10 +1184,17 @@ simulate_liquid_democracy <- function(
     # cycle-member power, Sec 2.2.7), reused here rather than recomputed.
     # Purely diagnostic, doesn't affect anything above.
     in_cycle_t <- is.na(agents$my_vote)
+    lost_agent_ids[[t]] <- which(in_cycle_t)
     if (any(in_cycle_t)) {
       cyc_len_t <- pv$cyc_len
+      # dplyr::count(cycle_length, ...) groups by cycle_length alone, so it
+      # silently drops any other column (round included) from the input --
+      # cycle_breakdown never actually had a `round` column until this
+      # mutate() added it back; nothing before Results.Rmd's "Lost votes"
+      # section had filtered on it, so the gap went unnoticed.
       cycle_breakdown_list[[t]] <- tibble(round = t, cycle_length = cyc_len_t[in_cycle_t]) |>
-        dplyr::count(cycle_length, name = "n_agents")
+        dplyr::count(cycle_length, name = "n_agents") |>
+        dplyr::mutate(round = t, .before = 1)
     }
 
     # --------------------------------------------------
@@ -1353,6 +1584,9 @@ simulate_liquid_democracy <- function(
     history_flickerness  = history_stability,  # alias -- see snapshot_list's "flickerness" column
     voting_rounds        = voting_rounds,      # which of the T rounds had a trust update (Sec 1.4.1)
     cycle_breakdown      = bind_rows(cycle_breakdown_list),  # tibble: round, cycle_length, n_agents
+    lost_agent_ids       = lost_agent_ids,  # list (length T): integer vector of agent ids with a
+                                             # lost (NA) vote at that round -- see cycle_breakdown_list
+                                             # init above for why this is separate from cycle_breakdown
     snapshots            = bind_rows(snapshot_list),
     delegation_graphs    = delegation_graphs,
     final_graph          = delegation_graphs[[T]],
