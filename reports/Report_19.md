@@ -8,15 +8,15 @@ Opinions are drawn once at initialisation from group-specific normal
 distributions,
 
 $$o_i \sim \begin{cases}
-  \mathcal{N}(0.5-\delta/2,\ \sigma^2) & g_i = \text{minority} \quad (20\%) \\
-  \mathcal{N}(0.5+\delta/2,\ \sigma^2) & g_i = \text{majority} \quad (80\%)
-\end{cases}, \qquad \sigma = OP\_SIGMA = 0.1,$$
+  \mathcal{N}(0.5-\delta/2,\ \sigma^2) & g_i = \text{minority} \quad (20\\%) \\
+  \mathcal{N}(0.5+\delta/2,\ \sigma^2) & g_i = \text{majority} \quad (80\\%)
+\end{cases}, \qquad \sigma = OP\\_SIGMA = 0.1,$$
 
 with $\delta=0$ under `random` (both groups share
-$\mathcal{N}(0.5,\sigma^2)$), $\delta\in\{0.2,0.4\}$ under `polarised`,
-and $\delta=0.4$ under `homophily` (same draw as `polarised`, then
-reshuffled onto the network – see the *Implementation Note: Homophily*
-section below).
+$\mathcal{N}(0.5,\sigma^2)$), $\delta\in\\{0.2,0.4\\}$ under
+`polarised`, and $\delta=0.4$ under `homophily` (same draw as
+`polarised`, then reshuffled onto the network – see the *Implementation
+Note: Homophily* section below).
 
 ![](Report_19_files/figure-gfm/opinion-dist-plot-1.png)<!-- -->
 
@@ -108,7 +108,7 @@ $$E = \sum_{(i,j)\in E(G)} |o_i - o_j|$$
     $$E_{\text{after}} = \sum_{k\in \text{nbr}(i)}|o_j-o_k| + \sum_{k\in \text{nbr}(j)}|o_i-o_k|$$
     $$\Delta E = E_{\text{after}} - E_{\text{before}}$$
 3.  Accept the swap if $\Delta E<0$; otherwise accept with probability
-    $$P(\text{accept}) = \exp(-\Delta E \cdot t), \qquad t = \texttt{homophily\_t} = 5.$$
+    $$P(\text{accept}) = \exp(-\Delta E \cdot t), \qquad t = \texttt{homophily\\_t} = 5.$$
 4.  Every 100 steps, check the **network opinion correlation** $r$ and
     stop once $r \ge r^\star$, $r^\star=$ 0.8. $r$ is the Pearson
     correlation between the opinions sitting at either end of an edge,
@@ -145,7 +145,7 @@ share; $1$ = proportional representation.
 
 **2b. Relative Representation, resolved-population denominator.**
 $$RR_m^{\text{resolved}} = \frac{\big(\sum_{i\in M} p_i \,/\, \sum_{i\in N} p_i\big)}{m_{\text{resolved}}},
-\qquad m_{\text{resolved}} = \frac{\#\{i\in M : \text{root}(i) \text{ defined}\}}{\#\{i\in N : \text{root}(i) \text{ defined}\}}$$
+\qquad m_{\text{resolved}} = \frac{\\#\\{i\in M : \text{root}(i) \text{ defined}\\}}{\\#\\{i\in N : \text{root}(i) \text{ defined}\\}}$$
 Same power-share numerator as $RR_m$, but divided by the minority’s
 share of the *resolved* population (agents whose delegation chain
 reaches a root, i.e. not stuck in a cycle) instead of its total
@@ -158,26 +158,26 @@ $RR_{Maj}^{\text{resolved}}$ is the majority counterpart, analogous to
 $RR_{Maj}$.
 
 **3. Power Capture.**
-$$PC_m = \frac{\#\{i\in M : \text{root}(i)\in N\setminus M\}}{\#\{i\in M : \text{root}(i) \text{ defined}\}},
+$$PC_m = \frac{\\#\\{i\in M : \text{root}(i)\in N\setminus M\\}}{\\#\\{i\in M : \text{root}(i) \text{ defined}\\}},
 \qquad PC_{Maj} \text{ analogous with } M \leftrightarrow N\setminus M$$
 Fraction of one group’s agents whose delegation chain terminates at a
 representative from the other group.
 
 **4. Cross-group delegation, both directions.**
-$$CDR_{M\to Maj} = \frac{\#\{(i,j)\in E : i\in M,\, j\notin M\}}{\#\{(i,j)\in E: i \in M\}},
+$$CDR_{M\to Maj} = \frac{\\#\\{(i,j)\in E : i\in M,\, j\notin M\\}}{\\#\\{(i,j)\in E: i \in M\\}},
 \qquad
-CDR_{Maj\to M} = \frac{\#\{(i,j)\in E : i\notin M,\, j\in M\}}{\#\{(i,j)\in E: i \notin M\}}$$
+CDR_{Maj\to M} = \frac{\\#\\{(i,j)\in E : i\notin M,\, j\in M\\}}{\\#\\{(i,j)\in E: i \notin M\\}}$$
 Share of each group’s own outgoing delegation edges that cross into the
 other group.
 
 **5. Group-specific rates.**
-$$\text{DelRate}_G = \frac{\#\{i\in G : \text{delegated}(i)\}}{|G|}$$
-Delegation rate within group $G$ ($G\in\{N, M, N\setminus M\}$);
+$$\text{DelRate}_G = \frac{\\#\\{i\in G : \text{delegated}(i)\\}}{|G|}$$
+Delegation rate within group $G$ ($G\in\\{N, M, N\setminus M\\}$);
 lost-vote rate, chain length and ideological drift use the same
 all/minority/majority split, restricted to each group’s own agents.
 
 **6. Representatives per group.**
-$$n_G = \#\{i\in G : \text{root}(i)=i\}$$ Headcount of group $G$’s
+$$n_G = \\#\\{i\in G : \text{root}(i)=i\\}$$ Headcount of group $G$’s
 direct voters (roots), regardless of how many others delegate to them.
 
 ## 1.2 Experimental Design
@@ -185,9 +185,9 @@ direct voters (roots), regardless of how many others delegate to them.
 | Factor | Values |
 |----|----|
 | Condition | `random`, `polarised`, `homophily` |
-| Polarisation $\delta$ | $\{0.2, 0.4\}$ under `polarised`; fixed at 0.4 under `homophily` |
-| Ingroup preference $r_{ingroup}$ | $\{0, 1, 2, 4, 8\}$ |
-| Background responsiveness $r_{op}=r_{pw}=r_{trust}$ | $\{$ 1, 4, 8 $\}$ |
+| Polarisation $\delta$ | $\\{0.2, 0.4\\}$ under `polarised`; fixed at 0.4 under `homophily` |
+| Ingroup preference $r_{ingroup}$ | $\\{0, 1, 2, 4, 8\\}$ |
+| Background responsiveness $r_{op}=r_{pw}=r_{trust}$ | $\\{$ 1, 4, 8 $\\}$ |
 
 `random`: $\mathcal{N}(0.5,0.1^2)$ for both groups. `polarised`:
 $\mathcal{N}(0.5\mp\delta/2,0.1^2)$. `homophily`: `polarised` at

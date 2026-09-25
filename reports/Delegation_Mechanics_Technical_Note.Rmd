@@ -660,7 +660,7 @@ ggplot(df_edge, aes(m, P_self)) +
 ```{r edge-case-table}
 tibble(m = c(0, 1, 1.5, 2, 2.5, 3)) |>
   mutate(P_self = p_self_mobius(m, 0.5)) |>
-  kable(digits = 4, caption = "P_self(m, c=0.5): note the sign flip past m=2")
+  kable(digits = 4, caption = "`P_self`(m, c=0.5): note the sign flip past m=2")
 ```
 
 Negative $P_{\text{self}}$ is not a crash -- `runif(1) < P_self` is simply

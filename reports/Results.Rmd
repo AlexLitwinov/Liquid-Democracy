@@ -1,0 +1,701 @@
+---
+title: "Results -- Effect of Responsiveness on Liquid Democracy Outcomes (RQ1-3)"
+output: github_document
+date: "2026-09-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 13, fig.height = 8)
+library(tidyverse)
+library(here)
+library(knitr)
+library(furrr)
+library(digest)
+
+theme_set(theme_minimal(base_size = 12))
+source(here::here("scripts/Network.R"))
+dir.create(here::here("reports/Results_files/figure-gfm"), recursive = TRUE, showWarnings = FALSE)
+dir.create(here::here("data"), showWarnings = FALSE)
+
+N_WORKERS <- max(1L, parallel::detectCores() - 1)
+
+run_cached <- function(cache_name, fn, hash_obj) {
+  hash       <- digest::digest(hash_obj)
+  cache_file <- here::here(paste0("data/", cache_name, "_cache.rds"))
+  if (file.exists(cache_file)) {
+    cc <- readRDS(cache_file)
+    if (identical(cc$hash, hash)) return(cc$data)
+  }
+  out <- fn()
+  saveRDS(list(hash = hash, data = out), cache_file)
+  out
+}
+
+# All plots below are saved as PNG + PDF into reports/Results_files/RQ1|RQ2|RQ3/,
+# so every plot lives under exactly one RQ folder -- including the "extreme
+# behaviour" plots (Sec. "Extreme behaviour" below), which are split into one
+# per RQ's own metric subset for this reason (Report_22/RQ1.Rmd had this as a
+# single combined plot across all metrics; split here purely for folder
+# consistency, same underlying data/grid).
+RESULTS_DIR <- here::here("reports", "Results_files")
+for (rq in c("RQ1", "RQ2", "RQ3", "LostVotes")) dir.create(file.path(RESULTS_DIR, rq), recursive = TRUE, showWarnings = FALSE)
+
+save_plot <- function(p, rq, name, width = 13, height = 8) {
+  base <- file.path(RESULTS_DIR, rq, name)
+  ggsave(paste0(base, ".png"), p, width = width, height = height, dpi = 150, bg = "white")
+  ggsave(paste0(base, ".pdf"), p, width = width, height = height)
+  p
+}
+
+# RQ1: delegation behaviour. RQ2: quality of representation (ideological
+# drift). RQ3: concentration of voting power. All three are answered off the
+# SAME simulation grid (see "Shared design" below) -- one run per (pair,
+# fixed-level, seed) cell produces every metric needed for all three RQs at
+# once, so the sweep only has to run once.
+metrics_rq1 <- c("delegation_rate", "lost_vote_rate", "flickerness", "chain_length")
+metrics_rq2 <- c("avg_drift")
+metrics_rq3 <- c("top5_power_share", "share_50pct")
+metrics_all_rqs <- c(metrics_rq1, metrics_rq2, metrics_rq3)
+
+metric_labels <- c(
+  delegation_rate  = "Delegation rate",
+  lost_vote_rate   = "Lost-vote rate",
+  flickerness      = "Delegation stability",
+  chain_length     = "Avg. delegation-chain length",
+  avg_drift        = "Avg. ideological drift",
+  top5_power_share = "Top-5% voting-power share",
+  share_50pct      = "Agents needed for 50% of power"
+)
+```
+
+## Fixed inputs
+
+```{r rq-fixed-inputs}
+# ══════════════════════════════════════════════════════════════════════
+# KEEP IN SYNC WITH REPORT_22 -- these are Report_22's Sec. 6 final
+# calibrated values, redefined here rather than sourced from that Rmd
+# (more robust to Report_22 changing independently). Update whenever
+# Report_22's K/T/r choices change.
+#
+# N = 1000 (not 500): RQ1.Rmd's previous "paired sweep" used
+# n_per_community = 500L, inconsistent with its OWN "extreme behaviour"
+# sweep (N=1000) and with Report_22's own small-world corridor requirement
+# N > 10*K (Report_22 Sec. 6) -- at K=60 that requires N > 600, which 500
+# violates. N=1000 (the value used everywhere else in Report_22/Report_23)
+# is used consistently for both sweeps here.
+# ══════════════════════════════════════════════════════════════════════
+CHOSEN_N          <- 1000L
+CHOSEN_K          <- 60L
+CHOSEN_VOTING_RDS <- 40L   # n_v
+CHOSEN_T          <- 80L   # T = n_v * dt = 40 * 2
+CHOSEN_C          <- 0.5
+
+lambda_from_forget_rate <- function(forget_pct, h = 5) 1 - (1 - forget_pct / 100)^(1 / h)
+LAMBDA_TR         <- lambda_from_forget_rate(50, h = 5)   # 50% of trust signal forgotten over 5 voting rounds
+
+# r_op/r_pw/r_tr needed to reach a given % of each dimension's own
+# saturated effect -- Report_22 Sec. 6/4.2, R_SAT_ANCHOR_FINAL read-off.
+# Linearly interpolated for any pct in between via pct_to_r_lookup() below.
+R_PCT_LOOKUP <- tribble(
+  ~pct, ~r_op,     ~r_pw, ~r_tr,
+  0,       0.00,     0.00,   0.00,
+  10,     13.17,     0.05,   2.09,
+  20,     28.85,     0.10,   3.99,
+  30,     48.58,     0.15,   6.79,
+  40,     72.89,     0.20,   9.76,
+  50,    109.53,     0.32,  12.86,
+  60,    166.16,     0.51,  15.97,
+  70,    243.11,     1.07,  22.97,
+  80,    429.31,     3.04,  30.01,
+  90,    910.23,     6.59,  48.68,
+  100, 16384.00,    64.00, 128.00
+)
+
+pct_to_r_lookup <- function(dim_name, pct) {
+  col <- switch(dim_name, op = "r_op", pw = "r_pw", tr = "r_tr", stop("unknown dim: ", dim_name))
+  approx(R_PCT_LOOKUP$pct, R_PCT_LOOKUP[[col]], xout = pct, rule = 2)$y
+}
+```
+
+**N = `r CHOSEN_N`, K = `r CHOSEN_K`, T = `r CHOSEN_T`
+(`r CHOSEN_VOTING_RDS` voting rounds, Δt = `r CHOSEN_T / CHOSEN_VOTING_RDS`),
+c = `r CHOSEN_C`, forget rate = 50% over 5 voting rounds.**
+
+**50 seeds per cell** (raised from an initial 1-seed structural-validation
+pass once the plots/folders checked out).
+
+```{r rq-pct-table}
+kable(R_PCT_LOOKUP, caption = "r needed to reach a given % of each dimension's own saturated effect (`Report_22` Sec. 6) -- everything below is expressed in these percentages, not raw r")
+```
+
+## Extreme behaviour: single-dial vs. isolated dimensions, 0-100%
+
+Before the paired sweep below, a wider look across the full 0-100% range
+of each dimension's own saturated effect (`Report_22`'s calibration) --
+fixed at N=`r CHOSEN_N`, K=`r CHOSEN_K` -- showing every metric used in
+RQ1-3 below, to see where each one saturates rather than assuming the range
+used in the paired sweep already captures the full picture. Four
+scenarios: **all** ($r_{op},r_{pw},r_{tr}$ all at the same %, each
+translated via `R_PCT_LOOKUP`) and each dimension **isolated** in turn (one
+dimension at that %, the other two at 0) -- so the joint effect and each
+mechanism's own isolated effect are visible side by side. Split into one
+plot per RQ below (same grid/data as a single combined plot would use) so
+every plot in this report saves into exactly one RQ folder.
+
+```{r rq-extreme-config}
+PCT_VALS_EXTREME <- seq(0, 100, by = 10)
+N_SEEDS_EXTREME  <- 50L
+
+scenarios_extreme <- tribble(
+  ~scenario,     ~use_op, ~use_pw, ~use_tr,
+  "all (r=r=r)", TRUE,    TRUE,    TRUE,
+  "op only",     TRUE,    FALSE,   FALSE,
+  "pw only",     FALSE,   TRUE,    FALSE,
+  "trust only",  FALSE,   FALSE,   TRUE
+)
+
+```{r rq-extreme-run}
+run_extreme_cell <- function(seed, pct, scenario, use_op, use_pw, use_tr) {
+  r_op <- if (use_op) pct_to_r_lookup("op", pct) else 0
+  r_pw <- if (use_pw) pct_to_r_lookup("pw", pct) else 0
+  r_tr <- if (use_tr) pct_to_r_lookup("tr", pct) else 0
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = CHOSEN_N, n_communities = 1, node_degree = CHOSEN_K, T = CHOSEN_T,
+    n_voting_rounds = CHOSEN_VOTING_RDS,
+    r_op = r_op, r_pw = r_pw, gamma = r_tr, lambda = LAMBDA_TR, k1 = 1, k2 = 1,
+    self_reliance_c = CHOSEN_C, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05
+  )
+  last5 <- max(1L, CHOSEN_T - 4L):CHOSEN_T
+  snaps <- res$snapshots |> dplyr::filter(round >= max(1L, CHOSEN_T - 4L))
+  delegation_rate <- mean(res$history_delegation[last5], na.rm = TRUE)
+  tibble(
+    seed = seed, pct = pct, scenario = scenario,
+    delegation_rate  = delegation_rate,
+    lost_vote_rate   = mean(res$history_lost[last5], na.rm = TRUE),
+    chain_length     = mean(snaps$avg_chain_length_delegators, na.rm = TRUE),
+    flickerness      = mean(res$history_flickerness[last5], na.rm = TRUE),
+    avg_drift        = mean(snaps$avg_drift, na.rm = TRUE),
+    top5_power_share = mean(snaps$top5_power_share, na.rm = TRUE),
+    share_50pct      = mean(snaps$share_50pct, na.rm = TRUE)
+  )
+}
+
+grid_extreme <- tidyr::crossing(scenarios_extreme, pct = PCT_VALS_EXTREME, seed = seq_len(N_SEEDS_EXTREME))
+
+extreme_raw <- run_cached("results_rq_extreme_raw", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_extreme, run_extreme_cell, .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(CHOSEN_N, CHOSEN_K, CHOSEN_T, CHOSEN_VOTING_RDS, CHOSEN_C, N_SEEDS_EXTREME, PCT_VALS_EXTREME,
+        scenarios_extreme, LAMBDA_TR, R_PCT_LOOKUP, v = 1))
+
+extreme_summary <- extreme_raw |>
+  pivot_longer(all_of(metrics_all_rqs), names_to = "metric", values_to = "value") |>
+  group_by(scenario, pct, metric) |>
+  summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop") |>
+  mutate(metric   = factor(metric_labels[metric], levels = unname(metric_labels)),
+         scenario = factor(scenario, levels = scenarios_extreme$scenario))
+
+plot_extreme <- function(metrics_subset) {
+  extreme_summary |>
+    filter(metric %in% metric_labels[metrics_subset]) |>
+    ggplot(aes(pct, mean_val, colour = scenario, group = scenario)) +
+    geom_line(linewidth = 0.8) + geom_point(size = 1.5) +
+    scale_x_continuous(breaks = PCT_VALS_EXTREME) +
+    scale_colour_viridis_d(name = "responsiveness scenario", end = 0.85) +
+    facet_wrap(~metric, scales = "free_y", ncol = 2) +
+    labs(title = sprintf("Extreme behaviour -- N=%d, K=%d, all vs. isolated dimensions", CHOSEN_N, CHOSEN_K),
+         subtitle = sprintf("%d seed(s) per cell; x = %% of each dimension's own saturated effect (R_PCT_LOOKUP)", N_SEEDS_EXTREME),
+         x = "% of own saturated effect", y = NULL) +
+    theme(legend.position = "top")
+}
+```
+
+---
+
+## Shared design: paired sweep, third dimension held fixed
+
+Same sweep grid for all three RQs. For each pair of responsiveness
+dimensions, both are varied *together* in **percentage** terms (same shared
+% of each dimension's own saturated effect, translated to that dimension's
+own r via `R_PCT_LOOKUP` -- op/pw/tr saturate at wildly different raw r, so
+a shared raw value no longer means the same thing across dimensions) across
+$\{10,20,...,100\}\%$, while the third dimension is held fixed at one of 3
+percentage levels ($0\%, 50\%, 100\%$) -- shown as 3 coloured lines in the
+same plot. Repeating this for each of the 3 possible pairs gives 3 plots per
+RQ (as many metrics as that RQ needs, faceted), covering all three
+responsiveness dimensions:
+
+- $r_{op}, r_{pw}$ varied together $\in \{10,...,100\}\%$, $r_{tr} \in \{0,50,100\}\%$ (fixed)
+- $r_{op}, r_{tr}$ varied together $\in \{10,...,100\}\%$, $r_{pw} \in \{0,50,100\}\%$ (fixed)
+- $r_{pw}, r_{tr}$ varied together $\in \{10,...,100\}\%$, $r_{op} \in \{0,50,100\}\%$ (fixed)
+
+```{r rq-config}
+N_SEEDS_PAIR <- 50L
+
+PCT_VALS_PAIR    <- seq(10, 100, by = 10)  # % for the two paired (jointly varied) dimensions
+PCT_FIXED_LEVELS <- c(0, 25, 50, 75, 100)  # % for the third, held-fixed dimension
+```
+
+---
+
+# Simulation grid (answers RQ1, RQ2 and RQ3 at once)
+
+```{r rq-pair-run}
+build_pair_grid <- function(pair_label, dim_v1, dim_v2, dim_fixed) {
+  df <- tidyr::crossing(pct_v = PCT_VALS_PAIR, pct_f = PCT_FIXED_LEVELS, seed = seq_len(N_SEEDS_PAIR))
+  df$pair_label <- pair_label
+  df[[paste0("r_", dim_v1)]]    <- pct_to_r_lookup(dim_v1, df$pct_v)
+  df[[paste0("r_", dim_v2)]]    <- pct_to_r_lookup(dim_v2, df$pct_v)
+  df[[paste0("r_", dim_fixed)]] <- pct_to_r_lookup(dim_fixed, df$pct_f)
+  df
+}
+
+grid_pair <- bind_rows(
+  build_pair_grid("r_op x r_pw (r_tr fixed)", "op", "pw", "tr"),
+  build_pair_grid("r_op x r_tr (r_pw fixed)", "op", "tr", "pw"),
+  build_pair_grid("r_pw x r_tr (r_op fixed)", "pw", "tr", "op")
+)
+
+run_pair_cell <- function(seed, pair_label, pct_v, pct_f, r_op, r_pw, r_tr) {
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = CHOSEN_N, n_communities = 1, node_degree = CHOSEN_K, T = CHOSEN_T,
+    n_voting_rounds = CHOSEN_VOTING_RDS,
+    r_op = r_op, r_pw = r_pw, gamma = r_tr, lambda = LAMBDA_TR, k1 = 1, k2 = 1,
+    self_reliance_c = CHOSEN_C, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05
+  )
+  last5 <- max(1L, CHOSEN_T - 4L):CHOSEN_T
+  snaps <- res$snapshots |> dplyr::filter(round >= max(1L, CHOSEN_T - 4L))
+  delegation_rate <- mean(res$history_delegation[last5], na.rm = TRUE)
+  tibble(
+    seed = seed, pair_label = pair_label, pct_v = pct_v, pct_f = pct_f,
+    r_op = r_op, r_pw = r_pw, r_tr = r_tr,
+    # RQ1
+    delegation_rate  = delegation_rate,
+    lost_vote_rate   = mean(res$history_lost[last5], na.rm = TRUE),
+    chain_length     = mean(snaps$avg_chain_length_delegators, na.rm = TRUE),
+    flickerness      = mean(res$history_flickerness[last5], na.rm = TRUE),
+    # RQ2
+    avg_drift        = mean(snaps$avg_drift, na.rm = TRUE),
+    # RQ3
+    top5_power_share = mean(snaps$top5_power_share, na.rm = TRUE),
+    share_50pct      = mean(snaps$share_50pct, na.rm = TRUE)
+  )
+}
+
+pair_raw <- run_cached("results_rq123_pair_raw", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_pair, run_pair_cell, .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(CHOSEN_N, CHOSEN_K, CHOSEN_T, CHOSEN_VOTING_RDS, CHOSEN_C, N_SEEDS_PAIR, PCT_VALS_PAIR, PCT_FIXED_LEVELS, LAMBDA_TR, R_PCT_LOOKUP, v = 1))
+
+pair_summary <- pair_raw |>
+  pivot_longer(all_of(metrics_all_rqs), names_to = "metric", values_to = "value") |>
+  group_by(pair_label, pct_v, pct_f, metric) |>
+  summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop") |>
+  mutate(metric = factor(metric_labels[metric], levels = unname(metric_labels)))
+
+# metrics_subset selects which metrics (as their metric_labels) go into this
+# particular plot -- each RQ section below passes its own subset, in the
+# same order as metrics_rq1/rq2/rq3 above (consistent facet order everywhere).
+plot_pair <- function(label, metrics_subset) {
+  pair_summary |>
+    filter(pair_label == label, metric %in% metric_labels[metrics_subset]) |>
+    ggplot(aes(pct_v, mean_val, colour = factor(pct_f, levels = PCT_FIXED_LEVELS))) +
+    geom_line(linewidth = 0.8) + geom_point(size = 2) +
+    scale_x_continuous(breaks = PCT_VALS_PAIR) +
+    scale_colour_viridis_d(name = "fixed level", end = 0.85, labels = function(x) sprintf("%s%%", x)) +
+    facet_wrap(~metric, scales = "free_y", ncol = 2) +
+    labs(title = sprintf("Paired sweep -- %s", label),
+         subtitle = sprintf("%d seed(s) per cell; values are %% of each dimension's own saturated effect (R_PCT_LOOKUP), not raw r", N_SEEDS_PAIR),
+         x = "shared % of own saturated effect", y = NULL) +
+    theme(legend.position = "top")
+}
+```
+
+---
+
+# RQ1: delegation behaviour
+
+Metrics: delegation rate, lost-vote rate, delegation stability (share of
+agents keeping the same delegation target as the previous round --
+`history_flickerness` from `simulate_liquid_democracy()`, NA on round 1; see
+`Network.R`'s `history_stability[t]` computation for the exact per-round
+definition), and average delegation-chain length.
+
+```{r rq1-extreme-plot, fig.height=10}
+p <- plot_extreme(metrics_rq1)
+save_plot(p, "RQ1", "extreme", height = 10)
+p
+```
+
+```{r rq1-pair-plot-1, fig.height=14}
+p <- plot_pair("r_op x r_pw (r_tr fixed)", metrics_rq1)
+save_plot(p, "RQ1", "paired_op_pw", height = 14)
+p
+```
+
+```{r rq1-pair-plot-2, fig.height=14}
+p <- plot_pair("r_op x r_tr (r_pw fixed)", metrics_rq1)
+save_plot(p, "RQ1", "paired_op_tr", height = 14)
+p
+```
+
+```{r rq1-pair-plot-3, fig.height=14}
+p <- plot_pair("r_pw x r_tr (r_op fixed)", metrics_rq1)
+save_plot(p, "RQ1", "paired_pw_tr", height = 14)
+p
+```
+
+## Chain-length distribution across seeds
+
+The paired-sweep plots above show only the mean across `r N_SEEDS_PAIR`
+seeds per grid cell -- the violin plots below show the full per-seed
+distribution of chain length at each grid point, so spread/skew/outliers the
+mean alone hides are visible.
+
+```{r rq1-violin-fn}
+plot_violin_chain <- function(label) {
+  pair_raw |>
+    filter(pair_label == label) |>
+    ggplot(aes(x = factor(pct_v, levels = PCT_VALS_PAIR), y = chain_length,
+               fill = factor(pct_f, levels = PCT_FIXED_LEVELS))) +
+    geom_violin(position = position_dodge(0.8), alpha = 0.8, colour = NA, scale = "width") +
+    scale_fill_viridis_d(name = "fixed level", end = 0.85, labels = function(x) sprintf("%s%%", x)) +
+    labs(title = sprintf("Chain-length distribution across %d seeds -- %s", N_SEEDS_PAIR, label),
+         subtitle = "One violin per grid cell (pct_v x pct_f)",
+         x = "shared % of own saturated effect", y = "Avg. delegation-chain length") +
+    theme(legend.position = "top")
+}
+```
+
+```{r rq1-violin-plot-1, fig.height=8}
+p <- plot_violin_chain("r_op x r_pw (r_tr fixed)")
+save_plot(p, "RQ1", "violin_chain_length_op_pw", height = 8)
+p
+```
+
+```{r rq1-violin-plot-2, fig.height=8}
+p <- plot_violin_chain("r_op x r_tr (r_pw fixed)")
+save_plot(p, "RQ1", "violin_chain_length_op_tr", height = 8)
+p
+```
+
+```{r rq1-violin-plot-3, fig.height=8}
+p <- plot_violin_chain("r_pw x r_tr (r_op fixed)")
+save_plot(p, "RQ1", "violin_chain_length_pw_tr", height = 8)
+p
+```
+
+## Distribution summary -- all RQ1 metrics
+
+Min/max and quartiles alongside the mean, across every individual
+(pair, pct_v, pct_f, seed) run in the paired sweep -- not just the
+grid-cell averages the plots above show, so the extreme cases seen anywhere
+across the whole RQ1 sweep are visible in one place.
+
+```{r rq1-dist-table}
+rq1_dist_table <- pair_raw |>
+  select(all_of(metrics_rq1)) |>
+  pivot_longer(everything(), names_to = "metric", values_to = "value") |>
+  group_by(metric) |>
+  summarise(
+    Min    = min(value, na.rm = TRUE),
+    Q1     = quantile(value, 0.25, na.rm = TRUE),
+    Median = median(value, na.rm = TRUE),
+    Mean   = mean(value, na.rm = TRUE),
+    Q3     = quantile(value, 0.75, na.rm = TRUE),
+    Max    = max(value, na.rm = TRUE),
+    SD     = sd(value, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(metric = factor(metric_labels[metric], levels = unname(metric_labels[metrics_rq1]))) |>
+  arrange(metric) |>
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+
+kable(rq1_dist_table,
+      caption = sprintf("RQ1 distribution summary across the full paired sweep (all pct_v x pct_f x pair combinations, %d seeds each)", N_SEEDS_PAIR))
+```
+
+## Answering RQ1
+
+*(Fill in once the plots above reflect the real simulation run -- this is
+a scaffold, not a pre-written conclusion.)*
+
+- **Ideological responsiveness ($r_{op}$):** ...
+- **Competence/power responsiveness ($r_{pw}$):** ...
+- **Trust responsiveness ($r_{tr}$):** ...
+- **Interactions between dimensions:** ...
+- **Overall answer to RQ1:** ...
+
+---
+
+# RQ2: quality of political representation
+
+Metric: average ideological drift (`avg_drift`) -- the mean distance between
+an agent's own opinion and the opinion of the agent who ultimately casts a
+vote on its behalf.
+
+Expected: $r_{op}$ reduces drift (dissimilar neighbours become less
+attractive delegates); $r_{pw}$ increases drift (powerful delegates stay
+attractive even when ideologically distant); $r_{tr}$ reduces drift, same
+mechanism as $r_{op}$. Because attractiveness is multiplicative, the joint
+$r_{op} \times r_{pw}$ effect is expected to favour the opinion term (net
+drift reduction), not a simple additive combination of the two individual
+effects.
+
+```{r rq2-extreme-plot, fig.height=6}
+p <- plot_extreme(metrics_rq2)
+save_plot(p, "RQ2", "extreme", height = 6)
+p
+```
+
+```{r rq2-pair-plot-1, fig.height=6}
+p <- plot_pair("r_op x r_pw (r_tr fixed)", metrics_rq2)
+save_plot(p, "RQ2", "paired_op_pw", height = 6)
+p
+```
+
+```{r rq2-pair-plot-2, fig.height=6}
+p <- plot_pair("r_op x r_tr (r_pw fixed)", metrics_rq2)
+save_plot(p, "RQ2", "paired_op_tr", height = 6)
+p
+```
+
+```{r rq2-pair-plot-3, fig.height=6}
+p <- plot_pair("r_pw x r_tr (r_op fixed)", metrics_rq2)
+save_plot(p, "RQ2", "paired_pw_tr", height = 6)
+p
+```
+
+## Answering RQ2
+
+*(Fill in once the plots above reflect the real simulation run -- this is
+a scaffold, not a pre-written conclusion.)*
+
+- **Ideological responsiveness ($r_{op}$):** ...
+- **Competence/power responsiveness ($r_{pw}$):** ...
+- **Trust responsiveness ($r_{tr}$):** ...
+- **Joint $r_{op} \times r_{pw}$ effect (opinion term expected to dominate):** ...
+- **Overall answer to RQ2:** ...
+
+---
+
+# RQ3: concentration of voting power
+
+Metrics: voting-power share held by the top 5% of agents (`top5_power_share`)
+and the fraction of agents needed to collectively hold 50% of total voting
+power (`share_50pct`).
+
+Expected: $r_{op}$ lowers concentration (more agents vote directly);
+$r_{pw}$ raises concentration (rich-get-richer -- already-powerful agents
+become more attractive delegates). For the joint $r_{op} \times r_{pw}$
+effect: as in RQ2, low opinion-based attractiveness is expected to constrain
+how much high voting power can raise a neighbour's overall attractiveness --
+so increasing both together should yield *lower* concentration than high
+$r_{pw}$ alone.
+
+```{r rq3-extreme-plot, fig.height=8}
+p <- plot_extreme(metrics_rq3)
+save_plot(p, "RQ3", "extreme", height = 8)
+p
+```
+
+```{r rq3-pair-plot-1, fig.height=8}
+p <- plot_pair("r_op x r_pw (r_tr fixed)", metrics_rq3)
+save_plot(p, "RQ3", "paired_op_pw", height = 8)
+p
+```
+
+```{r rq3-pair-plot-2, fig.height=8}
+p <- plot_pair("r_op x r_tr (r_pw fixed)", metrics_rq3)
+save_plot(p, "RQ3", "paired_op_tr", height = 8)
+p
+```
+
+```{r rq3-pair-plot-3, fig.height=8}
+p <- plot_pair("r_pw x r_tr (r_op fixed)", metrics_rq3)
+save_plot(p, "RQ3", "paired_pw_tr", height = 8)
+p
+```
+
+## Answering RQ3
+
+*(Fill in once the plots above reflect the real simulation run -- this is
+a scaffold, not a pre-written conclusion.)*
+
+- **Ideological responsiveness ($r_{op}$):** ...
+- **Competence/power responsiveness ($r_{pw}$):** ...
+- **Joint $r_{op} \times r_{pw}$ effect (opinion term expected to constrain concentration):** ...
+- **Overall answer to RQ3:** ...
+
+---
+
+# Lost votes: cycle mechanics
+
+A closer look at *how* votes actually get lost -- not just the lost-vote
+*rate* (RQ1 above), but the underlying cycle mechanism: how many agents are
+caught in a cycle at any given moment, what size those cycles are, and how
+quickly an individual agent escapes one once caught. Uses
+`Network.R`'s `lost_agent_ids` (per-round, which specific agent ids have a
+lost/NA vote -- added for this section; `cycle_breakdown`, used elsewhere,
+only has per-round *counts* by cycle length, not agent identity, so it can't
+answer "is agent i still lost next round").
+
+Run at the fully calibrated model (r_op=r_pw=r_tr=100% of each one's own
+saturated effect, r_ig=0 -- no group dimension here), N/K/T as in "Fixed
+inputs" above, over a steady-state window (last 30 of `r CHOSEN_T` rounds),
+20 seeds.
+
+```{r lost-votes-config}
+N_SEEDS_LOST <- 20L
+LOST_WINDOW  <- (CHOSEN_T - 29):CHOSEN_T        # last 30 rounds, steady state
+```
+
+```{r lost-votes-fn}
+run_lost_votes_cell <- function(seed) {
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = CHOSEN_N, n_communities = 1, node_degree = CHOSEN_K, T = CHOSEN_T,
+    n_voting_rounds = CHOSEN_VOTING_RDS,
+    r_op = pct_to_r_lookup("op", 100), r_pw = pct_to_r_lookup("pw", 100), gamma = pct_to_r_lookup("tr", 100),
+    lambda = LAMBDA_TR, k1 = 1, k2 = 1, self_reliance_c = CHOSEN_C, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05
+  )
+
+  # A. Cycle-size distribution: raw (round, cycle_length, n_agents) rows,
+  # tagged with seed -- aggregated across ALL seeds afterwards by summing
+  # n_agents per cycle_length and dividing by a FIXED denominator
+  # (N_SEEDS_LOST * length(LOST_WINDOW)), rather than averaging per seed
+  # here. That avoids relying on every seed having at least one cycle: a
+  # seed/round with zero cycles anywhere just contributes no rows at all
+  # (cycle_breakdown can even be completely empty, 0 rows/0 columns, for a
+  # seed where no cycle ever formed in the whole run -- e.g. plausible at
+  # the fully-saturated r=100% used here) -- the fixed denominator still
+  # accounts for it correctly instead of silently excluding it from the mean.
+  size_dist <- if (nrow(res$cycle_breakdown) > 0) {
+    res$cycle_breakdown |>
+      dplyr::filter(round %in% LOST_WINDOW) |>
+      dplyr::mutate(seed = seed)
+  } else {
+    tibble(round = integer(0), cycle_length = integer(0), n_agents = integer(0), seed = integer(0))
+  }
+
+  n_lost_per_round <- tibble(
+    seed = seed, round = LOST_WINDOW,
+    n_lost = lengths(res$lost_agent_ids[LOST_WINDOW])
+  )
+
+  # B. One-step recovery: for every consecutive round pair (t, t+1) in the
+  # window, of the agents lost AT t, what fraction are NOT lost at t+1 --
+  # i.e. "was this round's lost vote no longer lost next round". Computed
+  # for every t in the window (not just a handful of reference points) for
+  # a more robust estimate; this is a per-cohort rate, not a per-agent
+  # trajectory -- no tracking of any individual agent beyond one round.
+  recovery <- purrr::map_dfr(LOST_WINDOW[-length(LOST_WINDOW)], function(t) {
+    base   <- res$lost_agent_ids[[t]]
+    n_base <- length(base)
+    if (n_base == 0) return(tibble(seed = seed, round = t, n_base = 0L, frac_recovered = NA_real_))
+    tibble(seed = seed, round = t, n_base = n_base,
+           frac_recovered = mean(!(base %in% res$lost_agent_ids[[t + 1]])))
+  })
+
+  list(size_dist = size_dist, n_lost_per_round = n_lost_per_round, recovery = recovery)
+}
+
+lost_votes_raw <- run_cached("results_lost_votes_raw", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_map(seq_len(N_SEEDS_LOST), run_lost_votes_cell, .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(CHOSEN_N, CHOSEN_K, CHOSEN_T, CHOSEN_VOTING_RDS, CHOSEN_C, N_SEEDS_LOST, LOST_WINDOW,
+        LAMBDA_TR, R_PCT_LOOKUP, v = 3))
+# v = 3: Network.R's cycle_breakdown now actually carries a `round` column
+# (dplyr::count() was silently dropping it, see Network.R fix) -- this is
+# what the earlier run errored on ("match needs vectors" from filtering on
+# a nonexistent `round` column).
+
+size_dist_all        <- purrr::map_dfr(lost_votes_raw, "size_dist")
+n_lost_per_round_all  <- purrr::map_dfr(lost_votes_raw, "n_lost_per_round")
+recovery_all          <- purrr::map_dfr(lost_votes_raw, "recovery")
+```
+
+## How many agents are stuck in a cycle, and how big are the cycles?
+
+```{r lost-votes-size-table}
+n_seed_rounds <- N_SEEDS_LOST * length(LOST_WINDOW)   # fixed denominator, see run_lost_votes_cell() comment
+
+size_dist_summary <- size_dist_all |>
+  group_by(cycle_length) |>
+  summarise(total_agents = sum(n_agents), .groups = "drop") |>
+  arrange(cycle_length) |>
+  mutate(mean_n_agents   = total_agents / n_seed_rounds,
+         mean_pct_of_pop = round(mean_n_agents / CHOSEN_N * 100, 2),
+         mean_n_agents   = round(mean_n_agents, 2)) |>
+  select(cycle_length, mean_n_agents, mean_pct_of_pop)
+
+kable(size_dist_summary,
+      caption = sprintf("Average number of agents (out of N=%d) stuck in a cycle of each size, at a random steady-state round (last 30 of %d rounds, %d seeds)",
+                         CHOSEN_N, CHOSEN_T, N_SEEDS_LOST))
+cat(sprintf("\n**Total: on average %.1f agents (%.2f%% of the population) are lost to a cycle of some size at any given steady-state round.**\n",
+            sum(size_dist_summary$mean_n_agents), sum(size_dist_summary$mean_pct_of_pop)))
+```
+
+```{r lost-votes-timeseries-plot, fig.height=5}
+p <- n_lost_per_round_all |>
+  group_by(round) |>
+  summarise(mean_n_lost = mean(n_lost), .groups = "drop") |>
+  ggplot(aes(round, mean_n_lost)) +
+  geom_line(linewidth = 0.8, colour = "black") + geom_point(size = 1.8, colour = "black") +
+  labs(title = "Agents lost to a cycle per round (steady-state window)",
+       subtitle = sprintf("Mean across %d seeds, r_op=r_pw=r_tr=100%%", N_SEEDS_LOST),
+       x = "Round", y = "N agents lost") +
+  ylim(0, NA)
+save_plot(p, "LostVotes", "n_lost_per_round", height = 5)
+p
+```
+
+## Round-to-round recovery: was a lost vote still lost next round?
+
+For every pair of consecutive rounds in the steady-state window: of the
+agents whose vote was lost at round $t$, what share are *not* lost at round
+$t+1$ (i.e. recovered)?
+
+```{r lost-votes-recovery-plot, fig.height=5}
+recovery_by_round <- recovery_all |>
+  filter(n_base > 0) |>
+  group_by(round) |>
+  summarise(mean_frac_recovered = mean(frac_recovered), n_obs = n(), .groups = "drop")
+
+p <- recovery_by_round |>
+  ggplot(aes(round, mean_frac_recovered)) +
+  geom_line(linewidth = 0.8, colour = "black") + geom_point(size = 1.8, colour = "black") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(title = "Share of a round's lost votes that are not lost the following round",
+       subtitle = sprintf("Mean across %d seeds, r_op=r_pw=r_tr=100%%", N_SEEDS_LOST),
+       x = "Round t", y = "% recovered by round t+1") +
+  theme(legend.position = "top")
+save_plot(p, "LostVotes", "recovery_by_round", height = 5)
+p
+```
+
+```{r lost-votes-recovery-note, results = "asis"}
+recovery_overall <- recovery_all |> filter(n_base > 0) |> summarise(x = mean(frac_recovered)) |> pull(x)
+cat(sprintf(
+  "**On average, %.1f%% of agents whose vote is lost to a cycle in a given round are no longer lost the very next round**, averaged across the steady-state window (last %d rounds) and %d seeds.\n",
+  recovery_overall * 100, length(LOST_WINDOW), N_SEEDS_LOST
+))
+```
+
+## Summary
+
+*(Fill in once the plots/table above reflect the real simulation run.)*
+
+- **Typical cycle size:** ...
+- **Share of the population affected at any moment:** ...
+- **Round-to-round recovery rate:** ...
+- **Implication for the lost-vote rate seen in RQ1:** ...

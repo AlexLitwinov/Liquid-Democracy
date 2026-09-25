@@ -1,0 +1,529 @@
+---
+title: "Statistical Methods — GAMs and Saturation Analysis (RQ1 & RQ2)"
+output:
+  github_document:
+    toc: true
+date: "2026-06-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(tidyverse)
+theme_set(theme_minimal(base_size = 12))
+```
+
+# Overview
+
+The goal of RQ1 is to find, for each responsiveness parameter $r$, the range
+beyond which further increases in $r$ produce negligible changes in the network
+metrics. This is a **saturation** problem: the effect of $r$ is expected to
+grow fast at first and then flatten out.
+
+The analysis has four steps:
+
+1. **GAM** — fit a flexible curve to see the shape without assumptions
+2. **Derivative** — find $r^*$, the point where the slope drops to 5% of its peak
+3. **Emax model** — fit an interpretable saturation curve and extract EC$_{50}$, EC$_{90}$
+4. **Convergence check** — confirm that $r^*$ and EC$_{90}$ agree
+
+---
+
+# 1  GAM — Flexible Curve Fit
+
+## Why a GAM?
+
+We know the simulation produces saturation in principle (all outputs are
+bounded), but we do not know the exact curve shape from the algorithm alone.
+The emergent behaviour depends on network topology, delegation dynamics, and
+feedback — so the shape must be read from the data. A **Generalised Additive
+Model (GAM)** fits the curve flexibly, without assuming it is, say, a straight
+line or a specific S-curve.
+
+## Model
+
+$$\boxed{Y_i \;=\; f(\log_2 r_i) + \varepsilon_i, \qquad
+\varepsilon_i \sim \mathcal{N}(0,\,\sigma^2)}$$
+
+$Y_i$ is the metric value at parameter setting $r_i$ (averaged over seeds).
+$f(\cdot)$ is an unknown smooth function estimated from data.
+
+**Why $\log_2 r$?** The simulation sweeps $r$ over doublings
+$\{1, 2, 4, 8, \ldots, 128\}$. On the log₂-scale these are equally spaced, so
+each step carries the same information. On the original scale they are wildly
+unequal ($r=1$ to $r=2$ is the same absolute gap as $r=64$ to $r=65$, but
+a very different relative change).
+
+## How the smooth is estimated
+
+$f$ is built from $K=6$ piecewise-cubic polynomial pieces joined smoothly at
+interior knots. A **penalty on curvature** prevents overfitting:
+
+$$\text{penalised fit} \;=\; \text{fit to data} \;-\; \lambda \int[f''(x)]^2\,dx$$
+
+The penalty weight $\lambda$ is chosen automatically by **REML** (Restricted
+Maximum Likelihood), which balances fidelity to the data against smoothness.
+The result is characterised by its **effective degrees of freedom (edf)**:
+edf $\approx 1$ means the fit is nearly a straight line; edf $\approx 4$
+means a comfortably curved fit.
+
+## What the GAM answers
+
+- Is the relationship **monotone**? (If not, the Emax model in Step 3 is invalid.)
+- Does the curve **level off** before $r = 128$? (If not, the simulated range is too narrow.)
+- Is the shape **sigmoidal** (slow start, fast middle, plateau) or purely
+  **concave** (fast start, smooth plateau)? This determines the Hill coefficient in Step 3.
+
+---
+
+# 2  Derivative — Saturation Point $r^*$
+
+## Marginal effect per doubling
+
+Differentiating with respect to $\log_2 r$ gives the marginal effect of
+**one doubling of $r$**:
+
+$$\frac{dY}{d(\log_2 r)} \;=\; f'(\log_2 r)$$
+
+This is the most natural measure here, because the simulation grid is itself
+a doubling sequence.
+
+## Definition of $r^*$
+
+$$\boxed{r^* = \min\!\left\{ r > 0 \;\Big|\;
+  |f'(\log_2 r)| \;<\; 0.05 \cdot \max_{r'} |f'(\log_2 r')|\right\}}$$
+
+Beyond $r^*$, each further doubling of $r$ changes $Y$ by **less than 5% of
+the maximum change** seen anywhere in the grid — effectively negligible.
+
+The 5% threshold is scale-free (relative to the peak slope), applies equally
+to all metrics, and is intentionally conservative. The full derivative curve
+with 95% confidence bands is always shown in the figures, so a reader can
+apply a different threshold if needed.
+
+**Confidence bands** are derived from the posterior covariance of the GAM
+coefficients via the delta method: $\mathrm{se}[f'(x_0)] =
+\sqrt{\mathbf{x}_0^{\prime\top} \mathrm{Cov}(\hat{\boldsymbol{\beta}})\,
+\mathbf{x}_0'}$, where $\mathbf{x}_0'$ is the vector of basis-function
+derivatives at $x_0$.
+
+---
+
+# 3  Emax Model — Interpretable Parameters
+
+## Why a second model?
+
+The GAM and its derivative answer *where* saturation occurs, but not *how
+strong* the effect is or *how fast* it saturates. The **Emax model** encodes
+the same curve in four interpretable numbers.
+
+## Model equation
+
+$$\boxed{Y(r) \;=\; E_0 \;+\; E_{\max} \cdot \frac{r^n}{\mathrm{EC}_{50}^n + r^n}}$$
+
+```{r emax-shapes, fig.width=9, fig.height=3.5}
+r_seq <- seq(0, 32, length.out = 300)
+purrr::map_dfr(c(0.5, 1, 2, 4), function(n) {
+  tibble(r = r_seq, Y = 0.2 + 0.6 * r^n / (8^n + r^n),
+         label = factor(paste0("n = ", n),
+                        levels = paste0("n = ", c(0.5, 1, 2, 4))))
+}) |>
+ggplot(aes(r, Y, colour = label)) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = 8, linetype = "dashed", colour = "grey50") +
+  annotate("text", x = 8.6, y = 0.21, label = "EC₅₀ = 8",
+           hjust = 0, size = 3.5, colour = "grey40") +
+  scale_colour_viridis_d(name = "n", end = 0.85) +
+  labs(title = "Shape of the Emax model for different Hill coefficients",
+       subtitle = "E₀ = 0.2,  Emax = 0.6,  EC₅₀ = 8  (fixed)",
+       x = "r", y = "Y(r)") +
+  theme(legend.position = "right")
+```
+
+| Parameter | Meaning |
+|---|---|
+| $E_0$ | Value of $Y$ at $r = 0$ (network without responsiveness) |
+| $E_{\max}$ | Additional change from $r=0$ to $r \to \infty$ (can be negative) |
+| $\mathrm{EC}_{50}$ | The $r$ at which half of $E_{\max}$ is reached |
+| $n$ | Steepness: $n=1$ → smooth concave (Michaelis-Menten); $n>1$ → sigmoidal |
+
+**Why $E_0 \neq 0$?** Standard Hill / Michaelis-Menten equations force $Y(0)=0$.
+That is wrong here — at $r=0$ there is already a delegation network with
+its own structure. Fixing $E_0 = 0$ would systematically distort all other
+parameters.
+
+## EC$_{90}$: the practical simulation boundary
+
+Setting $Y(r) = E_0 + 0.9\,E_{\max}$ and solving:
+
+$$\mathrm{EC}_{90} \;=\; \mathrm{EC}_{50} \cdot 9^{1/n}$$
+
+Beyond $\mathrm{EC}_{90}$, less than 10% of the total effect remains.
+Simulating $r > \mathrm{EC}_{90}$ therefore adds very little scientific value.
+
+## Fitting and model selection
+
+Parameters are estimated by **nonlinear least squares** (minimise the sum of
+squared residuals). Two variants are compared:
+
+- **Michaelis-Menten** ($n = 1$, 3 parameters)
+- **Hill** (free $n$, 4 parameters)
+
+The simpler model is kept unless the Hill fit is clearly better:
+$\Delta\mathrm{AIC} = \mathrm{AIC}(\text{Hill}) - \mathrm{AIC}(\text{MM}) < -2$.
+
+**Confidence intervals** for $\mathrm{EC}_{50}$ use **profile likelihood**: the
+parameter is scanned over a grid while re-optimising all others, and the CI is
+the range where the log-likelihood drops by less than 1.92. This is more
+reliable than the standard Wald interval when sample sizes are small (here:
+9 $r$-values, 3–4 parameters).
+
+---
+
+# 4  Convergence Check
+
+Steps 2 and 3 use completely different methods to estimate where saturation
+ends:
+
+| | Step 2 | Step 3 |
+|---|---|---|
+| Approach | Non-parametric (GAM slope) | Parametric (Emax model) |
+| Output | $r^*$ | $\mathrm{EC}_{90}$ |
+| Requires functional form? | No | Yes |
+
+If both agree, the conclusion about the simulation range is **robust to the
+choice of model**. The relative divergence is:
+
+$$\delta \;=\; \frac{\mathrm{EC}_{90} - r^*}{r^*} \times 100\%$$
+
+A value $|\delta| < 30\%$ is considered good agreement (both methods point to
+the same order-of-magnitude boundary).
+
+---
+
+# 5  Generalised Additive Models (GAMs) — used in RQ2
+
+## 5.1  What is a GAM?
+
+Ordinary linear regression models the relationship between a predictor $x$ and
+an outcome $Y$ as a straight line: $Y = \beta_0 + \beta_1 x$. This is too
+rigid for the relationships in this simulation — the plots show curves that
+rise, peak, and fall. A **Generalised Additive Model** replaces the straight
+line with a flexible smooth curve:
+
+$$\boxed{Y_i \;=\; \alpha + f(x_i) + \varepsilon_i, \qquad
+\varepsilon_i \sim \mathcal{N}(0,\sigma^2)}$$
+
+where $f(\cdot)$ is an unknown function estimated directly from the data. The
+shape is not assumed in advance — it could be monotone, sigmoidal, peaked, or
+anything else. This makes GAMs ideal for exploratory analysis when theory does
+not dictate a specific functional form.
+
+**How $f$ is estimated.** The function $f$ is represented as a sum of $K$
+basis functions (piecewise cubic polynomials joined smoothly). A
+**roughness penalty** prevents overfitting by discouraging unnecessary
+wiggles:
+
+$$\text{penalised fit} \;=\;
+  \underbrace{\sum_i\bigl(Y_i - \hat{f}(x_i)\bigr)^2}_{\text{fit to data}}
+  \;+\; \lambda \int \bigl[f''(x)\bigr]^2 dx$$
+
+The weight $\lambda$ is chosen automatically by **REML** (Restricted Maximum
+Likelihood). A large $\lambda$ forces $f$ toward a straight line; a small
+$\lambda$ allows more curvature.
+
+**Effective degrees of freedom (edf).** Instead of a fixed number of
+parameters, a GAM reports *effective* degrees of freedom. edf $\approx 1$
+means the fitted curve is essentially linear; edf $\approx 4$–$5$ means it
+is highly curved. This is the main test for nonlinearity.
+
+---
+
+## 5.2  The four GAM specifications used in RQ2
+
+### Model 1 — one-dimensional smooth (Conditions A, B, C\_diag)
+
+Applied when a single parameter is varied while all others are held constant:
+
+$$Y_i \;=\; \alpha + f\!\bigl(\log_2 r_i\bigr) + \varepsilon_i$$
+
+The predictor is $\log_2 r$ so that one unit of increase corresponds to one
+**doubling** of the parameter. This is appropriate because the simulation
+sweeps $r$ over a doubling sequence. The smooth $f$ is fitted with $k = 6$
+basis functions and REML penalty.
+
+**What it gives you:**
+
+- The fitted curve $\hat{f}(\log_2 r)$ — how the metric responds to $r$
+- edf — is the relationship linear or curved?
+- R² — how much variance does $r$ explain?
+- The derivative $\hat{f}'(\log_2 r)$ — the marginal effect per doubling at each $r$
+
+### Model 2 — tensor-product smooth (Condition C grid)
+
+Applied to the full $r_{\text{op}} \times r_{\text{pw}}$ factorial grid, where
+both parameters vary simultaneously:
+
+$$Y_i \;=\; \alpha + f\!\bigl(\log_2 r_{\text{op},i},\;\log_2 r_{\text{pw},i}\bigr) + \varepsilon_i$$
+
+The function $f$ is now a **two-dimensional surface**. A tensor-product smooth
+$\texttt{te}(\log_2 r_{\text{op}},\, \log_2 r_{\text{pw}})$ builds this surface
+as a product of two separate one-dimensional basis systems, with an independent
+penalty on each dimension. This allows the effect of $r_{\text{op}}$ to change
+at different levels of $r_{\text{pw}}$ and vice versa — i.e. it models a
+**nonlinear interaction** without assuming a specific interaction form.
+
+This model directly tests H3b: if the joint effect surface is not simply
+additive (i.e. edf of the tensor product smooth $\gg 2$), the joint effect of
+$r_{\text{op}}$ and $r_{\text{pw}}$ is genuinely interactive, not just the
+sum of two separate effects.
+
+### Model 3 — by-factor smooth (Condition D, trust)
+
+Applied to the trust experiment, where $\gamma$ varies at three fixed
+background responsiveness levels $\ell \in \{r\!=\!1,\, r\!=\!2,\, r\!=\!4\}$:
+
+$$Y_i \;=\; \alpha_\ell + f_\ell(\gamma_i) + \varepsilon_i$$
+
+The term $\texttt{s(gamma, by = r\_level)}$ fits a **separate smooth for each
+$r$ level**. If trust has the same effect regardless of background
+responsiveness, the three curves $f_1, f_2, f_4$ will be parallel. If they
+diverge or converge, trust **moderates** the responsiveness effect (H4b).
+
+**How to read the output:** plot the three fitted curves on the same axis. If
+higher $r$ levels show a steeper negative slope in $\gamma$, trust is more
+effective at reducing drift when responsiveness is already high. If the curves
+are parallel, trust has an additive shift with no interaction.
+
+---
+
+## 5.3  Derivative analysis
+
+For Models 1 and 3, the **first derivative** $\hat{f}'(\log_2 r)$ is computed
+numerically using the GAM's linear prediction matrix:
+
+$$\hat{f}'(x_0) \;\approx\; \frac{\mathbf{X}(x_0+h) - \mathbf{X}(x_0-h)}{2h}
+\;\hat{\boldsymbol{\beta}}$$
+
+with $h = 10^{-5}$. Pointwise 95% confidence bands follow from the delta
+method applied to the posterior covariance of $\hat{\boldsymbol{\beta}}$.
+
+**Interpreting the derivative plot:**
+
+| Derivative value | Meaning |
+|---|---|
+| Positive, far from zero | Metric still rising — more $r$ has a clear effect |
+| Near zero (within dashed threshold) | Practical saturation — doubling $r$ changes the metric by < 5% of its peak rate |
+| Negative | Metric falling — increasing $r$ reverses the direction of change |
+| Zero-crossing | Peak or trough of the curve |
+
+The **saturation point** $r^*$ is defined as the first $r$ where
+$|\hat{f}'(\log_2 r)| < 0.05 \cdot \max |\hat{f}'|$.
+
+---
+
+# 6  Notation
+
+| Symbol | Meaning |
+|---|---|
+| $r$ | Responsiveness parameter ($r_\text{op}$, $r_\text{pw}$, or $\gamma$) |
+| $Y$ | Network metric (delegation rate, chain length, etc.) |
+| $f(\cdot)$ | GAM smooth function (penalised spline) |
+| $\lambda$ | GAM smoothing parameter (auto-selected by REML) |
+| edf | Effective degrees of freedom of a GAM smooth |
+| $\hat{f}'(x)$ | First derivative of the GAM smooth at $x$ |
+| $r^*$ | Practical saturation point — first $r$ where $|\hat{f}'| < 5\%$ of peak |
+| $E_0,\,E_{\max},\,\mathrm{EC}_{50},\,n$ | Emax model parameters |
+| $\mathrm{EC}_{90}$ | $r$ at which 90% of $E_{\max}$ is reached $= \mathrm{EC}_{50}\cdot 9^{1/n}$ |
+| $\delta$ | Relative divergence between $\mathrm{EC}_{90}$ and $r^*$ |
+
+---
+
+# 6  Metric Definitions
+
+Seven metrics are recorded. For each one this section explains: what it
+measures in plain language, which agents are counted, the scale, and any
+implementation details that affect interpretation.
+
+---
+
+## 6.1  Delegation Rate
+
+**Plain language:** "What fraction of agents chose to delegate?"
+
+**Formula:** `mean(agents$delegated[lay_ids])`
+
+**Who is counted:** all lay agents (= all N agents; no experts in this setup).
+An agent counts as "delegating" if they *chose* to delegate in that round,
+**regardless of whether their vote was ultimately cast or lost**.
+
+**Scale:** 0 = everyone votes directly · 1 = everyone delegates.
+
+**Key relation:** $1 - \text{delegation rate}$ = fraction of direct voters.
+
+**Watch out:** delegation rate and lost vote rate are independent.
+A delegating agent can still have a successfully cast vote if their chain
+reaches a direct voter.
+
+---
+
+## 6.2  Lost Vote Rate
+
+**Plain language:** "What fraction of all votes are lost — i.e. never registered?"
+
+**Formula:** `mean(is.na(agents$my_vote))`
+
+**Who is counted:** all N agents. Each agent has a slot `my_vote`:
+- Direct voter → `my_vote = own opinion` (never NA, never lost)
+- Delegator whose chain reaches a direct voter → `my_vote = guru's opinion` (not lost)
+- Delegator whose chain is broken (cycle or dead end) → `my_vote = NA` (lost)
+
+**Scale:** 0 = all votes cast · 1 = all votes lost.
+
+**Key insight:** direct voters can never lose their vote. Lost votes come
+exclusively from delegators with broken chains. So:
+
+$$\text{lost vote rate} = \frac{\text{delegators with broken chains}}{N}$$
+
+---
+
+## 6.3  Avg. Ideological Drift
+
+**Plain language:** "How different is the opinion represented on behalf of an
+agent from that agent's own opinion?"
+
+**Formula:** `mean(|opinion - my_vote|)` over agents with `my_vote ≠ NA`
+
+**Who is counted:** only *represented* agents — those whose vote was
+successfully cast.
+- Direct voters → contribute drift = 0 (their own opinion is cast)
+- Successful delegators → contribute |own opinion − guru's opinion|
+- Agents with broken chains → **excluded**
+
+**Scale:** 0 = perfect alignment · 1 = maximum possible misalignment (opinions on [0,1]).
+
+**NA rule:** if more than half (>2 out of 5) of the steady-state rounds have
+zero represented agents (all votes lost), the metric is set to NA instead of
+averaging the few surviving rounds. This prevents misleading values at high r.
+
+**Watch out:** as delegation rate → 1 and more chains break, the denominator
+shrinks to only the surviving chains, which may be structurally unusual
+(selection bias). Values at very high r should be interpreted cautiously.
+
+---
+
+## 6.4  Avg. Chain Length
+
+**Plain language:** "How many steps does a delegator's vote travel before
+reaching someone who votes directly?"
+
+**Formula:** mean shortest-path distance from each delegator to their chain's
+root, computed only for delegators with a finite path.
+
+**Who is counted:** agents who delegated AND whose chain successfully reaches
+a direct voter (finite path length).
+- Direct voters → **excluded** (chain length = 0, they are the root)
+- Delegators in broken chains → **excluded** (no finite path to root)
+
+**Scale:** 1 = delegated directly to a direct voter · higher = longer chains.
+Returns 0 if there are no valid chains (e.g. at r=0 with no delegation at all
+— actually 0 is returned when no roots or edges exist).
+
+**Watch out:** at high r where many chains break, the remaining sample is
+small and potentially unrepresentative. The metric can decrease not because
+chains actually shorten but because only short chains survive.
+
+---
+
+## 6.5  Top-5% Power Share
+
+**Plain language:** "What fraction of all votes does the most powerful 5% of
+agents control?"
+
+**Formula:** `sum(top-5% power) / sum(all represented power)`
+
+**Power definition:** every agent starts with power = 1. Each delegation
+transitively adds 1 to the power of the final direct voter at the chain root.
+If A→B→C (C votes directly): C has power = 3, A and B have power = 1 each.
+
+**Who is counted:**
+- Numerator: top `floor(0.05 × N)` agents by power (minimum 1 agent)
+- Denominator: all *represented* agents (non-NA `my_vote`) — not all N agents
+
+**Scale:** 0.05 = perfectly equal distribution · 1 = one agent holds all votes.
+
+**Watch out:** the denominator excludes agents with broken chains. At high
+lost vote rates, the surviving power pool is smaller, so top-5% share can
+look artificially high even without genuine concentration — fewer total
+votes remain, and they are disproportionately those that flowed through hubs.
+
+---
+
+## 6.6  Total Components
+
+**Plain language:** "How many separate groups exist in the delegation network?"
+
+**Formula:** `components(active subgraph) + isolated agents`
+
+**How it works:**
+- Build the delegation graph G (directed edges: delegator → delegate)
+- Find all agents with at least one edge (active nodes)
+- Count connected components in the subgraph of active nodes
+- Add the number of isolated agents (no edges at all)
+
+**Who is counted:** all N agents. Every agent belongs to exactly one component.
+
+**What is a component:**
+- A direct voter who receives delegations → the root of a tree = 1 component
+- A direct voter with no incoming delegations → isolated node = 1 component
+- Agents in a delegation cycle (no root) → 1 component
+- **Every component has at most one direct voter** (in a tree structure)
+
+**Scale:** 1 = entire network is one connected group · N = every agent is
+isolated. Number of components ≥ number of direct voters (equal when no cycles).
+
+**Interpretation:** fewer components = more centralised delegation structure.
+More components = fragmented, many small autonomous groups.
+
+---
+
+## 6.7  Share of Agents for 50% of Votes
+
+**Plain language:** "What is the minimum fraction of agents you need to control
+50% of all voting power?"
+
+**Formula:**
+1. Sort all agents by power, highest first: $p_{(1)} \geq p_{(2)} \geq \ldots$
+2. Find $k^* = $ first $k$ where cumulative sum $\geq 0.5 \times$ total power
+3. Return $k^* / N$
+
+**Who is counted:** all agents with power > 0 (= all agents, since everyone
+starts with power ≥ 1).
+
+**Scale:** low (e.g. 0.02) = very concentrated, 2% of agents hold 50% of power
+· high (e.g. 0.50) = very equal, need half the population to reach 50%.
+
+**Measured at:** the **final round only** (t = T), not averaged over the last
+5 rounds. This is the only metric that is a single-snapshot measurement.
+All other metrics are averaged over rounds 16–20.
+
+---
+
+## 6.8  Quick-reference table
+
+| Metric | In plain words | Agents counted | Range | Time |
+|---|---|---|---|---|
+| Delegation rate | Fraction who delegated | All lay agents | [0, 1] | Avg. rounds 16–20 |
+| Lost vote rate | Fraction of lost votes | All agents | [0, 1] | Avg. rounds 16–20 |
+| Avg. ideo. drift | Opinion gap: agent vs. cast vote | Represented only (vote cast) | [0, 1] | Avg. rounds 16–20 |
+| Avg. chain length | Steps from delegator to root | Delegators with finite chain | [0, ∞) | Avg. rounds 16–20 |
+| Top-5% power share | Vote share of most powerful 5% | Represented only | [0, 1] | Avg. rounds 16–20 |
+| Total components | Number of separate network groups | All agents | [1, N] | Avg. rounds 16–20 |
+| Share 50% votes | Fraction needed to hold 50% power | All agents | [0, 1] | Final round t=T only |
+
+---
+
+# 7  Key References
+
+- Wood, S. N. (2017). *Generalized Additive Models: An Introduction with R* (2nd ed.). Chapman & Hall/CRC.
+- Holford & Sheiner (1981). Understanding the dose-effect relationship. *Clinical Pharmacokinetics*, 6(6), 429–453. — original Emax / EC$_{50}$ paper.
+- Ritz et al. (2015). Dose-response analysis using R. *PLOS ONE*, 10(12), e0146021.

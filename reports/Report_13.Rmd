@@ -271,6 +271,53 @@ wrap_plots(gam_line_plots, ncol = 2) +
 
 Checked for reasonable r values. Plots show a very high delegation + lost vote rate for any value higher than r = 2. Therefore for the following simulations + models r values in {0, 1, 2}.
 
+```{r gam-ov-lineplot-rpw, fig.width=13, fig.height=10}
+r_op_show     <- c(0, 3, 6, 9, 12, 15)
+pred_line_gam <- expand_grid(r_pw = seq(0, 15, by = 0.4),
+                             r_op = r_op_show)
+
+gam_line_plots <- purrr::map(metrics_gam, function(y) {
+  lbl <- metrics_gam_lbl[y]
+  purrr::map(n_gam_vals, function(n) {
+    df_n  <- df_large |> filter(n_agents == n)
+    mod   <- gam_ov[[as.character(n)]][[y]]
+    sf_lv <- df_n |> mutate(seed_f = factor(seed)) |> pull(seed_f) |> levels()
+
+    pred_df <- pred_line_gam |>
+      mutate(seed_f = factor(sf_lv[1]),
+             val    = predict(mod, newdata = pick(everything()),
+                              exclude = "s(seed_f)", newdata.guaranteed = TRUE))
+
+    obs_df <- df_n |>
+  filter(r_op %in% r_op_show) |>
+  group_by(r_pw, r_op) |>
+  summarise(val = mean(.data[[y]], na.rm = TRUE), .groups = "drop")
+
+    ggplot(pred_df, aes(r_pw, val,
+                    colour = factor(r_op),
+                    group = factor(r_op))) +
+      geom_point(data = obs_df,
+           aes(x = r_pw, y = val,
+               colour = factor(r_op)),
+           size = 1.8, alpha = 0.55,
+           inherit.aes = FALSE) +
+      geom_line(linewidth = 0.9) +
+      scale_colour_viridis_d(name = expression(r[op])) +
+scale_x_continuous(breaks = seq(0, 15, by = 3)) +
+labs(title = paste0(lbl, "  --  N = ", n),
+     x = expression(r[pw]), y = lbl) +
+      theme(legend.position = "right")
+  })
+}) |> purrr::list_flatten()
+
+wrap_plots(gam_line_plots, ncol = 2) +
+  plot_annotation(
+    title    = "GAM predicted lines -- delegation & lost vote rate  (r in [0, 15])",
+    subtitle = "Points = observed cell means | Lines = GAM prediction | Colours = r_pw levels {0, 3, 6, 9, 12, 15}"
+  )
+```
+
+
 ---
 
 # Part 1 -- N = 300
@@ -362,6 +409,28 @@ wrap_plots(lmm_plots, ncol = 2) +
 ```
 
 
+```{r rpw-dlg-lost, fig.width=10, fig.height=4}
+focus_metrics <- c("delegation_rate", "lost_vote_rate")
+
+rpw_plots <- purrr::map(focus_metrics, function(y) {
+  lbl    <- all_metrics_lbl[y]
+  obs_df <- obs_all |> dplyr::select(r_op, r_pw, obs = all_of(y))
+
+  ggplot(obs_df, aes(r_pw, obs, colour = factor(r_op), group = factor(r_op))) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 1, alpha = 0.9) +
+    geom_point(size = 2.5, alpha = 0.85) +
+    scale_colour_viridis_d(name = expression(r[op])) +
+    labs(title = lbl, x = expression(r[pw]), y = lbl) +
+    theme(legend.position = "right")
+})
+
+wrap_plots(rpw_plots, ncol = 2) +
+  plot_annotation(
+    title    = "Delegation & Lost Vote Rate: r_pw on x-axis  (N = 300, r in {0,1,2})",
+    subtitle = "Points = seed-averaged cell means | Lines = OLS per r_op level | Colours = r_op levels"
+  )
+```
+
 - **ENP** ($1/\sum s_i^2$): effective number of equally powerful agents; *higher = less concentrated*
 
 ```{r lmm-all-fit, cache=TRUE, dependson=c("setup","robust-sweep"), cache.extra=list(all_metrics)}
@@ -401,7 +470,7 @@ lmm_coef_tbl <- purrr::map_dfr(all_metrics, function(y) {
 })
 
 knitr::kable(lmm_coef_tbl,
-  caption = "LMM fixed effects -- all metrics, r in {0,1,2}, N = 300. * p < 0.05, ** p < 0.01. LRT χ² tests interaction term (r_op:r_pw) against additive model. R2m = marginal, R2c = conditional.")
+  caption = "LMM fixed effects -- all metrics, r in {0,1,2}, N = 300. * p < 0.05, ** p < 0.01. LRT χ² tests interaction term (`r_op`:`r_pw`) against additive model. R2m = marginal, R2c = conditional.")
 ```
 
 **Interpretation:**

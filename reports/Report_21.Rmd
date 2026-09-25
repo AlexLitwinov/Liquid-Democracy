@@ -749,11 +749,11 @@ cat(sprintf(
   FINAL_ITER
 ))
 cat(sprintf(
-  "- **T = %d, n_voting_rounds = %d, Δt = %d** -- saturation read-off across %d Δt candidates, r_level=0/32/64, and both joint/trust-only modes, +10%% buffer.\n",
+  "- **T = %d, n_voting_rounds = %d, Δt = %d** -- saturation read-off across %d Δt candidates, `r_level`=0/32/64, and both joint/trust-only modes, +10%% buffer.\n",
   CHOSEN_T_FINAL, CHOSEN_NV_FINAL, CHOSEN_DT_FINAL, length(DT_CANDIDATES)
 ))
 cat(sprintf(
-  "- **r ceilings** -- r_op=%.2f, r_pw=%.2f, r_tr=%.2f -- smallest r per dimension at which delegation_rate stays within 1 percentage point of its own steady value through to the end of that dimension's own swept range.\n",
+  "- **r ceilings** -- `r_op`=%.2f, `r_pw`=%.2f, `r_tr`=%.2f -- smallest r per dimension at which `delegation_rate` stays within 1 percentage point of its own steady value through to the end of that dimension's own swept range.\n",
   r_sat_FINAL$r_sat[r_sat_FINAL$dim == "op"],
   r_sat_FINAL$r_sat[r_sat_FINAL$dim == "pw"],
   r_sat_FINAL$r_sat[r_sat_FINAL$dim == "tr"]

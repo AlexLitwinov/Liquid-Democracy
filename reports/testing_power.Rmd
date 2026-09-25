@@ -1,0 +1,101 @@
+---
+title: "Testing Power: Linear-Ratio vs. Log-Ratio Power Attractiveness"
+output: github_document
+date: "2026-08-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 5)
+library(tidyverse)
+library(here)
+library(furrr)
+library(digest)
+
+theme_set(theme_minimal(base_size = 12))
+source(here::here("scripts/Network.R"))
+dir.create(here::here("data"), showWarnings = FALSE)
+
+# Two candidate power-attractiveness formulas. r_op = 0 throughout, so
+# a_op = 1 and only the power term is exercised.
+#   linear: a_pw_ij = 2 L( r_pw (p_j/p_i - 1) )
+#   log:    a_pw_ij = 2 L( r_pw log(p_j/p_i) )     [= attractiveness_gaussian_log at r_op = 0]
+attractiveness_pw_linear <- function(op_i, op_j, pow_i, pow_j, r_op, r_pw) {
+  2 * exp(-0.5 * r_op^2 * (op_i - op_j)^2) * .sig(r_pw * (pow_j / pow_i - 1))
+}
+attractiveness_pw_log <- attractiveness_gaussian_log
+```
+
+## Model parameters
+
+- N = 500, k = 14 (Watts-Strogatz, p_rewire = 0.05), T = 20 rounds
+- r_op = 0 (isolates the power term); r_pw in {1, 2, 4, 8, 16, 32}
+- self-reliance c = 0.5, decision model = gaussian_mobius (Mobius self-vote curve)
+- trust / in-group inactive; 25 seeds per r_pw value per formula
+
+```{r run}
+N_SIM           <- 500L
+K_SIM           <- 14L
+SIM_T           <- 20L
+P_REWIRE        <- 0.05
+SELF_RELIANCE_C <- 0.5
+R_PW_VALS       <- c(1, 2, 4, 8, 16, 32)
+N_SEEDS         <- 25L
+N_WORKERS       <- max(1L, parallel::detectCores() - 1)
+
+run_cell <- function(seed, r_pw, attractiveness_fn, formula_name) {
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = N_SIM, n_communities = 1, node_degree = K_SIM, T = SIM_T,
+    r_op = 0, r_pw = r_pw, p_rewire = P_REWIRE, attractiveness_fn = attractiveness_fn,
+    decision_model = "gaussian_mobius", self_reliance_c = SELF_RELIANCE_C,
+    sigma_opinion = "auto", fast_path = TRUE
+  )
+  snaps <- res$snapshots |> dplyr::filter(round >= SIM_T - 4L)
+  tibble(
+    formula          = formula_name, seed = seed, r_pw = r_pw,
+    delegation_rate  = mean(res$history_delegation[(SIM_T - 4L):SIM_T], na.rm = TRUE),
+    lost_vote_rate   = mean(res$history_lost[(SIM_T - 4L):SIM_T],       na.rm = TRUE),
+    chain_length     = mean(snaps$avg_chain_length_delegators, na.rm = TRUE),
+    top5_power_share = mean(snaps$top5_power_share,            na.rm = TRUE),
+    share_50pct      = mean(snaps$share_50pct,                 na.rm = TRUE)
+  )
+}
+
+grid <- expand_grid(seed = seq_len(N_SEEDS), r_pw = R_PW_VALS)
+hash <- digest::digest(list(N_SIM, K_SIM, SIM_T, P_REWIRE, SELF_RELIANCE_C, R_PW_VALS, N_SEEDS, v = 1))
+cache_file <- here::here("data/testing_power_cache.rds")
+
+if (file.exists(cache_file) && identical(readRDS(cache_file)$hash, hash)) {
+  results <- readRDS(cache_file)$data
+} else {
+  plan(multisession, workers = N_WORKERS)
+  linear_res <- future_pmap_dfr(grid, run_cell, attractiveness_fn = attractiveness_pw_linear,
+                                 formula_name = "linear: r_pw(p_j/p_i - 1)", .options = furrr_options(seed = NULL))
+  log_res    <- future_pmap_dfr(grid, run_cell, attractiveness_fn = attractiveness_pw_log,
+                                 formula_name = "log: r_pw log(p_j/p_i)",    .options = furrr_options(seed = NULL))
+  plan(sequential)
+  results <- bind_rows(linear_res, log_res)
+  saveRDS(list(hash = hash, data = results), cache_file)
+}
+```
+
+```{r plot, fig.height=16}
+metrics <- c(delegation_rate = "Delegation rate", lost_vote_rate = "Lost-vote rate",
+             chain_length = "Avg. chain length", top5_power_share = "Top-5% power share",
+             share_50pct = "Agents for 50% of power")
+
+results |>
+  pivot_longer(names(metrics), names_to = "metric", values_to = "value") |>
+  mutate(metric = factor(metrics[metric], levels = unname(metrics))) |>
+  group_by(formula, r_pw, metric) |>
+  summarise(value = mean(value, na.rm = TRUE), .groups = "drop") |>
+  ggplot(aes(r_pw, value, colour = formula)) +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  scale_x_log10(breaks = R_PW_VALS) +
+  scale_colour_manual(values = c("linear: r_pw(p_j/p_i - 1)" = "firebrick3", "log: r_pw log(p_j/p_i)" = "steelblue4")) +
+  facet_wrap(~metric, scales = "free_y", ncol = 1) +
+  labs(title = "Power-attractiveness formula comparison -- mean over 25 seeds",
+       x = "r_pw (log scale)", y = NULL, colour = "a_pw formula") +
+  theme(strip.background = element_rect(fill = "grey93", colour = NA),
+        strip.text = element_text(face = "bold"), legend.position = "top")
+```

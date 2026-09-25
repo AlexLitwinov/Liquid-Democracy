@@ -182,7 +182,7 @@ seed_check <- map_dfr(1:15, function(s) {
 knitr::kable(
   seed_check,
   align = "rrrrrr",
-  caption = "Per-seed metrics at T = 1 (n = 250, responsiveness = 1, p_rewire = 0.10)"
+  caption = "Per-seed metrics at T = 1 (n = 250, responsiveness = 1, `p_rewire` = 0.10)"
 )
 ```
 

@@ -604,7 +604,7 @@ sat_rr_abs <- sat_rr_base |>
 colnames(sat_rr_abs) <- c("r", all_metrics_lbl[all_metrics])
 
 kable(sat_rr_abs,
-      caption = "Absolute metric values per r level (diagonal r_op = r_pw, N = 400, k = 12, p_self = 0.5).",
+      caption = "Absolute metric values per r level (diagonal `r_op` = `r_pw`, N = 400, k = 12, `p_self` = 0.5).",
       align   = c("l", rep("r", length(all_metrics))))
 
 # Table 2: relative change %
@@ -622,7 +622,7 @@ sat_rr_rel <- purrr::map_dfr(seq_len(nrow(sat_rr_base) - 1), function(i) {
 colnames(sat_rr_rel) <- c("r-Step", all_metrics_lbl[all_metrics])
 
 kable(sat_rr_rel,
-      caption = "Relative change per r-step on the diagonal (r_op = r_pw, N = 400, k = 12, p_self = 0.5).",
+      caption = "Relative change per r-step on the diagonal (`r_op` = `r_pw`, N = 400, k = 12, `p_self` = 0.5).",
       align   = c("l", rep("r", length(all_metrics))))
 ```
 

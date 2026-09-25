@@ -31,6 +31,8 @@ Checked for reasonable r values. Plots show a very high delegation +
 lost vote rate for any value higher than r = 2. Therefore for the
 following simulations + models r values in {0, 1, 2}.
 
+![](Report_13_files/figure-gfm/gam-ov-lineplot-rpw-1.png)<!-- -->
+
 ------------------------------------------------------------------------
 
 # Part 1 – N = 300
@@ -77,6 +79,8 @@ is fitted. $u_k \sim \mathcal{N}(0, \sigma_u^2)$ is the seed random
 intercept.
 
 ![](Report_13_files/figure-gfm/lmm-marginal-plots-1.png)<!-- -->
+
+![](Report_13_files/figure-gfm/rpw-dlg-lost-1.png)<!-- -->
 
 - **ENP** ($1/\sum s_i^2$): effective number of equally powerful agents;
   *higher = less concentrated*

@@ -1,0 +1,270 @@
+---
+title: "Report 21 -- Calibration: K then N"
+output: github_document
+date: "2026-08-28"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.width = 13, fig.height = 8)
+library(tidyverse)
+library(here)
+library(knitr)
+library(furrr)
+library(digest)
+library(igraph)
+
+theme_set(theme_minimal(base_size = 12))
+source(here::here("scripts/Network.R"))
+dir.create(here::here("data"), showWarnings = FALSE)
+
+N_WORKERS <- max(1L, parallel::detectCores() - 1)
+
+run_cached <- function(cache_name, fn, hash_obj) {
+  hash       <- digest::digest(hash_obj)
+  cache_file <- here::here(paste0("data/", cache_name, "_cache.rds"))
+  if (file.exists(cache_file)) {
+    cc <- readRDS(cache_file)
+    if (identical(cc$hash, hash)) return(cc$data)
+  }
+  out <- fn()
+  saveRDS(list(hash = hash, data = out), cache_file)
+  out
+}
+
+metrics_core  <- c("n_direct_voters", "delegation_rate", "lost_vote_rate", "chain_length")
+metric_labels <- c(n_direct_voters = "Number of direct voters", delegation_rate = "Delegation rate",
+                    lost_vote_rate = "Lost-vote rate", chain_length = "Avg. chain length")
+
+LAMBDA_TR <- 1 - 0.5^(1/5)   # half-life = 5 rounds
+C_NEUTRAL <- 0.5             # neutral, not yet calibrated
+MAX_ROUND <- 1000L
+N_SEEDS   <- 10L
+STEADY_WINDOW <- 5L
+R_LOW  <- 2
+R_HIGH <- 32
+DELTA_TOL_SEM <- 0.5   # stability: |change| < 0.5 * SEM across seeds
+
+r_settings <- tribble(
+  ~r_label, ~r_op, ~r_pw, ~r_tr,
+  "r0",     0,     0,     0,
+  "r_low",  R_LOW, R_LOW, R_LOW,
+  "r_high", R_HIGH,R_HIGH,R_HIGH
+)
+
+run_sim_cell <- function(seed, N, K, r_op, r_pw, r_tr, r_label) {
+  res <- simulate_liquid_democracy(
+    seed = seed, n_per_community = N, n_communities = 1, node_degree = K, T = MAX_ROUND,
+    r_op = r_op, r_pw = r_pw, gamma = r_tr, lambda = LAMBDA_TR, k1 = 1, k2 = 1,
+    decision_model = "calib", self_reliance_c = C_NEUTRAL, trust_mode = "relaxation",
+    sigma_opinion = "auto", fast_path = TRUE, p_rewire = 0.05,
+    snap_rounds = seq_len(MAX_ROUND)
+  )
+  tibble(seed = seed, N = N, K = K, r_label = r_label, round = seq_len(MAX_ROUND),
+    delegation_rate = res$history_delegation,
+    n_direct_voters = N * (1 - delegation_rate),
+    lost_vote_rate  = res$history_lost,
+    chain_length    = res$snapshots$avg_chain_length_delegators)
+}
+
+steady_summary <- function(raw_df, group_var) {
+  raw_df |>
+    filter(round > MAX_ROUND - STEADY_WINDOW) |>
+    pivot_longer(all_of(metrics_core), names_to = "metric", values_to = "value") |>
+    group_by(across(all_of(c(group_var, "r_label", "metric"))), seed) |>
+    summarise(steady_val = mean(value, na.rm = TRUE), .groups = "drop") |>
+    group_by(across(all_of(c(group_var, "r_label", "metric")))) |>
+    summarise(mean_val = mean(steady_val), sem = sd(steady_val) / sqrt(n()), .groups = "drop")
+}
+
+stability_table <- function(steady_df, group_var) {
+  steady_df |>
+    arrange(metric, r_label, .data[[group_var]]) |>
+    group_by(metric, r_label) |>
+    mutate(delta = abs(mean_val - lag(mean_val)), stable = delta < DELTA_TOL_SEM * sem) |>
+    ungroup()
+}
+```
+
+# Model
+
+$$A_{ij}=a^{tr}_{ij}\,a^{pw}_{ij}\,a^{op}_{ij}\quad(a^{ig}=1,\ r_{ig}=0\text{ -- Part I only})$$
+$$a^{op}_{ij}=\exp(-r_{op}|o_i-o_j|)\in(0,1],\qquad a^{pw}_{ij}=2\mathcal L\!\left(r_{pw}\log\tfrac{p_j}{p_i}\right)\in(0,2),\qquad a^{tr}_{ij}=2\mathcal L\!\left(r_{tr}(\tau_{ij}-1)\right)\in(0,2)$$
+$$\tau_{ij}(t)=(1-\lambda)\,\tau_{ij}(t-1)+\lambda\big(1+s_{ij}(t-1)\big),\quad \tau_{ij}(0)=1,\qquad s_{ij}(t-1)=\begin{cases}k_1\big(1-2|o_i-v_j(t-1)|\big) & j\text{ delivered}\\ -k_2 & j\text{'s vote lost to a cycle}\end{cases}$$
+$$P_{\text{self}}(A_k)=\frac{M-A_k}{M+A_k\left(\frac{M-1}{c}-M\right)},\qquad M=4,\quad k_1=k_2=1$$
+
+---
+
+# Part 1: Choosing K at N = 1000
+
+## Theoretical corridor
+
+$N \gg K \gg \ln(N) \gg 1$; margin $K > 2\ln N$, $N > 10K$, $N=1000$:
+
+```{r p1-corridor}
+N_STEP1 <- 1000L
+K_min <- floor(2 * log(N_STEP1)) + 1L
+K_max <- as.integer(floor(N_STEP1 / 10)) - 1L
+```
+
+$K \in [`r K_min`, `r K_max`]$. Dunbar's social-layer framework provides a
+qualitative reference point for a locally accessible neighbourhood
+(sympathy group $\approx 15$), not a quantitative degree estimate.
+Candidate set, chosen inside the corridor and around this reference:
+
+dunbar_layers <- tibble::tribble(
+  ~layer,              ~size, ~description,
+  "Support clique",       5,  "Closest confidants (family, best friends)",
+  "Sympathy group",      15,  "Close friends whose lives and views one knows well",
+  "Affinity group",      50,  "Regular but less intimate contacts",
+  "Active network",      150, "Stable social relationships (\"Dunbar's number\")",
+  "Acquaintances",       500, "Broader circle of recognisable contacts",
+  "Faces/Names",        1500, "Individuals recognised by sight or name"
+)
+
+
+
+```{r p1-grid}
+k_grid <- c(16, 24, 32, 40, 48)
+```
+
+$K \in \{`r paste(k_grid, collapse=", ")`\}$.
+
+## Small-world validation
+
+```{r p1-smallworld}
+compute_sw_stats <- function(K, n_reps = 30) {
+  ws_rows <- purrr::map_dfr(seq_len(n_reps), function(s) {
+    st <- setup_agents(N_STEP1, 1, seed = s)
+    gF <- setup_friendship_network(st$agents, 1, K, p_rewire = 0.05, seed = s)
+    gU <- as.undirected(gF, mode = "collapse")
+    tibble(clustering = transitivity(gU, type = "average"),
+           path_len   = mean_distance(gU, directed = FALSE, unconnected = TRUE),
+           n_comp     = components(gU)$no)
+  })
+  st0   <- setup_agents(N_STEP1, 1, seed = 1)
+  g_lat <- setup_friendship_network(st0$agents, 1, K, p_rewire = 0, seed = 1) |> as.undirected(mode = "collapse")
+  g_er  <- sample_gnm(N_STEP1, gsize(g_lat), directed = FALSE)
+  tibble(K = K,
+    ws_clustering = mean(ws_rows$clustering), ws_path = mean(ws_rows$path_len),
+    ws_components_max = max(ws_rows$n_comp),
+    lattice_clustering = transitivity(g_lat, type = "average"),
+    lattice_path = mean_distance(g_lat, directed = FALSE, unconnected = TRUE),
+    er_clustering = transitivity(g_er, type = "average"),
+    er_path = mean_distance(g_er, directed = FALSE, unconnected = TRUE))
+}
+
+sw_stats <- run_cached("smallworld_validation_k", function() {
+  purrr::map_dfr(k_grid, compute_sw_stats)
+}, list(N_STEP1, k_grid, v = 1))
+
+kable(sw_stats |> mutate(across(where(is.numeric), \(x) round(x, 3))),
+      caption = "WS vs. lattice (`p_rewire`=0) vs. Erdos-Renyi. Small-world = clustering near lattice, path length near ER.")
+```
+
+## Model outcome stability across K
+
+```{r p1-run}
+grid_k <- tidyr::crossing(K = k_grid, seed = seq_len(N_SEEDS)) |>
+  tidyr::crossing(r_settings |> select(r_label)) |>
+  left_join(r_settings, by = "r_label")
+
+k_raw <- run_cached("k_grid_raw", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_k, function(K, seed, r_label, r_op, r_pw, r_tr)
+    run_sim_cell(seed, N_STEP1, K, r_op, r_pw, r_tr, r_label), .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(MAX_ROUND, N_SEEDS, k_grid, r_settings, N_STEP1, LAMBDA_TR, v = 1))
+
+k_steady <- steady_summary(k_raw, "K")
+```
+
+```{r p1-plot, fig.height=14}
+k_steady |>
+  mutate(metric = factor(metric_labels[metric], levels = unname(metric_labels)),
+         r_label = factor(r_label, levels = c("r0", "r_low", "r_high"))) |>
+  ggplot(aes(K, mean_val)) +
+  geom_line(colour = "steelblue4", linewidth = 0.8) + geom_point(size = 2) +
+  geom_errorbar(aes(ymin = mean_val - sem, ymax = mean_val + sem), width = 1) +
+  facet_grid(metric ~ r_label, scales = "free_y") +
+  labs(title = "Steady-state outcomes vs. K", x = "K", y = NULL)
+```
+
+## Decision: K
+
+$K^*$ = smallest $K$ for which a further increase changes each metric by
+less than $`r DELTA_TOL_SEM`\times\text{SEM}$, at every $r$-setting.
+
+```{r p1-decision}
+kable(stability_table(k_steady, "K") |> filter(!is.na(delta)) |>
+        mutate(across(where(is.numeric), \(x) round(x, 4))),
+      caption = "Step-to-step change vs. SEM-based tolerance, per metric x r-setting")
+
+# ══════════════════════════════════════════════════════════════
+# PICK K: smallest K after which `stable` holds for all metric x
+# r_label combinations at every subsequent K. Inspect table above.
+# ══════════════════════════════════════════════════════════════
+CHOSEN_K <- 32L
+```
+
+**Chosen: K = `r CHOSEN_K`.**
+
+---
+
+# Part 2: Confirming N = 1000 at K = `r CHOSEN_K`
+
+$N=1000$ was fixed pragmatically before Part 1. This checks it is large
+enough that outcomes no longer depend on further increases in $N$, holding
+$K=`r CHOSEN_K`$ fixed.
+
+```{r p2-grid}
+n_grid <- c(500, 750, 1000, 1500, 2000)
+
+corridor_n <- tibble(N = n_grid) |>
+  mutate(K_over_lnN = round(CHOSEN_K / log(N), 2), N_over_K = round(N / CHOSEN_K, 2))
+kable(corridor_n, caption = sprintf("K=%d relative to each candidate N -- confirms all pairs stay inside the small-world margin", CHOSEN_K))
+```
+
+```{r p2-run}
+grid_n <- tidyr::crossing(N = n_grid, seed = seq_len(N_SEEDS)) |>
+  tidyr::crossing(r_settings |> select(r_label)) |>
+  left_join(r_settings, by = "r_label")
+
+n_raw <- run_cached("n_sensitivity_raw", function() {
+  plan(multisession, workers = N_WORKERS)
+  out <- future_pmap_dfr(grid_n, function(N, seed, r_label, r_op, r_pw, r_tr)
+    run_sim_cell(seed, N, CHOSEN_K, r_op, r_pw, r_tr, r_label), .options = furrr_options(seed = NULL))
+  plan(sequential)
+  out
+}, list(MAX_ROUND, N_SEEDS, n_grid, r_settings, CHOSEN_K, LAMBDA_TR, v = 1))
+
+n_steady <- steady_summary(n_raw, "N")
+```
+
+```{r p2-plot, fig.height=14}
+n_steady |>
+  mutate(metric = factor(metric_labels[metric], levels = unname(metric_labels)),
+         r_label = factor(r_label, levels = c("r0", "r_low", "r_high"))) |>
+  ggplot(aes(N, mean_val)) +
+  geom_line(colour = "steelblue4", linewidth = 0.8) + geom_point(size = 2) +
+  geom_errorbar(aes(ymin = mean_val - sem, ymax = mean_val + sem), width = 20) +
+  facet_grid(metric ~ r_label, scales = "free_y") +
+  labs(title = "Steady-state outcomes vs. N", x = "N", y = NULL)
+```
+
+## Decision: N
+
+```{r p2-decision}
+kable(stability_table(n_steady, "N") |> filter(!is.na(delta)) |>
+        mutate(across(where(is.numeric), \(x) round(x, 4))),
+      caption = "Step-to-step change vs. SEM-based tolerance, per metric x r-setting")
+
+# ══════════════════════════════════════════════════════════════
+# CONFIRM N: `stable` must hold from N=1000 onward for all metric x
+# r_label combinations. If not, move up to the next N for which it does.
+# ══════════════════════════════════════════════════════════════
+CHOSEN_N <- 1000L
+```
+
+**Chosen: N = `r CHOSEN_N`, K = `r CHOSEN_K`.**

@@ -225,18 +225,18 @@ R_SAT_FINAL <- tibble(
 ```
 
 ```{r p1-carryover-list, results = "asis"}
-cat(sprintf("- **N = %d** lay agents (n_per_community = %d, n_communities = 1)\n", N_BASE, N_BASE))
+cat(sprintf("- **N = %d** lay agents (`n_per_community` = %d, `n_communities` = 1)\n", N_BASE, N_BASE))
 cat(sprintf("- **Network**: Watts-Strogatz small-world, node degree k = %d, rewiring p = 0.05\n", CHOSEN_K_FINAL))
-cat(sprintf("- **T = %d** rounds, of which **n_v = %d** are voting rounds (Delta t = %.0f, Sec. 1.4.1 trust update)\n",
+cat(sprintf("- **T = %d** rounds, of which **`n_v` = %d** are voting rounds (Delta t = %.0f, Sec. 1.4.1 trust update)\n",
             CHOSEN_T_FINAL, CHOSEN_NV_FINAL, CHOSEN_T_FINAL / CHOSEN_NV_FINAL))
 cat(sprintf("- **lambda = %.3f** (trust-relaxation adaptation rate, derived from a 50%% forget rate over 5 voting rounds)\n", LAMBDA_CONTEXT))
-cat("- **c = 0.5** (self_reliance_c, Mobius self-vote curve)\n")
-cat(sprintf("- **r_op / r_pw / r_tr ceilings (100%% of saturated effect) = %.0f / %.0f / %.0f** -- see the full pct table below\n",
+cat("- **c = 0.5** (`self_reliance_c`, Mobius self-vote curve)\n")
+cat(sprintf("- **`r_op` / `r_pw` / `r_tr` ceilings (100%% of saturated effect) = %.0f / %.0f / %.0f** -- see the full pct table below\n",
             R_SAT_FINAL$r_sat[1], R_SAT_FINAL$r_sat[2], R_SAT_FINAL$r_sat[3]))
 ```
 
 ```{r p1-carryover-pct-table}
-kable(PCT_TABLE_P1, caption = "Calibrated r_op/r_pw/r_tr values from Part 1")
+kable(PCT_TABLE_P1, caption = "Calibrated `r_op`/`r_pw`/`r_tr` values from Part 1")
 ```
 
 All carried over unchanged from Part 1 -- adding the
@@ -361,7 +361,7 @@ observed range (max-min across all r_val).
 ```{r p3-rig-diag-table}
 diag_rig <- build_diag_table_rig(rig_summary)
 kable(round_diag_table_p2(diag_rig), col.names = diag_col_names_p2(diag_rig),
-      caption = "r_ig, isolated sweep -- read off by eye where the slowest metric stops changing further")
+      caption = "`r_ig`, isolated sweep -- read off by eye where the slowest metric stops changing further")
 ```
 
 ```{r p3-rig-anchor}
@@ -494,7 +494,7 @@ homophily_summary <- homophily_raw |>
                     ~mean(.x, na.rm = TRUE)), .groups = "drop")
 
 kable(homophily_summary |> mutate(across(where(is.numeric), ~round(.x, 3))),
-      caption = "Effect of target_homophily x r_op=r_pw=r_tr=r_ig background level on realised assortativity, delegation rate, RR_m, and CDR, per condition")
+      caption = "Effect of `target_homophily` x `r_op`=`r_pw`=`r_tr`=`r_ig` background level on realised assortativity, delegation rate, `RR_m`, and CDR, per condition")
 ```
 
 ```{r p4-homophily-plot, fig.height=16}
@@ -649,7 +649,7 @@ share_summary <- share_raw |>
                     ~mean(.x, na.rm = TRUE)), .groups = "drop")
 
 kable(share_summary |> mutate(across(where(is.numeric), ~round(.x, 3))),
-      caption = "Effect of minority_share (15/20/25/30/35/40%) at fixed r_ig levels (0/33/66/100% of its saturated effect, Sec. 2; r_op=r_pw=r_tr=0) on delegation rate, lost-vote rate, RR_m, and CDR")
+      caption = "Effect of `minority_share` (15/20/25/30/35/40%) at fixed `r_ig` levels (0/33/66/100% of its saturated effect, Sec. 2; `r_op`=`r_pw`=`r_tr`=0) on delegation rate, lost-vote rate, `RR_m`, and CDR")
 ```
 
 ```{r p6-share-plot, fig.height=16}
@@ -724,7 +724,7 @@ share_bg_summary <- share_bg_raw |>
                     ~mean(.x, na.rm = TRUE)), .groups = "drop")
 
 kable(share_bg_summary |> mutate(across(where(is.numeric), ~round(.x, 3))),
-      caption = "Effect of minority_share (15/20/25/30/35/40%) at fixed r_op=r_pw=r_tr=r_ig background levels (0/33/66/100% of each dimension's own saturated effect, Sec. 1/2) on delegation rate, lost-vote rate, RR_m, and CDR")
+      caption = "Effect of `minority_share` (15/20/25/30/35/40%) at fixed `r_op`=`r_pw`=`r_tr`=`r_ig` background levels (0/33/66/100% of each dimension's own saturated effect, Sec. 1/2) on delegation rate, lost-vote rate, `RR_m`, and CDR")
 ```
 
 ```{r p6-share-bg-plot, fig.height=16}
@@ -746,7 +746,7 @@ build_share_group_plot_data(share_bg_raw, share_bg_summary, "r_bg_pct") |>
 
 ```{r p6-share-note, results = "asis"}
 cat(sprintf(
-  "At N=%d and minority share %.0f%%, a run has ~%d minority agents -- comfortably above the point where per-run minority-side metrics ($RR$, chain length/drift for the minority group) would be dominated by small-sample noise. The sweep above shows delegation rate, lost-vote rate, $RR_m$, and CDR behaving sensibly (no discontinuity or breakdown) across the full 15--40%% range and across all four r_ig levels, so **%.0f%%** is kept as the fixed default used throughout Sec. 2/3.\n",
+  "At N=%d and minority share %.0f%%, a run has ~%d minority agents -- comfortably above the point where per-run minority-side metrics ($RR$, chain length/drift for the minority group) would be dominated by small-sample noise. The sweep above shows delegation rate, lost-vote rate, $RR_m$, and CDR behaving sensibly (no discontinuity or breakdown) across the full 15--40%% range and across all four `r_ig` levels, so **%.0f%%** is kept as the fixed default used throughout Sec. 2/3.\n",
   N_BASE, MINORITY_SHARE * 100, round(N_BASE * MINORITY_SHARE), MINORITY_SHARE * 100
 ))
 ```
@@ -759,12 +759,12 @@ cat(sprintf(
   MINORITY_SHARE * 100
 ))
 cat(sprintf(
-  "- **target_homophily = %.2f** -- highest of the tested levels (Sec. 3) still producing a meaningful, clearly separated network structure without collapsing CDR to ~0.\n",
+  "- **`target_homophily` = %.2f** -- highest of the tested levels (Sec. 3) still producing a meaningful, clearly separated network structure without collapsing CDR to ~0.\n",
   CHOSEN_TARGET_HOMOPHILY
 ))
 cat(sprintf(
-  "- **r_ig ceiling = %.2f** -- read off on the %s curve (Sec. 2), isolated sweep with r_op=r_pw=r_tr=0.\n",
+  "- **`r_ig` ceiling = %.2f** -- read off on the %s curve (Sec. 2), isolated sweep with `r_op`=`r_pw`=`r_tr`=0.\n",
   R_SAT_ANCHOR_RIG$r_sat, as.character(R_SAT_ANCHOR_RIG$r_sat_metric)
 ))
-cat("- **K, T, n_v, Δt, λ, c** -- carried over unchanged from Report_22 Sec. 6 (see Sec. 1).\n")
+cat("- **K, T, `n_v`, Δt, λ, c** -- carried over unchanged from `Report_22` Sec. 6 (see Sec. 1).\n")
 ```

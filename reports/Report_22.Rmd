@@ -414,11 +414,11 @@ separate step-to-step-delta section).
 diag_bootstrap <- build_diag_tables(bootstrap_r_res$r3_isolated_summary)
 
 kable(round_diag_table(diag_bootstrap$op), col.names = diag_col_names(diag_bootstrap$op),
-      caption = "r_op, bootstrap r-sweep -- read off by eye where the slowest metric stops changing further; use this to set R_SAT_ANCHOR_BOOTSTRAP below")
+      caption = "`r_op`, bootstrap r-sweep -- read off by eye where the slowest metric stops changing further; use this to set `R_SAT_ANCHOR_BOOTSTRAP` below")
 kable(round_diag_table(diag_bootstrap$pw), col.names = diag_col_names(diag_bootstrap$pw),
-      caption = "r_pw, bootstrap r-sweep")
+      caption = "`r_pw`, bootstrap r-sweep")
 kable(round_diag_table(diag_bootstrap$tr), col.names = diag_col_names(diag_bootstrap$tr),
-      caption = "r_tr, bootstrap r-sweep")
+      caption = "`r_tr`, bootstrap r-sweep")
 ```
 
 ```{r p2-sat-anchor-manual}
@@ -443,7 +443,7 @@ pct_ref_table <- tibble(pct = seq(0, 100, by = 10)) |>
   )
 
 kable(pct_ref_table |> mutate(across(starts_with("r_"), ~round(.x, 2))),
-      caption = "r needed to reach a given % of each dimension's own saturated effect (bootstrap r-sweep) -- percentages are of the anchor metric's own value range (R_SAT_ANCHOR_BOOTSTRAP), not a linear split of r")
+      caption = "r needed to reach a given % of each dimension's own saturated effect (bootstrap r-sweep) -- percentages are of the anchor metric's own value range (`R_SAT_ANCHOR_BOOTSTRAP`), not a linear split of r")
 ```
 
 ```{r p2-pct-triples}
@@ -921,11 +921,11 @@ observed range (max-min across all r_val), not an absolute difference.
 diag_final <- build_diag_tables(r3_isolated_summary)
 
 kable(round_diag_table(diag_final$op), col.names = diag_col_names(diag_final$op),
-      caption = "r_op, final K/T config -- read off by eye where the slowest metric stops changing further; use this to set R_SAT_ANCHOR_FINAL below")
+      caption = "`r_op`, final K/T config -- read off by eye where the slowest metric stops changing further; use this to set `R_SAT_ANCHOR_FINAL` below")
 kable(round_diag_table(diag_final$pw), col.names = diag_col_names(diag_final$pw),
-      caption = "r_pw, final K/T config")
+      caption = "`r_pw`, final K/T config")
 kable(round_diag_table(diag_final$tr), col.names = diag_col_names(diag_final$tr),
-      caption = "r_tr, final K/T config")
+      caption = "`r_tr`, final K/T config")
 ```
 
 ```{r p3-sat-anchor-manual}
@@ -1029,7 +1029,7 @@ cat(sprintf(
   CHOSEN_T_FINAL, CHOSEN_NV_FINAL, CHOSEN_DT_FINAL
 ))
 cat(sprintf(
-  "- **r ceilings** -- r_op=%.2f, r_pw=%.2f, r_tr=%.2f -- r_sat read off by eye from the Sec 4.2 diagnostic table (R_SAT_ANCHOR_FINAL), the r_val at which each dimension's own slowest-to-settle tracked metric stops changing further.\n",
+  "- **r ceilings** -- `r_op`=%.2f, `r_pw`=%.2f, `r_tr`=%.2f -- `r_sat` read off by eye from the Sec 4.2 diagnostic table (`R_SAT_ANCHOR_FINAL`), the `r_val` at which each dimension's own slowest-to-settle tracked metric stops changing further.\n",
   r_sat_manual_final("op"), r_sat_manual_final("pw"), r_sat_manual_final("tr")
 ))
 ```
@@ -1302,7 +1302,7 @@ c_sweep_summary |>
 # 10. Watts-Strogatz vs. Barabasi-Albert
 
 Fixing N=`r N_BASE`, K=`r CHOSEN_K_FINAL`, T=`r CHOSEN_T_FINAL`, nv=`r CHOSEN_NV_FINAL`
-(the calibrated values from Sec. 6, not Report_20's anchor N=1000/K=16): does
+(the calibrated values from Sec. 6, not `Report_20`'s anchor N=1000/K=16): does
 the network generator itself matter? WS (small-world, the default used
 everywhere else in this report) vs. BA (Barabasi-Albert preferential
 attachment -- hub-like degree heterogeneity that WS cannot produce). Everything
@@ -1486,7 +1486,7 @@ timing_log_df <- bind_rows(TIMING_LOG) |>
          minutes = round(seconds / 60, 1)) |>
   select(Sweep = description, Status = status, Seeds = seeds, Runs = n_rows, Seconds = seconds, Minutes = minutes)
 
-kable(timing_log_df, caption = "Actual measured wall-clock time per sweep this knit -- 'cached' rows took 0s because they were reused from a previous run's saved .rds, not recomputed. Seeds = seeds per grid cell; Runs = total simulate_liquid_democracy() calls (grid cells x seeds) that sweep represents, whether cached or freshly computed this knit")
+kable(timing_log_df, caption = "Actual measured wall-clock time per sweep this knit -- 'cached' rows took 0s because they were reused from a previous run's saved .rds, not recomputed. Seeds = seeds per grid cell; Runs = total `simulate_liquid_democracy()` calls (grid cells x seeds) that sweep represents, whether cached or freshly computed this knit")
 ```
 
 ```{r p12-timing-total, results = "asis"}

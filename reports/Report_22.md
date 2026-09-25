@@ -382,21 +382,21 @@ three possible pairings are covered:
 # 11. Actual runtime
 
 Runtime for a single simulation at the final calibrated config (K=60,
-T=80, nv=40, N=1000): **2.92 seconds**.
+T=80, nv=40, N=1000): **3.04 seconds**.
 
 | Sweep | Status | Seeds | Runs | Seconds | Minutes |
 |:---|:---|---:|---:|---:|---:|
-| r-sweep bootstrap, coarse grid (K=40, T=30, nv=10) | computed | 25 | 7375 | 1038.895 | 17.3 |
-| K-sweep (K=30-140, T=80, nv=40, 26 r-triples x 3 tolerances) | computed | 10 | 9360 | 15202.122 | 253.4 |
-| T/nv sweep (K=60, nv up to 60, dt up to 10) | computed | 15 | 2475 | 3261.911 | 54.4 |
-| T/nv sweep (K=60, nv up to 60, dt up to 10) | computed | 15 | 2475 | 4108.977 | 68.5 |
-| r-sweep at chosen K, coarse grid (K=60, T=80, nv=40) | computed | 25 | 7375 | 1565.295 | 26.1 |
-| K-sweep (K=30-140, T=80, nv=40, 26 r-triples x 3 tolerances) | cached | 10 | 9360 | 0.000 | 0.0 |
-| r-sweep at chosen K, coarse grid (K=60, T=80, nv=40) | cached | 25 | 7375 | 0.000 | 0.0 |
-| N sensitivity (K=60, T=80, nv=40, N up to 12000) | computed | 10 | 120 | 3871.930 | 64.5 |
-| dt x lambda (K=60, nv up to 60, dt up to 10) | computed | 10 | 1650 | 2659.821 | 44.3 |
-| Self-reliance c (K=60, T=80, nv=40) | computed | 25 | 825 | 2481.409 | 41.4 |
-| WS vs BA (K=60, T=80, nv=40) | computed | 25 | 4500 | 4485.842 | 74.8 |
+| r-sweep bootstrap, coarse grid (K=40, T=30, nv=10) | cached | 25 | 7375 | 0 | 0 |
+| K-sweep (K=30-140, T=80, nv=40, 26 r-triples x 3 tolerances) | cached | 10 | 9360 | 0 | 0 |
+| T/nv sweep (K=60, nv up to 60, dt up to 10) | cached | 15 | 2475 | 0 | 0 |
+| T/nv sweep (K=60, nv up to 60, dt up to 10) | cached | 15 | 2475 | 0 | 0 |
+| r-sweep at chosen K, coarse grid (K=60, T=80, nv=40) | cached | 25 | 7375 | 0 | 0 |
+| K-sweep (K=30-140, T=80, nv=40, 26 r-triples x 3 tolerances) | cached | 10 | 9360 | 0 | 0 |
+| r-sweep at chosen K, coarse grid (K=60, T=80, nv=40) | cached | 25 | 7375 | 0 | 0 |
+| N sensitivity (K=60, T=80, nv=40, N up to 12000) | cached | 10 | 120 | 0 | 0 |
+| dt x lambda (K=60, nv up to 60, dt up to 10) | cached | 10 | 1650 | 0 | 0 |
+| Self-reliance c (K=60, T=80, nv=40) | cached | 25 | 825 | 0 | 0 |
+| WS vs BA (K=60, T=80, nv=40) | cached | 25 | 4500 | 0 | 0 |
 
 Actual measured wall-clock time per sweep this knit – ‘cached’ rows took
 0s because they were reused from a previous run’s saved .rds, not
@@ -405,7 +405,7 @@ simulate_liquid_democracy() calls (grid cells x seeds) that sweep
 represents, whether cached or freshly computed this knit
 
 **Total actual compute time this knit (sum of everything freshly
-computed, excluding cache hits): 644.6 minutes (10.74 hours).**
+computed, excluding cache hits): 0.0 minutes (0.00 hours).**
 
 # 12. RQ1-3: Effect of Responsiveness on Liquid Democracy Outcomes
 

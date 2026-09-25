@@ -146,6 +146,87 @@ date: "2026-05-24"
 - H4d: Increasing resp. to trust has a reducing influence of the effect of resp. to opinion and power.
 
 ---
+# 1 Core Network Dynamics
+
+This part investigates how the responsiveness parameters influence the
+emergence of delegation structures, representation quality, and power
+concentration in the proposed model of liquid democracy.
+
+## Objective 1: Saturation of Responsiveness Effects
+
+**Expected effects**
+
+- Increasing opinion responsiveness (r_op) leads to a non-linear relationship
+  with delegation network metrics that saturates at high responsiveness.
+
+- Increasing power responsiveness (r_pw) leads to a non-linear relationship
+  with delegation network metrics that saturates at high responsiveness.
+
+- Joint increases in opinion and power responsiveness (r_op = r_pw) produce
+  a non-linear saturation effect.
+
+- Increasing trust sensitivity (γ) leads to a non-linear saturation of the
+  delegation network metrics.
+
+---
+
+## Objective 2: Ideological Drift
+
+**Expected effects**
+
+- Increasing opinion responsiveness increases the average ideological drift.
+
+- Increasing power responsiveness increases the average ideological drift.
+
+- Joint increases in opinion and power responsiveness further increase the
+  average ideological drift.
+
+- Increasing trust sensitivity reduces the influence of opinion and power
+  responsiveness on ideological drift.
+
+---
+
+## Objective 3: Power Concentration
+
+**Outcome measure**
+
+- Top 5% power share.
+
+**Expected effects**
+
+- Increasing opinion responsiveness increases the top 5% power share.
+
+- Increasing power responsiveness increases the top 5% power share.
+
+- Joint increases in opinion and power responsiveness increase the top 5%
+  power share.
+
+- Increasing trust sensitivity weakens the influence of opinion and power
+  responsiveness on power concentration.
+
+---
+
+## Objective 4: Concentration of Voting Power
+
+**Outcome measure**
+
+- Share of agents required to accumulate 50% of the total voting power.
+
+**Expected effects**
+
+- Increasing opinion responsiveness decreases the share of agents required
+  to accumulate 50% of the voting power.
+
+- Increasing power responsiveness decreases the share of agents required
+  to accumulate 50% of the voting power.
+
+- Joint increases in opinion and power responsiveness further decrease the
+  required share.
+
+- Increasing trust sensitivity weakens the influence of opinion and power
+  responsiveness on the concentration of voting power.
+
+---
 
 ```{r run-one, include=FALSE}
 run_one <- function(seed, r_op, r_pw, gamma, lambda = 0) {
