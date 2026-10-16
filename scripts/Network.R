@@ -651,6 +651,14 @@ shuffle_group_homophily <- function(agents, gF,
     use_maj <- if (length(boundary$maj)) boundary$maj else maj_pos
     i  <- use_min[sample.int(length(use_min), 1L)]
     j  <- use_maj[sample.int(length(use_maj), 1L)]
+    # Guard against stale boundary entries: between refreshes a position can
+    # have changed group via an earlier accepted swap. Without this check a
+    # stale pick swapped two same-group agents (delta_E = 0, always accepted)
+    # and corrupted min_pos/maj_pos, gradually dropping minority positions
+    # from the pools until the walk froze -- the cause of realised
+    # assortativity plateauing at the same value (~0.37) for every target
+    # above it (Report 23 Sec 3, cache v7).
+    if (grp[i] != "minority" || grp[j] != "majority") next
     mi <- min_idx_of[i]
     mj <- maj_idx_of[j]
 
@@ -673,6 +681,12 @@ shuffle_group_homophily <- function(agents, gF,
       maj_pos[mj] <- i
       min_idx_of[j] <- mi
       maj_idx_of[i] <- mj
+      min_idx_of[i] <- 0L
+      maj_idx_of[j] <- 0L
+      # Keep the boundary pools consistent with the swap right away (i/j
+      # changed group) instead of waiting for the next BOUNDARY_REFRESH.
+      boundary$min <- c(boundary$min[boundary$min != i], j)
+      boundary$maj <- c(boundary$maj[boundary$maj != j], i)
     }
   }
 

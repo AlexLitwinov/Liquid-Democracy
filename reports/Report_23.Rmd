@@ -51,9 +51,6 @@ metric_labels_part2 <- c(
   RR_m                 = "RR (minority relative representation)",
   cross_group_dlg_rate = "Cross-group delegation rate (CDR)"
 )
-METRIC_ABBR_P2 <- setNames(c("DR", "DS", "LV", "CL", "T5", "V50", "RR", "CDR"),
-                           unname(metric_labels_part2[metrics_part2]))
-
 RATE_METRICS_01_P2 <- c("Delegation stability", "Delegation rate", "Lost-vote rate",
                          "Top-5% voting-power share", "Voters for 50% power",
                          "Cross-group delegation rate (CDR)")
@@ -100,43 +97,17 @@ pct_to_r_from_anchor_rig <- function(pct, curve, r_sat, r_sat_metric) {
   approx(sub_by_val$mean_val, sub_by_val$r_val, xout = target_val, rule = 2)$y
 }
 
-# Compact diagnostic table for the by-eye read-off: one row per r_val, one
-# value + one step-to-step delta column per metric (abbreviated headers),
-# same convention as Report_22.Rmd's build_diag_tables().
-build_diag_table_rig <- function(summary_df) {
-  df <- summary_df |>
-    mutate(abbr = METRIC_ABBR_P2[as.character(metric)]) |>
-    arrange(abbr, r_val) |>
-    group_by(abbr) |>
-    # Delta as % of the metric's OWN observed range (max-min across r_val),
-    # not an absolute difference -- see Report_22.Rmd's build_diag_tables()
-    # for why (an absolute delta means very different things for metrics on
-    # different scales, e.g. CDR near 0 vs. chain length around 2).
-    mutate(rng   = diff(range(mean_val, na.rm = TRUE)),
-           delta = if_else(rng > 0, (mean_val - lag(mean_val)) / rng * 100, NA_real_)) |>
-    ungroup()
-  r_vals <- sort(unique(df$r_val))
-  out <- tibble(r_val = r_vals)
-  for (a in unname(METRIC_ABBR_P2)) {
-    sub <- df |> filter(abbr == a) |> arrange(r_val)
-    out[[a]]               <- sub$mean_val[match(r_vals, sub$r_val)]
-    out[[paste0(a, "_d")]] <- sub$delta[match(r_vals, sub$r_val)]
-  }
-  out
-}
+# Seeds per grid cell for every sweep in this report (exploratory run).
+N_SEEDS <- 100L
 
-METRIC_DISPLAY_P2 <- c(DR = "Del. Rate", DS = "Del. Stab.", LV = "Lost Votes",
-                       CL = "Chain Len.", T5 = "Top 5%", V50 = "Voters 50%",
-                       RR = "RR_m", CDR = "CDR")
-diag_col_names_p2 <- function(tbl) {
-  nm <- names(tbl)[-1]
-  disp <- vapply(nm, function(n) if (grepl("_d$", n)) "Delta %" else unname(METRIC_DISPLAY_P2[n]), character(1))
-  c("r_val", disp)
-}
-round_diag_table_p2 <- function(tbl) {
-  tbl |>
-    mutate(across(-c(r_val, ends_with("_d")), ~round(.x, 4)),
-           across(ends_with("_d"), ~round(.x, 1)))
+# Run-parameter line shown above every plot, so each plot states which
+# setup it comes from. Evaluated at call time (constants from Sec. 1).
+plot_info <- function(extra = NULL, minority_share = MINORITY_SHARE) {
+  base <- sprintf("N=%d, K=%d, T=%d, n_v=%d, p_rewire=0.05, minority share=%s, %d seeds per point",
+                  N_BASE, CHOSEN_K_FINAL, CHOSEN_T_FINAL, CHOSEN_NV_FINAL,
+                  if (is.null(minority_share)) "swept" else sprintf("%.0f%%", minority_share * 100),
+                  N_SEEDS)
+  if (is.null(extra)) base else paste0(base, "\n", extra)
 }
 
 N_BASE <- 1000L
@@ -231,12 +202,8 @@ cat(sprintf("- **T = %d** rounds, of which **`n_v` = %d** are voting rounds (Del
             CHOSEN_T_FINAL, CHOSEN_NV_FINAL, CHOSEN_T_FINAL / CHOSEN_NV_FINAL))
 cat(sprintf("- **lambda = %.3f** (trust-relaxation adaptation rate, derived from a 50%% forget rate over 5 voting rounds)\n", LAMBDA_CONTEXT))
 cat("- **c = 0.5** (`self_reliance_c`, Mobius self-vote curve)\n")
-cat(sprintf("- **`r_op` / `r_pw` / `r_tr` ceilings (100%% of saturated effect) = %.0f / %.0f / %.0f** -- see the full pct table below\n",
+cat(sprintf("- **`r_op` / `r_pw` / `r_tr` ceilings (100%% of saturated effect) = %.0f / %.0f / %.0f** (full pct table in `Report_22` Sec. 6)\n",
             R_SAT_FINAL$r_sat[1], R_SAT_FINAL$r_sat[2], R_SAT_FINAL$r_sat[3]))
-```
-
-```{r p1-carryover-pct-table}
-kable(PCT_TABLE_P1, caption = "Calibrated `r_op`/`r_pw`/`r_tr` values from Part 1")
 ```
 
 All carried over unchanged from Part 1 -- adding the
@@ -251,7 +218,7 @@ to $r_{ig}$ alone.
 
 ```{r p3-rig-config}
 R_IG_MAX    <- c(0, 2^(0:15))
-N_SEEDS_RIG <- 25L
+N_SEEDS_RIG <- N_SEEDS
 ```
 
 ```{r p3-rig-fn}
@@ -296,7 +263,7 @@ grid_rig <- tidyr::crossing(r_val = R_IG_MAX, seed = seq_len(N_SEEDS_RIG))
 rig_raw <- run_cached("r23_rig_isolated_bg0", function() {
   plan(multisession, workers = N_WORKERS)
   out <- future_pmap_dfr(grid_rig, function(r_val, seed) r_ig_cell(seed, r_val),
-                          .options = furrr_options(seed = NULL))
+                          .options = furrr_options(seed = NULL, packages = c("igraph", "dplyr", "tibble")))
   plan(sequential)
   out
 }, list(grid_rig, CHOSEN_K_FINAL, CHOSEN_T_FINAL, CHOSEN_NV_FINAL, MINORITY_SHARE, v = 2))
@@ -348,24 +315,14 @@ rig_plot_data |>
   scale_x_continuous(trans = "log1p", breaks = c(0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768)) +
   facet_wrap(~metric, scales = "free_y", ncol = 2) +
   labs(title = "Isolated r_ig sweep (random condition, r_op=r_pw=r_tr=0)",
-       subtitle = sprintf("K=%d, T=%d, nv=%d, N=%d, %d seed(s) per point; x on log1p scale. Black = pooled mean; blue/red = minority/majority-only, where a group-restricted metric exists",
-                           CHOSEN_K_FINAL, CHOSEN_T_FINAL, CHOSEN_NV_FINAL, N_BASE, N_SEEDS_RIG),
+       subtitle = plot_info("x on log1p scale. Black = pooled mean; blue/red = minority/majority-only, where a group-restricted metric exists"),
        x = "r_ig (log1p scale)", y = NULL, colour = NULL) +
   theme(legend.position = "top") +
   FACET_SPACING
 ```
 
-"Delta %" columns = step-to-step change as a % of that metric's own
-observed range (max-min across all r_val).
-
-```{r p3-rig-diag-table}
-diag_rig <- build_diag_table_rig(rig_summary)
-kable(round_diag_table_p2(diag_rig), col.names = diag_col_names_p2(diag_rig),
-      caption = "`r_ig`, isolated sweep -- read off by eye where the slowest metric stops changing further")
-```
-
 ```{r p3-rig-anchor}
-# Eyeballed from the plot/table above, same "eyeball, then hardcode" pattern
+# Eyeballed from the plot above, same "eyeball, then hardcode" pattern
 # as Report_22.Rmd's R_SAT_ANCHOR_BOOTSTRAP/R_SAT_ANCHOR_FINAL. "Delegation
 # rate" doesn't work as the anchor metric here -- it comes out completely
 # flat across the whole r_ig range at r_op=r_pw=r_tr=0 (confirmed on a live
@@ -400,30 +357,46 @@ r_from_pct_shared <- function(pct) {
 }
 ```
 
-RQ4/RQ5 use $r_{ig} \in \{0, 33, 66, 100\}$% throughout, translated via this
-table -- the same convention as Part I's $r_{op}/r_{pw}/r_{tr}$.
+RQ4/RQ5 use $r_{ig} \in \{0, 33, 66, 100\}$% throughout, translated via the
+table below -- the same convention as Part I's $r_{op}/r_{pw}/r_{tr}$.
+
+```{r p3-rig-pct-kable}
+kable(pct_ref_table_rig |> mutate(r_ig = round(r_ig, 3)),
+      col.names = c("% of saturated effect", "r_ig"),
+      caption = "r_ig needed to reach a given % of its own saturated effect")
+```
 
 # 3. Homophily effects
 
-```{r p4-conditions-table}
-conditions_tbl <- tribble(
-  ~Condition,                 ~opinion_dist, ~minority_opinion_mu, ~target_homophily,
-  "random",                   "n/a",         "NULL (unclustered)", "NULL",
-  "polarised",                "uniform",     sprintf("non-NULL, min in [0,%.1f)", POLARISED_SPLIT), "NULL",
-  "homophilic",               "uniform",     sprintf("non-NULL, min in [0,%.1f)", POLARISED_SPLIT), "calibrated below",
-  "non-polarised-homophily",  "n/a",         "NULL (unclustered)", "calibrated below (same value)"
-)
-kable(conditions_tbl, caption = "Parameter mapping for the four Part II conditions")
-```
+Part II conditions:
 
-Descriptive only -- no search/iteration here, just the effect of increasing
-$\text{target\_homophily}$ on the metrics that matter for RQ4/RQ5, at three
-levels spanning weak to (attempted) very strong clustering.
+- **random** -- opinions uniform, independent of group; no homophily shuffle.
+- **polarised** -- minority opinions ~ U[0, `r POLARISED_SPLIT`), majority ~ U[`r POLARISED_SPLIT`, 1); no homophily shuffle.
+- **homophilic** -- polarised opinions + group-homophily shuffle at `target_homophily`.
+- **non-polarised-homophily** -- random opinions + group-homophily shuffle at the same `target_homophily`.
+
+Both homophily conditions cluster by **group label** (`homophily_target = "group"`),
+and realised assortativity below is measured on the group label as well.
+
+**Maximum achievable homophily.** On the fixed network (Watts-Strogatz ring,
+K = `r CHOSEN_K_FINAL`, 5% rewired edges) group assortativity has a
+structural ceiling -- the minority can at best form one contiguous block, whose
+boundary and the randomly rewired edges always stay partly cross-group. The
+level **max** therefore sets `target_homophily = 1` (unreachable), so the
+shuffle uses its full step budget and the realised assortativity is the
+empirical maximum for this network. It is compared against fixed targets
+0.3 / 0.4 / 0.5 / 0.6.
 
 ```{r p4-homophily-config}
-HOMOPHILY_LEVELS  <- c(0.3, 0.7, 0.9)
-N_SEEDS_HOMOPHILY <- 25L
-R_BG_PCT_LEVELS   <- c(0, 33, 66, 100)   # r_op=r_pw=r_tr=r_ig background, % of each dimension's own saturated effect (Sec. 1/2)
+HOMOPHILY_MAX_TARGET <- 1   # unreachable -> full shuffle budget -> empirical maximum
+HOMOPHILY_LEVELS     <- c(0.3, 0.4, 0.5, 0.6, HOMOPHILY_MAX_TARGET)
+N_SEEDS_HOMOPHILY    <- N_SEEDS
+R_BG_PCT_LEVELS      <- c(0, 33, 66, 100)   # r_op=r_pw=r_tr=r_ig background, % of each dimension's own saturated effect (Sec. 1/2)
+
+homophily_level_label <- function(target_h) {
+  factor(if_else(target_h == HOMOPHILY_MAX_TARGET, "max", sprintf("%.1f", target_h)),
+         levels = c(sprintf("%.1f", setdiff(HOMOPHILY_LEVELS, HOMOPHILY_MAX_TARGET)), "max"))
+}
 ```
 
 ```{r p4-homophily-fn}
@@ -438,9 +411,9 @@ homophily_diag_cell <- function(seed, target_h, condition, r_bg_pct) {
   args$r_ingroup <- r_bg$r_ig
   args$snap_rounds <- window
   res <- do.call(simulate_liquid_democracy, args)
-  gU  <- as_undirected(res$friendship_graph, mode = "collapse")
+  gU  <- igraph::as_undirected(res$friendship_graph, mode = "collapse")
   g   <- res$agents$group
-  assort <- tryCatch(assortativity(gU, (g == "minority") + 0), error = function(e) NA_real_)
+  assort <- tryCatch(igraph::assortativity(gU, (g == "minority") + 0), error = function(e) NA_real_)
   snap_idx <- match(window, res$snapshots$round)
   tibble(
     seed = seed, condition = condition, target_homophily = target_h, r_bg_pct = r_bg_pct,
@@ -462,74 +435,66 @@ homophily_raw <- run_cached("r23_homophily_effects", function() {
   plan(multisession, workers = N_WORKERS)
   out <- future_pmap_dfr(grid_homophily, function(target_h, condition, r_bg_pct, seed)
     homophily_diag_cell(seed, target_h, condition, r_bg_pct),
-    .options = furrr_options(seed = NULL))
+    .options = furrr_options(seed = NULL, packages = c("igraph", "dplyr", "tibble")))
   plan(sequential)
   out
-}, list(grid_homophily, CHOSEN_K_FINAL, CHOSEN_T_FINAL, CHOSEN_NV_FINAL, MINORITY_SHARE, PCT_TABLE_P1, R_SAT_ANCHOR_RIG, v = 7))
-# v = 2: "homophilic" now reshuffles via homophily_target = "group" instead
-# of "opinion" (see build_condition_args()).
-# v = 3: shuffle_group_homophily() now proposes cross-group-only swaps
-# (Network.R) instead of uniform-random pairs -- realised assortativity was
-# plateauing around 0.7-0.75 even at target_homophily = 0.9 because ~68% of
-# proposals under uniform sampling were same-group no-ops at a 20/80 split.
-# v = 4: added the r_op=r_pw=r_tr background dimension (r_bg_pct) and
-# renamed "structural-homophily-only" -> "non-polarised-homophily"; grid
-# shape/condition values already changed (both are part of hash_obj), this
-# bump is just for a human reading the cache name to see why it changed.
-# v = 5: shuffle_group_homophily() now anneals its temperature (Network.R) --
-# realised assortativity was still plateauing around 0.73 at target 0.9
-# (barely above target 0.7's 0.688), consistent with getting stuck across
-# several fragmented minority clusters at a fixed temperature.
-# v = 6: N_SEEDS_HOMOPHILY raised 5 -> 25.
-# v = 7: shuffle_group_homophily() now uses boundary-biased sampling
-# (Network.R) -- only proposes swaps between nodes that currently have
-# >=1 cross-group neighbour, since a node whose neighbours all already
-# match its own group can never be improved by swapping it.
-# v = 6: r_bg_pct now ALSO sets r_ig (via r_from_pct_shared()), not just
-# r_op/r_pw/r_tr -- "r=r=r=r" was meant to include r_ig from the start.
+}, list(grid_homophily, CHOSEN_K_FINAL, CHOSEN_T_FINAL, CHOSEN_NV_FINAL, MINORITY_SHARE, PCT_TABLE_P1, R_SAT_ANCHOR_RIG, v = 9))
+# v = 9: levels 0.3/0.4/0.5/0.6 + "max" (target 1 = full shuffle budget).
+# v = 8: bug fix in shuffle_group_homophily() (Network.R) -- stale boundary
+# entries let same-group swaps through and corrupted the position pools,
+# freezing the walk at ~0.37 for every target >= 0.7 (identical values at
+# 0.7 and 0.9). Structural ceiling at K=60, p_rewire=0.05, 20% minority is
+# ~0.85 (minority as one contiguous ring block), so 0.9 is not reachable.
 
 homophily_summary <- homophily_raw |>
   group_by(condition, target_homophily, r_bg_pct) |>
   summarise(across(c(realised_assortativity, delegation_rate, RR_m, cross_group_dlg_rate),
-                    ~mean(.x, na.rm = TRUE)), .groups = "drop")
+                    ~mean(.x, na.rm = TRUE)), .groups = "drop") |>
+  mutate(level = homophily_level_label(target_homophily))
 
-kable(homophily_summary |> mutate(across(where(is.numeric), ~round(.x, 3))),
-      caption = "Effect of `target_homophily` x `r_op`=`r_pw`=`r_tr`=`r_ig` background level on realised assortativity, delegation rate, `RR_m`, and CDR, per condition")
+homophily_max <- homophily_raw |>
+  filter(target_homophily == HOMOPHILY_MAX_TARGET) |>
+  distinct(seed, realised_assortativity) |>
+  summarise(mean = mean(realised_assortativity, na.rm = TRUE),
+            min  = min(realised_assortativity, na.rm = TRUE),
+            max  = max(realised_assortativity, na.rm = TRUE))
 ```
+
+**Maximum achievable group assortativity: `r sprintf("%.3f", homophily_max$mean)`**
+(range `r sprintf("%.3f", homophily_max$min)`--`r sprintf("%.3f", homophily_max$max)` across `r N_SEEDS_HOMOPHILY` seeds).
 
 ```{r p4-homophily-plot, fig.height=16}
 homophily_summary |>
   pivot_longer(c(realised_assortativity, delegation_rate, RR_m, cross_group_dlg_rate),
                names_to = "metric", values_to = "value") |>
-  mutate(metric = recode(metric,
-                         realised_assortativity = "Realised assortativity",
-                         delegation_rate = "Delegation rate",
-                         RR_m = "RR_m", cross_group_dlg_rate = "CDR"),
+  mutate(metric = factor(recode(metric,
+                                realised_assortativity = "Realised assortativity",
+                                delegation_rate = "Delegation rate",
+                                RR_m = "RR_m", cross_group_dlg_rate = "CDR"),
+                         levels = c("Realised assortativity", "Delegation rate", "RR_m", "CDR")),
          r_bg_label = factor(sprintf("r_op=r_pw=r_tr=r_ig = %d%%", r_bg_pct),
                               levels = sprintf("r_op=r_pw=r_tr=r_ig = %d%%", R_BG_PCT_LEVELS))) |>
-  ggplot(aes(target_homophily, value, colour = condition)) +
+  ggplot(aes(level, value, colour = condition, group = condition)) +
   geom_line(linewidth = 0.8) + geom_point(size = 2) +
   scale_colour_viridis_d(end = 0.7) +
   facet_grid(rows = vars(metric), cols = vars(r_bg_label), scales = "free_y") +
-  labs(title = "Effect of target_homophily strength across r_op=r_pw=r_tr=r_ig background levels",
+  labs(title = "Effect of target_homophily (0.3-0.6 vs. maximum achievable) across r_op=r_pw=r_tr=r_ig background levels",
+       subtitle = plot_info(sprintf("max = target_homophily 1 (unreachable, full shuffle budget) -> realised assortativity %.3f on average",
+                                    homophily_max$mean)),
        x = "target_homophily", y = NULL) +
   theme(legend.position = "top") +
   FACET_SPACING
 ```
 
 ```{r p4-homophily-choice}
-# ANNAHME (placeholder, fill in by hand from the table/plot above): pick the
-# HIGHEST of HOMOPHILY_LEVELS whose realised assortativity actually still
-# approaches its target (Metropolis-Hastings reshuffling may plateau below
-# very high targets within homophily_steps -- see shuffle_*_homophily()'s
-# own console message if it doesn't converge) and whose CDR hasn't already
-# collapsed to ~0, which would leave no room for r_ig itself to show an
-# effect later. Read off at whichever r_bg_pct panel is most representative
-# of the actual RQ4/RQ5 background level.
-CHOSEN_TARGET_HOMOPHILY <- 0.9
+# ANNAHME (placeholder, confirm from the plot above): use the maximum
+# achievable homophily as the "homophilic" level for RQ4/RQ5, as long as CDR
+# hasn't collapsed to ~0 there (which would leave no room for r_ig itself to
+# show an effect later).
+CHOSEN_TARGET_HOMOPHILY <- HOMOPHILY_MAX_TARGET
 ```
 
-**Chosen: target_homophily = `r CHOSEN_TARGET_HOMOPHILY`.**
+**Chosen: target_homophily = max** (realised group assortativity ≈ `r sprintf("%.3f", homophily_max$mean)`).
 
 
 # 4. Minority share
@@ -547,7 +512,7 @@ default.
 ```{r p6-share-sweep-config}
 MINORITY_SHARE_LEVELS <- seq(0.15, 0.40, by = 0.05)
 R_IG_PCT_LEVELS_SHARE <- c(0, 33, 66, 100)
-N_SEEDS_SHARE         <- 25L
+N_SEEDS_SHARE         <- N_SEEDS
 
 R_IG_LEVELS_SHARE <- pct_to_r_from_anchor_rig(R_IG_PCT_LEVELS_SHARE, rig_summary,
                                               R_SAT_ANCHOR_RIG$r_sat, R_SAT_ANCHOR_RIG$r_sat_metric)
@@ -636,7 +601,7 @@ share_raw <- run_cached("r23_minority_share_sweep", function() {
   plan(multisession, workers = N_WORKERS)
   out <- future_pmap_dfr(grid_share, function(share_val, r_ig_pct, seed, r_ig_val)
     minority_share_cell(seed, share_val, r_ig_pct, r_ig_val),
-    .options = furrr_options(seed = NULL))
+    .options = furrr_options(seed = NULL, packages = c("igraph", "dplyr", "tibble")))
   plan(sequential)
   out
 }, list(grid_share, CHOSEN_K_FINAL, CHOSEN_T_FINAL, CHOSEN_NV_FINAL, R_SAT_ANCHOR_RIG, v = 2))
@@ -647,9 +612,6 @@ share_summary <- share_raw |>
   group_by(minority_share, r_ig_pct) |>
   summarise(across(c(delegation_rate, lost_vote_rate, RR_m, cross_group_dlg_rate),
                     ~mean(.x, na.rm = TRUE)), .groups = "drop")
-
-kable(share_summary |> mutate(across(where(is.numeric), ~round(.x, 3))),
-      caption = "Effect of `minority_share` (15/20/25/30/35/40%) at fixed `r_ig` levels (0/33/66/100% of its saturated effect, Sec. 2; `r_op`=`r_pw`=`r_tr`=0) on delegation rate, lost-vote rate, `RR_m`, and CDR")
 ```
 
 ```{r p6-share-plot, fig.height=16}
@@ -662,7 +624,8 @@ build_share_group_plot_data(share_raw, share_summary, "r_ig_pct") |>
   scale_x_continuous(labels = scales::percent) +
   facet_grid(rows = vars(metric), cols = vars(r_ig_label), scales = "free_y") +
   labs(title = "Effect of minority_share across fixed r_ig levels",
-       subtitle = "Black = pooled mean; blue/red = minority/majority-only, where a group-restricted metric exists",
+       subtitle = plot_info("random condition, r_op=r_pw=r_tr=0. Black = pooled mean; blue/red = minority/majority-only, where a group-restricted metric exists",
+                            minority_share = NULL),
        x = "Minority share", y = NULL, colour = NULL) +
   theme(legend.position = "top") +
   FACET_SPACING
@@ -709,7 +672,7 @@ share_bg_raw <- run_cached("r23_minority_share_bg_sweep", function() {
   plan(multisession, workers = N_WORKERS)
   out <- future_pmap_dfr(grid_share_bg, function(share_val, r_bg_pct, seed)
     minority_share_bg_cell(seed, share_val, r_bg_pct),
-    .options = furrr_options(seed = NULL))
+    .options = furrr_options(seed = NULL, packages = c("igraph", "dplyr", "tibble")))
   plan(sequential)
   out
 }, list(grid_share_bg, CHOSEN_K_FINAL, CHOSEN_T_FINAL, CHOSEN_NV_FINAL, PCT_TABLE_P1, R_SAT_ANCHOR_RIG, v = 3))
@@ -722,9 +685,6 @@ share_bg_summary <- share_bg_raw |>
   group_by(minority_share, r_bg_pct) |>
   summarise(across(c(delegation_rate, lost_vote_rate, RR_m, cross_group_dlg_rate),
                     ~mean(.x, na.rm = TRUE)), .groups = "drop")
-
-kable(share_bg_summary |> mutate(across(where(is.numeric), ~round(.x, 3))),
-      caption = "Effect of `minority_share` (15/20/25/30/35/40%) at fixed `r_op`=`r_pw`=`r_tr`=`r_ig` background levels (0/33/66/100% of each dimension's own saturated effect, Sec. 1/2) on delegation rate, lost-vote rate, `RR_m`, and CDR")
 ```
 
 ```{r p6-share-bg-plot, fig.height=16}
@@ -738,7 +698,8 @@ build_share_group_plot_data(share_bg_raw, share_bg_summary, "r_bg_pct") |>
   scale_x_continuous(labels = scales::percent) +
   facet_grid(rows = vars(metric), cols = vars(r_bg_label), scales = "free_y") +
   labs(title = "Effect of minority_share across fixed r_op=r_pw=r_tr=r_ig background levels",
-       subtitle = "Black = pooled mean; blue/red = minority/majority-only, where a group-restricted metric exists",
+       subtitle = plot_info("random condition. Black = pooled mean; blue/red = minority/majority-only, where a group-restricted metric exists",
+                            minority_share = NULL),
        x = "Minority share", y = NULL, colour = NULL) +
   theme(legend.position = "top") +
   FACET_SPACING
@@ -759,8 +720,8 @@ cat(sprintf(
   MINORITY_SHARE * 100
 ))
 cat(sprintf(
-  "- **`target_homophily` = %.2f** -- highest of the tested levels (Sec. 3) still producing a meaningful, clearly separated network structure without collapsing CDR to ~0.\n",
-  CHOSEN_TARGET_HOMOPHILY
+  "- **`target_homophily` = max** -- maximum achievable group assortativity on this network (Sec. 3), realised %.3f on average across %d seeds.\n",
+  homophily_max$mean, N_SEEDS_HOMOPHILY
 ))
 cat(sprintf(
   "- **`r_ig` ceiling = %.2f** -- read off on the %s curve (Sec. 2), isolated sweep with `r_op`=`r_pw`=`r_tr`=0.\n",
