@@ -36,9 +36,9 @@ their allocation is reshuffled.
     $$E = \sum_{v \in N_i \setminus \{j\}} |op_i - op_v| + \sum_{v \in N_j \setminus \{i\}} |op_j - op_v|$$
 3.  Propose swapping $op_i \leftrightarrow op_j$; compute $E'$
 4.  Accept if $E' < E$; otherwise accept with probability
-    $e^{-(E'-E)\cdot \text{homophily\_t}}$
+    $e^{-(E'-E)\cdot \beta}$ with $\beta$ = `homophily_t`
 5.  Every 100 steps: compute opinion assortativity on the lay subgraph;
-    **stop** as soon as $r_{op} \geq \text{target\_homophily}$
+    **stop** as soon as $r_{op} \geq h^{*}$ with $h^{*}$ = `target_homophily`
 
 The parameter `homophily_t` (Metropolis temperature) controls how
 strictly improvements are enforced — higher values make the algorithm

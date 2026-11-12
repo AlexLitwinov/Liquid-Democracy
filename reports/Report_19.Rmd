@@ -70,7 +70,9 @@ distributions,
 $$o_i \sim \begin{cases}
   \mathcal{N}(0.5-\delta/2,\ \sigma^2) & g_i = \text{minority} \quad (20\%) \\
   \mathcal{N}(0.5+\delta/2,\ \sigma^2) & g_i = \text{majority} \quad (80\%)
-\end{cases}, \qquad \sigma = OP\_SIGMA = 0.1,$$
+\end{cases}, \qquad \sigma = 0.1,$$
+
+where $\sigma$ is `OP_SIGMA` in the code.
 
 with $\delta=0$ under `random` (both groups share $\mathcal{N}(0.5,\sigma^2)$),
 $\delta\in\{0.2,0.4\}$ under `polarised`, and $\delta=0.4$ under `homophily`
@@ -232,7 +234,9 @@ $$E_{\text{before}} = \sum_{k\in \text{nbr}(i)}|o_i-o_k| + \sum_{k\in \text{nbr}
 $$E_{\text{after}} = \sum_{k\in \text{nbr}(i)}|o_j-o_k| + \sum_{k\in \text{nbr}(j)}|o_i-o_k|$$
 $$\Delta E = E_{\text{after}} - E_{\text{before}}$$
 3. Accept the swap if $\Delta E<0$; otherwise accept with probability
-$$P(\text{accept}) = \exp(-\Delta E \cdot t), \qquad t = \texttt{homophily\_t} = 5.$$
+$$P(\text{accept}) = \exp(-\Delta E \cdot t), \qquad t = 5,$$
+
+where $t$ is `homophily_t` in the code.
 4. Every 100 steps, check the **network opinion correlation** $r$ and stop
    once $r \ge r^\star$, $r^\star=$ `r HOMOPHILY_TARGET_R`. $r$ is the
    Pearson correlation between the opinions sitting at either end of an

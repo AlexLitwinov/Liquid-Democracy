@@ -39,9 +39,9 @@ Controlled by `n_voting_rounds` in `simulate_liquid_democracy()`; `NULL`
 Voting rounds are evenly spaced via
 `round(seq(T/n_voting_rounds, T, length.out = n_voting_rounds))`, always
 ending on round $T$ – exactly regular (constant number of delegating
-rounds in between) only when $T/n_\text{voting\_rounds}$ is an integer,
+rounds in between) only when $T/n_{\mathrm{vote}}$ (with $n_{\mathrm{vote}}$ = `n_voting_rounds`) is an integer,
 e.g. 60/20 split: 60/20=3, so 20 voting rounds and 40; otherwise (when
-$T/n_\text{voting\_rounds}$ isn’t an integer) spacing can vary by $\pm1$
+$T/n_{\mathrm{vote}}$ isn’t an integer) spacing can vary by $\pm1$
 round from rounding.
 
 **Parameters used in this report:**
@@ -53,17 +53,17 @@ round from rounding.
 | $r_{op}$ | opinion responsiveness | varied |
 | $r_{pw}$ | power responsiveness | varied |
 | $r_{tr}$ | trust responsiveness (`gamma`) | varied |
-| $\lambda$ | trust adaptation rate | fixed, $\lambda=1-0.5^{2/n_\text{voting\_rounds}}\approx0.0670$ |
+| $\lambda$ | trust adaptation rate | fixed, $\lambda=1-0.5^{2/n_{\mathrm{vote}}}\approx0.0670$ |
 | $c$ | self-reliance baseline | fixed, $c=0.5$ |
 | $k_1,k_2$ | agreement / cycle-penalty weights | fixed at 1 |
 | $r_{ig}$ | ingroup responsiveness | fixed at 0 (Part I only) |
 
 **$\lambda$** is not swept below (only $c,r_{op},r_{pw},r_{tr}$ are); it
 is fixed via a half-life condition on the trust-relaxation recursion,
-$(1-\lambda)^h=0.5$ for $h=n_\text{voting\_rounds}/2$ voting-round
+$(1-\lambda)^h=0.5$ for $h=n_{\mathrm{vote}}/2$ voting-round
 updates (half of however many voting rounds a run actually has), giving
-$\lambda=1-0.5^{2/n_\text{voting\_rounds}}$. At this report’s
-$n_\text{voting\_rounds}=20$ that is $\lambda\approx0.0670$.
+$\lambda=1-0.5^{2/n_{\mathrm{vote}}}$. At this report’s
+$n_{\mathrm{vote}}=20$ that is $\lambda\approx0.0670$.
 
 ------------------------------------------------------------------------
 

@@ -168,7 +168,7 @@ of it, at a lower combinatorial cost than the finer grid.
 
 ## 2.4 Neighbour attractiveness distribution (diagnostic)
 
-Distribution of $A_{ij} \times \text{trust\_mod}$ across a random sample
+Distribution of $A_{ij}$ $\times$ `trust_mod` across a random sample
 of agents’ out-neighbours, for two of the effect-percentage triples from
 2.2 – this is what `tolerance` actually cuts against in 2.5/2.6.
 

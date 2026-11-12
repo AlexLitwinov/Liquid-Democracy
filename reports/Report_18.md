@@ -177,7 +177,7 @@ lost-vote increase in Section 3.4.
 
 **Second**, $\tau_{ij} \le 0$ always, since every update either
 subtracts a non-negative disagreement term or does nothing. That means
-$\text{trust\_mod} = 2\sigma(r_{trust}\cdot\tau_{ij}) \le 1$ always:
+`trust_mod` $= 2\sigma(r_{trust}\cdot\tau_{ij}) \le 1$ always:
 trust can only ever shrink a neighbour’s attractiveness, never boost it.
 A neighbour who has represented you perfectly for 19 rounds is no more
 attractive than one you’ve never interacted with.
@@ -197,7 +197,7 @@ non-delivering neighbour is penalized by a fixed, separately-tunable
 $\kappa_{cyc}$ regardless of what they might have voted. Two
 consequences worth flagging explicitly:
 
-- $\tau_{ij}$ can now be positive, so $\text{trust\_mod}$ can exceed 1 –
+- $\tau_{ij}$ can now be positive, so `trust_mod` can exceed 1 –
   a consistently well-agreeing delegate becomes *more* attractive than
   an untested one (at $\tau=0$, e.g. round 1), not merely “less
   suppressed.” This is closer to how trust intuitively works, but it

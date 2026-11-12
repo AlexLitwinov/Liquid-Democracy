@@ -62,7 +62,7 @@ and remains static across all T rounds. Construction proceeds in two
 stages.
 
 **Stage 1 — Regular ring lattice:** Within each community, every lay
-agent is connected to their $k = \lfloor node\_degree / 2 \rfloor$
+agent is connected to their $k = \lfloor d / 2 \rfloor$ (with $d$ = `node_degree`)
 nearest neighbours on each side, forming a ring. All lay-to-lay edges
 are bidirectional, so any lay agent can delegate to any connected
 neighbour.
@@ -80,8 +80,8 @@ local clustering.
 
 ##### Expert Connectivity
 
-Each expert is connected to $\lceil expert\_connectedness \times
-n\_per\_community \rceil$ randomly selected lay agents within their
+Each expert is connected to $\lceil c_e \times n_c \rceil$ (with $c_e$ =
+`expert_connectedness`, $n_c$ = `n_per_community`) randomly selected lay agents within their
 community. These edges run in one direction only (lay → expert),
 reflecting the assumption that experts always vote directly and are
 never in need of a delegate.
@@ -239,9 +239,9 @@ Repeat up to `homophily_steps` times:
     $$E = \sum_{v \in N_i \setminus \{j\}} |op_i - op_v| + \sum_{v \in N_j \setminus \{i\}} |op_j - op_v|$$
 3.  Propose swapping $op_i \leftrightarrow op_j$ and compute $E'$
 4.  Accept if $E' < E$; otherwise accept with probability
-    $e^{-(E'-E)\cdot \text{homophily\_t}}$
+    $e^{-(E'-E)\cdot \beta}$ with $\beta$ = `homophily_t`
 5.  Every 100 steps: compute the opinion assortativity of the lay
-    subgraph; stop as soon as $r_{op} \geq \text{target\_homophily}$
+    subgraph; stop as soon as $r_{op} \geq h^{*}$ with $h^{*}$ = `target_homophily`
 
 Higher `homophily_t` makes the algorithm greedier — only clearly
 improving swaps are accepted, converging faster to the target. Lower
@@ -327,7 +327,7 @@ $$A \rightarrow B \rightarrow C \rightarrow A$$
 
 no agent in the cycle casts a final vote. Agents in cycles retain
 $power = 1$ and their votes are recorded as lost
-($my\_vote = \text{NA}$).
+(`my_vote = NA`).
 
 ------------------------------------------------------------------------
 
@@ -338,7 +338,7 @@ After roots are identified, votes propagate as follows:
 - **Direct voters and experts**: cast their own preference $pref_i$ as
   their vote.
 - **Delegating agents**: inherit the preference of their chain’s root.
-- **Cycle agents**: $my\_vote = \text{NA}$ (vote is lost).
+- **Cycle agents**: `my_vote = NA` (vote is lost).
 
 When evaluating binary outcomes, preferences are interpreted using a
 threshold of $0.5$ (yes if $pref \geq 0.5$, no otherwise).
@@ -390,7 +390,7 @@ per snapshot round (25%, 50%, 75%, 100% of T):
 
 `summary_metrics(res)` evaluates the state of the simulation at round T
 across four sections. Throughout, **represented agents** are agents with
-a valid $my\_vote$ (non-NA) — i.e., all agents except those in
+a valid `my_vote` (non-NA) — i.e., all agents except those in
 delegation cycles.
 
 ------------------------------------------------------------------------
